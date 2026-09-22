@@ -121,3 +121,21 @@ bool wp_metal_capture_host_op(int ordinal, std::function<bool()> op);
 // Keeps the current error string for the next wp_metal_synchronize(); for entry points that return void.
 void wp_metal_defer_error(int ordinal);
 #endif
+
+// Interop with other users of the same Metal device (renderers, PyTorch MPS). Handles are unretained
+// Objective-C object pointers (id<MTLDevice>, id<MTLCommandQueue>, id<MTLBuffer>, id<MTLEvent>/id<MTLSharedEvent>).
+extern "C" {
+WP_API void* wp_metal_device_handle(int ordinal);
+WP_API void* wp_metal_queue_handle(int ordinal);
+// The MTLBuffer behind a pointer into Metal memory of this device (own allocation or imported host memory) and
+// the byte offset of ptr within it. Null if ptr is not Metal memory. The caller must keep the array alive.
+WP_API void* wp_metal_buffer_handle(int ordinal, const void* ptr, size_t* offset_out);
+// The event that orders this device's command buffers and the value the most recently committed work signals.
+WP_API void* wp_metal_event_handle(int ordinal);
+WP_API uint64_t wp_metal_event_value(int ordinal);
+// Commits pending work; when it completes, `event` (MTLEvent or MTLSharedEvent) is signaled with `value`.
+// Returns 0 on success. Not available during graph capture (signal after wp_metal_graph_launch instead).
+WP_API int wp_metal_signal_event(int ordinal, void* event, uint64_t value);
+// Commits pending work; everything launched afterwards waits until `event` reaches `value`. Returns 0 on success.
+WP_API int wp_metal_wait_event(int ordinal, void* event, uint64_t value);
+}

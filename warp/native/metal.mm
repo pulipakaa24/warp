@@ -1564,3 +1564,110 @@ int wp_metal_flush(int ordinal)
         return dev && flush(*dev) ? 0 : -1;
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Interop: handles and cross-queue ordering for other Metal users on the same device (see metal.h).
+
+void* wp_metal_device_handle(int ordinal)
+{
+    WP_METAL_LOCK();
+    Device* dev = get_device(ordinal);
+    return dev ? (__bridge void*)dev->device : nullptr;
+}
+
+void* wp_metal_queue_handle(int ordinal)
+{
+    WP_METAL_LOCK();
+    Device* dev = get_device(ordinal);
+    return dev ? (__bridge void*)dev->queue : nullptr;
+}
+
+void* wp_metal_buffer_handle(int ordinal, const void* ptr, size_t* offset_out)
+{
+    WP_METAL_LOCK();
+    Device* dev = get_device(ordinal);
+    if (!dev || !ptr)
+        return nullptr;
+    auto own = [](id<MTLBuffer> b) { return b; };
+    auto imported = [](const Device::Import& i) { return i.buffer; };
+    uintptr_t base = 0;
+    for (bool allow_end : { false, true }) {
+        id<MTLBuffer> buffer = buffer_containing(dev->allocations, uint64_t(ptr), allow_end, base, own);
+        if (!buffer)
+            buffer = buffer_containing(dev->imports, uint64_t(ptr), allow_end, base, imported);
+        if (buffer) {
+            if (offset_out)
+                *offset_out = size_t(uintptr_t(ptr) - base);
+            return (__bridge void*)buffer;
+        }
+    }
+    return nullptr;
+}
+
+void* wp_metal_event_handle(int ordinal)
+{
+    WP_METAL_LOCK();
+    Device* dev = get_device(ordinal);
+    return dev ? (__bridge void*)dev->event : nullptr;
+}
+
+uint64_t wp_metal_event_value(int ordinal)
+{
+    WP_METAL_LOCK();
+    Device* dev = get_device(ordinal);
+    return dev ? dev->event_value : 0;
+}
+
+int wp_metal_signal_event(int ordinal, void* event, uint64_t value)
+{
+    WP_METAL_LOCK();
+    @autoreleasepool {
+        Device* dev = get_device(ordinal);
+        if (!dev || !event) {
+            wp::set_error_string("Invalid Metal device or event");
+            return -1;
+        }
+        if (dev->capture) {
+            wp::set_error_string("Signaling an event during graph capture is not supported on Metal");
+            return -1;
+        }
+        if (dev->encoder) {
+            [dev->encoder endEncoding];
+            dev->encoder = nil;
+        }
+        if (!dev->command_buffer) {
+            // nothing pending in this buffer: still order the signal after all previously committed work
+            dev->command_buffer = new_command_buffer(*dev);
+            if (dev->event_value > 0)
+                [dev->command_buffer encodeWaitForEvent:dev->event value:dev->event_value];
+        }
+        [dev->command_buffer encodeSignalEvent:(__bridge id<MTLEvent>)event value:value];
+        return flush(*dev) ? 0 : -1;
+    }
+}
+
+int wp_metal_wait_event(int ordinal, void* event, uint64_t value)
+{
+    WP_METAL_LOCK();
+    @autoreleasepool {
+        Device* dev = get_device(ordinal);
+        if (!dev || !event) {
+            wp::set_error_string("Invalid Metal device or event");
+            return -1;
+        }
+        if (dev->capture) {
+            wp::set_error_string("Waiting for an event during graph capture is not supported on Metal");
+            return -1;
+        }
+        // Work launched before the wait must not be held back by it: commit it first, then open the
+        // command buffer that every later launch is encoded into with the wait at its head. Command
+        // buffers chain through dev->event, so the ordering carries over to later buffers as well.
+        if (!flush(*dev))
+            return -1;
+        dev->command_buffer = new_command_buffer(*dev);
+        if (dev->event_value > 0)
+            [dev->command_buffer encodeWaitForEvent:dev->event value:dev->event_value];
+        [dev->command_buffer encodeWaitForEvent:(__bridge id<MTLEvent>)event value:value];
+        return 0;
+    }
+}
