@@ -138,4 +138,7 @@ WP_API uint64_t wp_metal_event_value(int ordinal);
 WP_API int wp_metal_signal_event(int ordinal, void* event, uint64_t value);
 // Commits pending work; everything launched afterwards waits until `event` reaches `value`. Returns 0 on success.
 WP_API int wp_metal_wait_event(int ordinal, void* event, uint64_t value);
+// Diagnostics: out[0..3] = host waits for the GPU, command buffers committed, host ops run during
+// graph replay, kernel dispatches encoded (cumulative). Lets callers assert a loop never blocks.
+WP_API int wp_metal_counters(int ordinal, uint64_t* out, int n);
 }

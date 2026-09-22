@@ -42,6 +42,16 @@ constexpr size_t kThreadgroupMemoryAlignment = 16;
 // Dispatches per command buffer before it is committed. Smaller batches let the GPU start while
 // Python is still encoding a step, but every boundary drains the GPU (buffers are chained with
 // an event, see Device::event). WP_METAL_BATCH overrides the default for tuning.
+// WP_METAL_ICB=0 disables indirect-command-buffer graph replay (per-dispatch re-encoding instead).
+bool icb_replay_enabled()
+{
+    static const bool value = [] {
+        const char* env = std::getenv("WP_METAL_ICB");
+        return !env || atoi(env) != 0;
+    }();
+    return value;
+}
+
 int max_dispatches_per_command_buffer()
 {
     static const int value = [] {
@@ -81,6 +91,11 @@ struct Graph {
     std::vector<std::pair<size_t, size_t>> fixups;  // (field offset, data offset): field = data GPU address
     id<MTLBuffer> buffer;  // bytes uploaded at capture end
     std::vector<id<MTLBuffer>> retained;  // freed during capture but referenced by the recording
+    // Replay: the dispatches encoded once into an indirect command buffer (with a barrier between
+    // consecutive commands), executed with one call per launch instead of re-encoding every dispatch.
+    // Built lazily on the first launch; graphs with host ops keep the per-dispatch path.
+    id<MTLIndirectCommandBuffer> icb;
+    bool icb_tried = false;
 };
 
 struct Device {
@@ -142,6 +157,9 @@ struct Device {
     uint64_t event_value = 0;
     id<MTLComputeCommandEncoder> encoder;  // open encoder on command_buffer, if any
     int num_dispatches = 0;
+    // Interop diagnostics (wp_metal_counters): how often the runtime waited for the GPU, committed a
+    // command buffer, ran a recorded host op during graph replay, or encoded a dispatch.
+    uint64_t n_sync = 0, n_flush = 0, n_host_ops = 0, n_dispatch = 0;
     std::vector<id<MTLCommandBuffer>> in_flight;  // committed but not yet known to be complete
 
     ~Device()
@@ -404,6 +422,7 @@ bool flush(Device& dev)
         commit_residency(dev);
         [dev.command_buffer encodeSignalEvent:dev.event value:++dev.event_value];
         [dev.command_buffer commit];
+        ++dev.n_flush;
         dev.in_flight.push_back(dev.command_buffer);
         dev.command_buffer = nil;
         dev.num_dispatches = 0;
@@ -415,6 +434,8 @@ bool flush(Device& dev)
 bool synchronize(Device& dev)
 {
     bool ok = flush(dev);
+    if (!dev.in_flight.empty())
+        ++dev.n_sync;
     for (id<MTLCommandBuffer> command_buffer : dev.in_flight)
         [command_buffer waitUntilCompleted];
     ok = retire_completed(dev) && ok;
@@ -692,6 +713,7 @@ bool load_memory_kernels(Device& dev)
         MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
         descriptor.computeFunction = [library newFunctionWithName:name];
         descriptor.label = name;
+        descriptor.supportIndirectCommandBuffers = YES;
         return descriptor.computeFunction ? [dev.device newComputePipelineStateWithDescriptor:descriptor
                                                                                       options:MTLPipelineOptionNone
                                                                                    reflection:nil
@@ -1032,6 +1054,7 @@ void* wp_metal_get_kernel(void* library, const char* name)
         MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
         descriptor.computeFunction = function;
         descriptor.label = @(name);
+        descriptor.supportIndirectCommandBuffers = YES;  // graphs replay through indirect command buffers
         id<MTLComputePipelineState> pipeline =
             [lib->library.device newComputePipelineStateWithDescriptor:descriptor
                                                                options:MTLPipelineOptionNone
@@ -1140,6 +1163,7 @@ int wp_metal_launch_kernel(
             [encoder dispatchThreads:MTLSizeMake(num_threads, 1, 1) threadsPerThreadgroup:group];
         }
 
+        ++dev->n_dispatch;
         if (profiler().enabled)
             return profile_dispatch(*dev, pipeline.label.UTF8String) ? 0 : -1;
         // Bound latency by committing large batches; the next launch starts a fresh command buffer.
@@ -1318,10 +1342,70 @@ int wp_metal_graph_launch(int ordinal, void* handle)
     }
 }
 
+// Encodes the graph's dispatches into an indirect command buffer. Returns false (and leaves icb nil)
+// if the device refuses; the caller then falls back to per-dispatch encoding.
+static bool graph_build_icb(Device& dev, Graph* graph)
+{
+    graph->icb_tried = true;
+    const size_t count = graph->dispatches.size();
+    if (count == 0 || !graph->buffer)
+        return false;
+    MTLIndirectCommandBufferDescriptor* descriptor = [MTLIndirectCommandBufferDescriptor new];
+    descriptor.commandTypes = MTLIndirectCommandTypeConcurrentDispatch | MTLIndirectCommandTypeConcurrentDispatchThreads;
+    descriptor.inheritPipelineState = NO;
+    descriptor.inheritBuffers = NO;
+    descriptor.maxKernelBufferBindCount = 2;
+    if ([descriptor respondsToSelector:@selector(setMaxKernelThreadgroupMemoryBindCount:)])
+        descriptor.maxKernelThreadgroupMemoryBindCount = 1;
+    id<MTLIndirectCommandBuffer> icb = [dev.device newIndirectCommandBufferWithDescriptor:descriptor
+                                                                          maxCommandCount:count
+                                                                                  options:MTLResourceStorageModeShared];
+    if (!icb)
+        return false;
+    icb.label = @"Warp graph";
+    for (size_t i = 0; i < count; ++i) {
+        const Graph::Dispatch& d = graph->dispatches[i];
+        id<MTLIndirectComputeCommand> cmd = [icb indirectComputeCommandAtIndex:i];
+        [cmd setComputePipelineState:d.pipeline];
+        if (d.bounds_size) {
+            [cmd setKernelBuffer:graph->buffer offset:d.bounds_offset atIndex:0];
+            [cmd setKernelBuffer:graph->buffer offset:d.args_offset atIndex:1];
+        } else {
+            [cmd setKernelBuffer:graph->buffer offset:d.args_offset atIndex:0];
+        }
+        MTLSize group = MTLSizeMake(d.group_size, 1, 1);
+        if (d.threadgroup_bytes) {
+            [cmd setThreadgroupMemoryLength:d.threadgroup_bytes atIndex:0];
+            [cmd concurrentDispatchThreadgroups:MTLSizeMake((d.num_threads + d.group_size - 1) / d.group_size, 1, 1)
+                          threadsPerThreadgroup:group];
+        } else {
+            [cmd concurrentDispatchThreads:MTLSizeMake(d.num_threads, 1, 1) threadsPerThreadgroup:group];
+        }
+        [cmd setBarrier];  // recorded launches are sequential, as on a single CUDA stream
+    }
+    graph->icb = icb;
+    return true;
+}
+
 static int graph_launch(Device& device, Graph* graph)
 {
     Device* dev = &device;
     refresh_table(device);  // recorded kernels translate host pointers they read from memory, too
+    if (graph->host_ops.empty() && icb_replay_enabled()) {
+        if (!graph->icb_tried)
+            graph_build_icb(device, graph);
+        if (graph->icb) {
+            const size_t count = graph->dispatches.size();
+            id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
+            [encoder useResource:graph->buffer usage:MTLResourceUsageRead];
+            [encoder executeCommandsInBuffer:graph->icb withRange:NSMakeRange(0, count)];
+            dev->n_dispatch += count;
+            dev->num_dispatches += int(count);
+            if (dev->num_dispatches >= max_dispatches_per_command_buffer() && !flush(*dev))
+                return -1;
+            return 0;
+        }
+    }
     {
         size_t next_host_op = 0;
         auto run_host_ops = [&](size_t before_dispatch) {
@@ -1330,6 +1414,7 @@ static int graph_launch(Device& device, Graph* graph)
                  ++next_host_op) {
                 if (!synchronize(*dev))  // the host op reads results of the dispatches recorded before it
                     return false;
+                ++dev->n_host_ops;
                 if (!graph->host_ops[next_host_op].run())
                     return false;
             }
@@ -1355,6 +1440,7 @@ static int graph_launch(Device& device, Graph* graph)
             } else {
                 [encoder dispatchThreads:MTLSizeMake(d.num_threads, 1, 1) threadsPerThreadgroup:group];
             }
+            ++dev->n_dispatch;
             if (++dev->num_dispatches >= max_dispatches_per_command_buffer() && !flush(*dev))
                 return -1;
         }
@@ -1670,4 +1756,18 @@ int wp_metal_wait_event(int ordinal, void* event, uint64_t value)
         [dev->command_buffer encodeWaitForEvent:(__bridge id<MTLEvent>)event value:value];
         return 0;
     }
+}
+
+// Diagnostics: n_sync (host waits for the GPU), n_flush (command buffers committed), n_host_ops (host
+// operations run during graph replay, each preceded by a wait), n_dispatch (kernel dispatches encoded).
+int wp_metal_counters(int ordinal, uint64_t* out, int n)
+{
+    WP_METAL_LOCK();
+    Device* dev = get_device(ordinal);
+    if (!dev || !out)
+        return -1;
+    uint64_t values[4] = { dev->n_sync, dev->n_flush, dev->n_host_ops, dev->n_dispatch };
+    for (int i = 0; i < n && i < 4; ++i)
+        out[i] = values[i];
+    return 0;
 }
