@@ -61,6 +61,26 @@ int max_dispatches_per_command_buffer()
     return value;
 }
 
+// WP_METAL_ICB_BATCH > 0 replays graphs in chunks of that many dispatches per command buffer.
+int icb_batch()
+{
+    static const int value = [] {
+        const char* env = std::getenv("WP_METAL_ICB_BATCH");
+        return env ? std::max(0, atoi(env)) : 0;
+    }();
+    return value;
+}
+
+// WP_METAL_INFLIGHT bounds the committed-but-unfinished command buffers (see flush()).
+int max_command_buffers_in_flight()
+{
+    static const int value = [] {
+        const char* env = std::getenv("WP_METAL_INFLIGHT");
+        return env ? std::max(1, atoi(env)) : 64;
+    }();
+    return value;
+}
+
 // Warp may call into the runtime from several Python threads; the device state is not thread-safe.
 std::recursive_mutex& runtime_mutex()
 {
@@ -112,6 +132,10 @@ struct Device {
 
     std::map<uintptr_t, id<MTLBuffer>> allocations;  // keyed by host base address
     std::vector<id<MTLBuffer>> deferred_frees;  // freed while GPU work may still use them
+    // deferred frees attached to the command buffer committed after them: released when it completes,
+    // so an eager loop that allocates temporaries per step (MuJoCo Warp does) does not accumulate them
+    // until the next synchronize (which exhausted GPU memory at 4096 worlds)
+    std::vector<std::pair<id<MTLCommandBuffer>, std::vector<id<MTLBuffer>>>> pending_frees;
 
     // Foreign host memory (NumPy, Torch) wrapped page-aligned with newBufferWithBytesNoCopy so kernels can
     // address it in place; keyed by page base, released when the last importing array is freed.
@@ -159,7 +183,7 @@ struct Device {
     int num_dispatches = 0;
     // Interop diagnostics (wp_metal_counters): how often the runtime waited for the GPU, committed a
     // command buffer, ran a recorded host op during graph replay, or encoded a dispatch.
-    uint64_t n_sync = 0, n_flush = 0, n_host_ops = 0, n_dispatch = 0;
+    uint64_t n_sync = 0, n_flush = 0, n_host_ops = 0, n_dispatch = 0, n_backpressure = 0;
     std::vector<id<MTLCommandBuffer>> in_flight;  // committed but not yet known to be complete
 
     ~Device()
@@ -341,6 +365,8 @@ void commit_residency(Device& dev)
 bool has_pending_work(const Device& dev) { return dev.command_buffer != nil || !dev.in_flight.empty(); }
 
 // Drops command buffers that have finished executing. Returns false if any of them failed.
+void release_buffers(Device& dev, std::vector<id<MTLBuffer>>& buffers);
+
 bool retire_completed(Device& dev)
 {
     bool ok = true;
@@ -358,6 +384,16 @@ bool retire_completed(Device& dev)
     };
     std::vector<id<MTLCommandBuffer>>& in_flight = dev.in_flight;
     in_flight.erase(std::remove_if(in_flight.begin(), in_flight.end(), finished), in_flight.end());
+    // frees whose command buffer completed can be released now (buffers are only ever referenced by
+    // work committed before they were freed, and command buffers complete in order on the queue)
+    for (size_t i = 0; i < dev.pending_frees.size();) {
+        if (dev.pending_frees[i].first.status >= MTLCommandBufferStatusCompleted) {
+            release_buffers(dev, dev.pending_frees[i].second);
+            dev.pending_frees.erase(dev.pending_frees.begin() + i);
+        } else {
+            ++i;
+        }
+    }
     if (in_flight.empty() && !dev.kernel_assertion.empty()) {
         wp::set_error_string("Metal kernel assertion failed: %s", dev.kernel_assertion.c_str());
         dev.kernel_assertion.clear();  // reported once, like a CUDA trap surfacing at synchronize
@@ -424,8 +460,23 @@ bool flush(Device& dev)
         [dev.command_buffer commit];
         ++dev.n_flush;
         dev.in_flight.push_back(dev.command_buffer);
+        if (!dev.deferred_frees.empty()) {
+            dev.pending_frees.emplace_back(dev.command_buffer, std::move(dev.deferred_frees));
+            dev.deferred_frees.clear();
+        }
         dev.command_buffer = nil;
         dev.num_dispatches = 0;
+    }
+    // Back-pressure: the driver reserves per-dispatch scratch for every command buffer in flight, and
+    // thousands of large dispatches outstanding fail with kIOGPUCommandBufferCallbackErrorOutOfMemory
+    // (seen at 4096 MuJoCo Warp worlds). Waiting on the oldest buffer keeps the queue deep enough to
+    // stay fed while bounding that reservation. Not counted as a sync: no host-visible data is read.
+    const int limit = max_command_buffers_in_flight();
+    while (int(dev.in_flight.size()) > limit) {
+        [dev.in_flight.front() waitUntilCompleted];
+        ++dev.n_backpressure;
+        if (!retire_completed(dev))
+            return false;
     }
     return retire_completed(dev);
 }
@@ -438,7 +489,7 @@ bool synchronize(Device& dev)
         ++dev.n_sync;
     for (id<MTLCommandBuffer> command_buffer : dev.in_flight)
         [command_buffer waitUntilCompleted];
-    ok = retire_completed(dev) && ok;
+    ok = retire_completed(dev) && ok;   // releases every pending free: all command buffers completed
     dev.args_ring_offset = 0;
     release_buffers(dev, dev.deferred_frees);
     return ok;
@@ -1395,14 +1446,28 @@ static int graph_launch(Device& device, Graph* graph)
         if (!graph->icb_tried)
             graph_build_icb(device, graph);
         if (graph->icb) {
+            // Replayed in chunks so each command buffer carries at most WP_METAL_BATCH dispatches (the
+            // same bound as eager launches); command buffers on one queue execute in order.
             const size_t count = graph->dispatches.size();
-            id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
-            [encoder useResource:graph->buffer usage:MTLResourceUsageRead];
-            [encoder executeCommandsInBuffer:graph->icb withRange:NSMakeRange(0, count)];
-            dev->n_dispatch += count;
-            dev->num_dispatches += int(count);
-            if (dev->num_dispatches >= max_dispatches_per_command_buffer() && !flush(*dev))
-                return -1;
+            const int batch = icb_batch() > 0 ? icb_batch() : int(std::max(count, size_t(1)) + dev->num_dispatches);
+            size_t offset = 0;
+            while (offset < count) {
+                int room = batch - dev->num_dispatches;
+                if (room <= 0) {
+                    if (!flush(*dev))
+                        return -1;
+                    continue;
+                }
+                const size_t len = std::min(count - offset, size_t(room));
+                id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
+                [encoder useResource:graph->buffer usage:MTLResourceUsageRead];
+                [encoder executeCommandsInBuffer:graph->icb withRange:NSMakeRange(offset, len)];
+                dev->n_dispatch += len;
+                dev->num_dispatches += int(len);
+                offset += len;
+                if (dev->num_dispatches >= batch && !flush(*dev))
+                    return -1;
+            }
             return 0;
         }
     }
