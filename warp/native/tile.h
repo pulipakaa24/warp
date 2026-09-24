@@ -89,6 +89,14 @@ template <int BlockDim> inline void tile_sync()
 #define WP_TILE_ARENA_PARAM_LAST , threadgroup char* _wp_arena = nullptr
 #define WP_TILE_ARENA_ARG_LAST , _wp_arena
 #define WP_TILE_CALL(f, ...) f(_wp_arena __VA_OPT__(, ) __VA_ARGS__)  // call a generated function
+// Generated functions additionally take the thread's fixed-array scratch (see fixedarray_t in
+// array.h); a call passes it advanced past the caller's frame (`_wp_fixed_frame`, declared in every
+// generated body). Tile builtins keep WP_TILE_ARENA_PARAM.
+#define WP_FUNC_PARAM threadgroup char* _wp_arena, device char* _wp_fixed,
+#define WP_FUNC_PARAM0 threadgroup char* _wp_arena, device char* _wp_fixed
+#define WP_FUNC_ARG _wp_arena, _wp_fixed + _wp_fixed_frame,
+#define WP_FUNC_ARG0 _wp_arena, _wp_fixed + _wp_fixed_frame
+#define WP_FUNC_CALL(f, ...) f(_wp_arena, _wp_fixed + _wp_fixed_frame __VA_OPT__(, ) __VA_ARGS__)
 #else
 #define WP_TILE_ARENA_PARAM
 #define WP_TILE_ARENA_ARG
@@ -100,6 +108,11 @@ template <int BlockDim> inline void tile_sync()
 #define WP_TILE_ARENA_PARAM_LAST
 #define WP_TILE_ARENA_ARG_LAST
 #define WP_TILE_CALL(f, ...) f(__VA_ARGS__)
+#define WP_FUNC_PARAM
+#define WP_FUNC_PARAM0
+#define WP_FUNC_ARG
+#define WP_FUNC_ARG0
+#define WP_FUNC_CALL(f, ...) f(__VA_ARGS__)
 #endif
 
 #if defined(__METAL_VERSION__)

@@ -1959,14 +1959,17 @@ def replay_arena_arg(func, has_args: bool) -> str:
     """
     if func.custom_replay_func is None:
         return ""
-    return "WP_TILE_ARENA_ARG " if has_args else "WP_TILE_ARENA_ARG0"
+    return "WP_FUNC_ARG " if has_args else "WP_FUNC_ARG0"
 
 
 def tile_arena_arg(func, has_args: bool) -> str:
     """Hidden arena argument for calls to generated functions and arena-using tile builtins."""
     if func.is_builtin() and func.native_func not in TILE_ARENA_NATIVES:
         return ""
-    return "WP_TILE_ARENA_ARG " if has_args else "WP_TILE_ARENA_ARG0"
+    if func.is_builtin():
+        return "WP_TILE_ARENA_ARG " if has_args else "WP_TILE_ARENA_ARG0"
+    # generated functions also take the thread's fixed-array scratch (see WP_FUNC_PARAM in tile.h)
+    return "WP_FUNC_ARG " if has_args else "WP_FUNC_ARG0"
 
 
 class Adjoint:
@@ -2331,6 +2334,8 @@ class Adjoint:
         adj.loop_blocks = []
 
         adj.metal = getattr(builder, "device", None) == "metal"
+        # bytes of this function's frame in the per-thread fixed-array scratch (Metal, see fixedarray_t in array.h)
+        adj.fixed_frame_bytes = 0
         # Emit loops as for(;;)/break/continue instead of labels and goto (Metal has no goto).
         adj.structured_loops = adj.metal
         adj.metal_unsupported_builtins = set()
@@ -2479,7 +2484,7 @@ class Adjoint:
                     else:
                         # generated functions take the hidden tile arena first (see WP_TILE_ARENA_PARAM)
                         arg_strs.append(
-                            f"[&](auto... _a) {{ return WP_TILE_CALL({a.namespace}{a.native_func}, _a...); }}"
+                            f"[&](auto... _a) {{ return WP_FUNC_CALL({a.namespace}{a.native_func}, _a...); }}"
                         )
                 else:
                     arg_strs.append(f"{a.namespace}{prefix}_{a.native_func}")
@@ -3118,6 +3123,23 @@ class Adjoint:
 
         func_args = tuple(adj.register_var(x) for x in func_args)
         func_name = compute_type_str(func.native_func, template_args)
+        fixed_scratch_arg = False
+        if adj.metal and func.is_builtin():
+            # fixed-size arrays live in the thread's scratch frame on Metal (see fixedarray_t in array.h):
+            # each wp.zeros() or fixed-array copy site owns a static, 16-byte aligned slot of the frame
+            fixed_type = None
+            if func.native_func == "fixedarray_t":
+                fixed_type = fixedarray(dtype=template_args[1], shape=(template_args[0],))
+                native = "fixedarray_zeros"
+            elif func.key == "copy" and func_args and isinstance(strip_reference(func_args[0].type), fixedarray):
+                fixed_type = strip_reference(func_args[0].type)
+                native = "fixedarray_copy"
+            if fixed_type is not None:
+                offset = adj.fixed_frame_bytes
+                nbytes = fixed_type.size * warp._src.types.type_size_in_bytes(fixed_type.dtype)
+                adj.fixed_frame_bytes += (nbytes + 15) // 16 * 16
+                func_name = compute_type_str(native, (fixed_type.size, fixed_type.dtype, offset))
+                fixed_scratch_arg = True
         if adj.metal:
             if func.is_builtin() and func.key.startswith(METAL_UNSUPPORTED_BUILTIN_PREFIXES):
                 adj.metal_unsupported_builtins.add(func.key)
@@ -3197,6 +3219,8 @@ class Adjoint:
         elif not isinstance(return_type, Sequence) or len(return_type) == 1:
             # handle simple function (one output)
             args_str = adj.format_forward_call_args(fwd_args + det_args, use_initializer_list)
+            if fixed_scratch_arg:
+                args_str = "_wp_fixed, " + args_str
             forward_call = (
                 f"var_{output} = {func.namespace}{func_name}({tile_arena_arg(func, args_str != '')}{args_str});"
             )
@@ -7668,7 +7692,7 @@ def cuda_kernel_backward_name(kernel, name=None):
 cpu_kernel_template_forward = """
 
 WP_FORCE_INLINE void {name}_cpu_kernel_forward(
-    WP_TILE_ARENA_PARAM {forward_args},
+    WP_FUNC_PARAM {forward_args},
     WP_CONSTANT wp_args_{name}* _wp_args)
 {{
 {forward_body}}}
@@ -7678,16 +7702,16 @@ WP_FORCE_INLINE void {name}_cpu_kernel_forward(
 # Metal entry point: one GPU thread per task, arguments read from a constant buffer.
 metal_module_template_forward = """
 
-kernel void {name}_metal_forward(
+{fixed_struct_forward}kernel void {name}_metal_forward(
     constant wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
-    constant wp_args_{name}* _wp_args [[buffer(1)]],
+    constant {forward_args_struct}* _wp_args [[buffer(1)]],
     threadgroup char* _wp_arena [[threadgroup(0)]],
     uint task_index [[thread_position_in_grid]])
 {{
     if (task_index >= dim.size)
         return;
     wp::tile_shared_storage_t::init(_wp_arena);  // shared-tile arena (see tile.h)
-    {name}_cpu_kernel_forward(_wp_arena, dim, task_index, _wp_args);
+    {name}_cpu_kernel_forward(_wp_arena, {fixed_scratch}, dim, task_index, {forward_args_ref});
 }}
 
 """
@@ -7695,7 +7719,7 @@ kernel void {name}_metal_forward(
 cpu_kernel_template_backward = """
 
 WP_FORCE_INLINE void {name}_cpu_kernel_backward(
-    WP_TILE_ARENA_PARAM {reverse_args},
+    WP_FUNC_PARAM {reverse_args},
     WP_CONSTANT wp_args_{name} *_wp_args,
     WP_CONSTANT wp_args_{name} *_wp_adj_args)
 {{
@@ -7711,16 +7735,17 @@ struct wp_bwd_args_{name} {{
     wp_args_{name} adj_args;
 }};
 
-kernel void {name}_metal_backward(
+{fixed_struct_backward}kernel void {name}_metal_backward(
     constant wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
-    constant wp_bwd_args_{name}* _wp [[buffer(1)]],
+    constant {backward_args_struct}* _wp_bwd [[buffer(1)]],
     threadgroup char* _wp_arena [[threadgroup(0)]],
     uint task_index [[thread_position_in_grid]])
 {{
     if (task_index >= dim.size)
         return;
     wp::tile_shared_storage_t::init(_wp_arena);
-    {name}_cpu_kernel_backward(_wp_arena, dim, task_index, &_wp->args, &_wp->adj_args);
+    constant wp_bwd_args_{name}* _wp = {backward_args_ref};
+    {name}_cpu_kernel_backward(_wp_arena, {fixed_scratch_bwd}, dim, task_index, &_wp->args, &_wp->adj_args);
 }}
 
 """
@@ -8181,6 +8206,8 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu", grid_stride=Fals
     # primal vars
     lines += ["//---------\n"]
     lines += ["// primal vars\n"]
+    if device == "metal":
+        lines += [f"const int _wp_fixed_frame = {adj.fixed_frame_bytes};  // fixed-array scratch of this frame\n"]
 
     for var in adj.variables:
         if is_tile(var.type):
@@ -8240,6 +8267,8 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu", grid_stride=Fals
     # primal vars
     lines += ["//---------\n"]
     lines += ["// primal vars\n"]
+    if device == "metal":
+        lines += [f"const int _wp_fixed_frame = {adj.fixed_frame_bytes};  // fixed-array scratch of this frame\n"]
 
     for var in adj.variables:
         if is_tile(var.type):
@@ -8466,9 +8495,9 @@ def codegen_func(
             return_type=return_type,
             inline_attr=inline_attr,
             forward_args=indent(
-                ["WP_TILE_ARENA_PARAM " + forward_args[0], *forward_args[1:]]
+                ["WP_FUNC_PARAM " + forward_args[0], *forward_args[1:]]
                 if forward_args
-                else ["WP_TILE_ARENA_PARAM0"]
+                else ["WP_FUNC_PARAM0"]
             ),
             forward_body=forward_body,
             filename=adj.filename,
@@ -8496,9 +8525,9 @@ def codegen_func(
             return_type=return_type,
             inline_attr=inline_attr,
             reverse_args=indent(
-                ["WP_TILE_ARENA_PARAM " + reverse_args[0], *reverse_args[1:]]
+                ["WP_FUNC_PARAM " + reverse_args[0], *reverse_args[1:]]
                 if reverse_args
-                else ["WP_TILE_ARENA_PARAM0"]
+                else ["WP_FUNC_PARAM0"]
             ),
             forward_body=forward_body,
             reverse_body=reverse_body,
@@ -8510,7 +8539,32 @@ def codegen_func(
     return s
 
 
-def codegen_snippet(adj, name, snippet, adj_snippet, replay_snippet, forward_only=False, reverse_only=False):
+_METAL_REF_CAST = re.compile(r"\b(reinterpret_cast|static_cast|const_cast)<(\s*(?:const\s+)?[A-Za-z_][\w:]*(?:<[^<>]*>)?\s*)&>")
+
+
+def metal_qualify_snippet(src: str | None) -> str | None:
+    """Give unqualified reference casts in ``@wp.func_native`` snippets the ``thread`` address space.
+
+    MSL requires an address space on every reference type; C++/CUDA snippets such as
+    ``reinterpret_cast<uint32_t&>(f)`` (a local reinterpretation) are thread-local by construction.
+    """
+    if not src:
+        return src
+
+    def fix(m):
+        t = m.group(2)
+        if re.search(r"\b(thread|device|threadgroup|constant|WP_THREAD|WP_DEVICE)\b", t):
+            return m.group(0)
+        return f"{m.group(1)}<{t.rstrip()} thread&>"
+
+    return _METAL_REF_CAST.sub(fix, src)
+
+
+def codegen_snippet(
+    adj, name, snippet, adj_snippet, replay_snippet, forward_only=False, reverse_only=False, device=None
+):
+    if adj.metal or device == "metal":
+        snippet, adj_snippet, replay_snippet = (metal_qualify_snippet(x) for x in (snippet, adj_snippet, replay_snippet))
     if adj.return_var is not None and len(adj.return_var) == 1:
         return_type = adj.return_var[0].ctype()
     else:
@@ -8600,9 +8654,9 @@ def codegen_snippet(adj, name, snippet, adj_snippet, replay_snippet, forward_onl
             return_type=return_type,
             inline_attr=inline_attr,
             forward_args=indent(
-                ["WP_TILE_ARENA_PARAM " + forward_args[0], *forward_args[1:]]
+                ["WP_FUNC_PARAM " + forward_args[0], *forward_args[1:]]
                 if forward_args
-                else ["WP_TILE_ARENA_PARAM0"]
+                else ["WP_FUNC_PARAM0"]
             ),
             forward_body=forward_ref_aliases_str + snippet,
             filename=adj.filename,
@@ -8634,9 +8688,9 @@ def codegen_snippet(adj, name, snippet, adj_snippet, replay_snippet, forward_onl
             return_type=return_type,
             inline_attr=inline_attr,
             reverse_args=indent(
-                ["WP_TILE_ARENA_PARAM " + reverse_args[0], *reverse_args[1:]]
+                ["WP_FUNC_PARAM " + reverse_args[0], *reverse_args[1:]]
                 if reverse_args
-                else ["WP_TILE_ARENA_PARAM0"]
+                else ["WP_FUNC_PARAM0"]
             ),
             forward_body=snippet,
             reverse_body=reverse_body,
@@ -8646,6 +8700,25 @@ def codegen_snippet(adj, name, snippet, adj_snippet, replay_snippet, forward_onl
         )
 
     return s
+
+
+def fixed_stack_bytes(adj, _memo=None) -> int:
+    """Per-thread fixed-array scratch a call of ``adj`` needs on Metal: its own frame plus the deepest
+    callee chain (callees receive the scratch advanced past the caller's frame; no recursion in Warp)."""
+    if _memo is None:
+        _memo = {}
+    key = id(adj)
+    if key in _memo:
+        return _memo[key]
+    _memo[key] = 0
+    deepest = 0
+    for callee in getattr(adj, "called_user_functions", {}) or {}:
+        for f in (callee, getattr(callee, "custom_grad_func", None), getattr(callee, "custom_replay_func", None)):
+            if f is not None and getattr(f, "adj", None) is not None and f.adj is not adj:
+                deepest = max(deepest, fixed_stack_bytes(f.adj, _memo))
+    total = getattr(adj, "fixed_frame_bytes", 0) + deepest
+    _memo[key] = total
+    return total
 
 
 def resolve_grid_stride(kernel_options: dict, default_grid_stride: builtins.bool) -> builtins.bool:
@@ -8873,6 +8946,33 @@ def codegen_module(kernel, device, options):
         "launch_ndim": kernel.adj.kernel_dim,
     }
     if device == "metal":
+        # fixed-size arrays (wp.zeros in kernels): a per-thread slice of a scratch buffer whose address
+        # travels after the arguments (see fixedarray_t in array.h and invoke_metal)
+        name = template_fmt_args["name"]
+        fixed = fixed_stack_bytes(kernel.adj)
+        if fixed:
+            scratch = f"(device char*)(_wp_{{}}->_wp_fixed) + size_t(task_index) * {fixed}"
+            template_fmt_args.update(
+                fixed_struct_forward=f"struct wp_fixed_args_{name} {{\n    wp_args_{name} args;\n    uint64_t _wp_fixed;\n}};\n\n",
+                forward_args_struct=f"wp_fixed_args_{name}",
+                forward_args_ref="&_wp_args->args",
+                fixed_scratch=scratch.format("args"),
+                fixed_struct_backward=f"struct wp_fixed_bwd_args_{name} {{\n    wp_bwd_args_{name} bwd;\n    uint64_t _wp_fixed;\n}};\n\n",
+                backward_args_struct=f"wp_fixed_bwd_args_{name}",
+                backward_args_ref="&_wp_bwd->bwd",
+                fixed_scratch_bwd=scratch.format("bwd"),
+            )
+        else:
+            template_fmt_args.update(
+                fixed_struct_forward="",
+                forward_args_struct=f"wp_args_{name}",
+                forward_args_ref="_wp_args",
+                fixed_scratch="(device char*)nullptr",
+                fixed_struct_backward="",
+                backward_args_struct=f"wp_bwd_args_{name}",
+                backward_args_ref="_wp_bwd",
+                fixed_scratch_bwd="(device char*)nullptr",
+            )
         source = metal_module_template_forward.format(**template_fmt_args)
         # a Metal forward-only rebuild (see Module.load) drops every adjoint, including per-kernel opt-ins
         if (options | kernel.options)["enable_backward"] and not options.get("metal_forward_only"):

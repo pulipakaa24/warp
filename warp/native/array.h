@@ -384,6 +384,62 @@ add(const fixedarray_t<Size, T> WP_THREAD& a, const fixedarray_t<Size, T> WP_THR
 {
     return fixedarray_t<Size, T>();
 }
+#else  // __METAL_VERSION__
+// Metal has no derived classes, and a stack array cannot back an `array_t`, whose `data` is a
+// `device` pointer (MSL address spaces are disjoint, so no cast reaches thread memory). Fixed-size
+// arrays are therefore plain `array_t`s over a per-thread slice of a device scratch buffer:
+// codegen gives each `wp.zeros()` / copy site a static offset in its function's frame, and every
+// generated function receives the thread's scratch pointer as a hidden argument (`_wp_fixed`,
+// see WP_FUNC_PARAM in tile.h), advanced past the caller's frame for each call. All array
+// builtins, `.ptr` and `wp.array(ptr=...)` views of the storage then work unchanged.
+// Differences from CPU/CUDA: the storage of a fixed array returned from a function lives in the
+// callee's frame (valid until the next call at that depth), and it is device memory, not registers.
+template <int Size, typename T> using fixedarray_t = array_t<T>;
+
+template <int Size, typename T> inline T WP_DEVICE* fixedarray_zero_storage(WP_DEVICE char* storage)
+{
+    static_assert(Size > 0, "Expected Size > 0");
+    WP_DEVICE uint32_t* words = (WP_DEVICE uint32_t*)storage;
+    const int bytes = int(Size * sizeof(T));
+    for (int i = 0; i < bytes / 4; ++i)
+        words[i] = 0u;
+    for (int i = bytes & ~3; i < bytes; ++i)
+        storage[i] = 0;
+    return (T WP_DEVICE*)storage;
+}
+
+template <int Size, typename T, int Offset> inline array_t<T> fixedarray_zeros(WP_DEVICE char* scratch, int dim0)
+{
+    return array_t<T>(fixedarray_zero_storage<Size, T>(scratch + Offset), dim0);
+}
+template <int Size, typename T, int Offset>
+inline array_t<T> fixedarray_zeros(WP_DEVICE char* scratch, int dim0, int dim1)
+{
+    return array_t<T>(fixedarray_zero_storage<Size, T>(scratch + Offset), dim0, dim1);
+}
+template <int Size, typename T, int Offset>
+inline array_t<T> fixedarray_zeros(WP_DEVICE char* scratch, int dim0, int dim1, int dim2)
+{
+    return array_t<T>(fixedarray_zero_storage<Size, T>(scratch + Offset), dim0, dim1, dim2);
+}
+template <int Size, typename T, int Offset>
+inline array_t<T> fixedarray_zeros(WP_DEVICE char* scratch, int dim0, int dim1, int dim2, int dim3)
+{
+    return array_t<T>(fixedarray_zero_storage<Size, T>(scratch + Offset), dim0, dim1, dim2, dim3);
+}
+
+// Value copy (`b = a` of a fixed array): new storage at the copy site's frame offset, same shape.
+template <int Size, typename T, int Offset>
+inline array_t<T> fixedarray_copy(WP_DEVICE char* scratch, const array_t<T> WP_THREAD& src)
+{
+    T WP_DEVICE* dst = (T WP_DEVICE*)(scratch + Offset);
+    for (int i = 0; i < Size; ++i)
+        dst[i] = src.data[i];
+    array_t<T> out = src;
+    out.data = dst;
+    out.grad = nullptr;
+    return out;
+}
 #endif  // !__METAL_VERSION__
 
 

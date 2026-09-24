@@ -1093,9 +1093,12 @@ class KernelHooks:
         forward_smem_shortfall: str | None = None,
         backward_smem_shortfall: str | None = None,
         metal_unsupported: str | None = None,
+        metal_fixed_bytes: int = 0,
     ):
         self.forward = forward
         self.backward = backward
+        # per-thread bytes of fixed-array scratch the Metal entry points expect after the arguments
+        self.metal_fixed_bytes = metal_fixed_bytes
         # builtins without a Metal implementation reached by the kernel; launching raises (see invoke_metal)
         self.metal_unsupported = metal_unsupported
 
@@ -3550,6 +3553,9 @@ class ModuleBuilder:
             options = self.options | kernel.options
 
             meta[forward_name + "_smem_bytes"] = kernel.adj.get_total_required_shared()
+            fixed_bytes = warp._src.codegen.fixed_stack_bytes(kernel.adj)
+            if fixed_bytes:  # Metal: per-thread fixed-array scratch (see invoke_metal)
+                meta[forward_name + "_fixed_bytes"] = fixed_bytes
             if options["enable_backward"] and options.get("entry_point_abi", "warp") == "warp":
                 meta[backward_name + "_smem_bytes"] = kernel.adj.get_total_required_shared_backward()
 
@@ -3600,6 +3606,7 @@ class ModuleBuilder:
                     replay_snippet=func.replay_snippet,
                     forward_only=forward_only,
                     reverse_only=reverse_only,
+                    device=device,
                 )
         return source
 
@@ -4012,6 +4019,7 @@ class ModuleExec:
                 backward_smem_bytes=self.meta.get(backward_name + "_smem_bytes", 0),
                 det_launch_meta=self.det_launch_meta_map.get(name),
                 metal_unsupported=unsupported,
+                metal_fixed_bytes=self.meta.get(warp._src.codegen.cuda_kernel_forward_name(kernel) + "_fixed_bytes", 0),
             )
 
         else:
@@ -11305,6 +11313,25 @@ def _metal_pointer_offsets(struct_type, base=0):
     return offsets
 
 
+_metal_fixed_arg_types: dict = {}
+
+
+def _metal_append_fixed_scratch(args, device: Device, nbytes: int):
+    """Wrap a kernel-argument struct as ``{args; uint64 _wp_fixed}`` with the address of a device scratch
+    buffer of at least ``nbytes``. The buffer only grows; outgrown buffers are kept alive because captured
+    graphs may still reference them."""
+    scratch = device.__dict__.setdefault("_metal_fixed_scratch", [])
+    if not scratch or scratch[-1].size < nbytes:
+        size = max(nbytes, 2 * scratch[-1].size if scratch else 0, 1 << 16)
+        scratch.append(warp.empty(size, dtype=warp.uint8, device=device))
+    inner = type(args)
+    wrapper = _metal_fixed_arg_types.get(inner)
+    if wrapper is None:
+        wrapper = type("wp_fixed_args", (ctypes.Structure,), {"_fields_": [("args", inner), ("_wp_fixed", ctypes.c_uint64)]})
+        _metal_fixed_arg_types[inner] = wrapper
+    return wrapper(args, scratch[-1].ptr)
+
+
 def invoke_metal(kernel, hooks, params: Sequence[Any], device: Device, block_dim: int, adjoint: bool = False):
     """Dispatch a forward or backward kernel on a Metal device."""
     if hooks.metal_unsupported:
@@ -11323,10 +11350,17 @@ def invoke_metal(kernel, hooks, params: Sequence[Any], device: Device, block_dim
             )
             kernel._metal_bwd_args_type = combined_type
         args = combined_type(args, adj_args)
+    if hooks.metal_fixed_bytes:
+        # fixed-size arrays (wp.zeros in kernels) live in a per-thread slice of a device scratch buffer;
+        # its address follows the arguments (wp_fixed_args_<kernel> in the generated source)
+        args = _metal_append_fixed_scratch(args, device, bounds.size * hooks.metal_fixed_bytes)
     args_type = type(args)
     offsets = getattr(args_type, "_metal_pointer_offsets", None)
     if offsets is None:
-        offsets = (ctypes.c_size_t * len(_metal_pointer_offsets(args_type)))(*_metal_pointer_offsets(args_type))
+        pointer_offsets = _metal_pointer_offsets(args_type)
+        if hooks.metal_fixed_bytes:
+            pointer_offsets.append(args_type._wp_fixed.offset)
+        offsets = (ctypes.c_size_t * len(pointer_offsets))(*pointer_offsets)
         args_type._metal_pointer_offsets = offsets
 
     if runtime.core.wp_metal_launch_kernel(
