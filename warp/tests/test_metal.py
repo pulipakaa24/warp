@@ -341,6 +341,31 @@ class TestMetal(unittest.TestCase):
                 np.testing.assert_allclose(factor.numpy(), u_ref, rtol=1e-4, atol=1e-4, err_msg=msg)
                 np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
 
+    def test_tile_cholesky_register_bound_configurable(self):
+        """``warp.config.metal_register_cholesky_max`` moves matrices above the default bound (40) onto the
+        register path (MuJoCo Warp's G1 has 43 dofs); the factor and solve must still match numpy."""
+        rng = np.random.default_rng(1)
+        worlds = 4
+        old = wp.config.metal_register_cholesky_max
+        try:
+            wp.config.metal_register_cholesky_max = 64
+            for n in (41, 43, 48, 64):
+                m = rng.standard_normal((worlds, n, n)).astype(np.float32)
+                a_np = m @ m.transpose(0, 2, 1) + n * np.eye(n, dtype=np.float32)
+                b_np = rng.standard_normal((worlds, n)).astype(np.float32)
+                x_ref = np.linalg.solve(a_np.astype(np.float64), b_np.astype(np.float64)[..., None])[..., 0]
+                u_ref = np.linalg.cholesky(a_np.astype(np.float64)).transpose(0, 2, 1)
+                kernel = _make_cholesky_kernel(n)
+                a = wp.array(a_np, dtype=float, device=self.device)
+                b = wp.array(b_np, dtype=float, device=self.device)
+                factor = wp.zeros((worlds, n, n), dtype=float, device=self.device)
+                x = wp.zeros((worlds, n), dtype=float, device=self.device)
+                wp.launch_tiled(kernel, dim=[worlds], inputs=[a, b, factor, x], device=self.device, block_dim=32)
+                np.testing.assert_allclose(factor.numpy(), u_ref, rtol=1e-4, atol=1e-4, err_msg=f"n={n}")
+                np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-3, atol=1e-4, err_msg=f"n={n}")
+        finally:
+            wp.config.metal_register_cholesky_max = old
+
     def test_tile_ops_across_block_boundary(self):
         """Tile sizes just below, at and above the block size, and above two blocks.
 

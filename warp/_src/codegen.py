@@ -1919,7 +1919,7 @@ def metal_tile_scratch_bytes(key: str, args: Mapping[str, Any], block_dim: int) 
         return tiles[0].size * elem + block_dim
     if key == "tile_cholesky":
         n = tiles[0].shape[0]
-        if 1 < block_dim <= 32 and n <= 40:
+        if 1 < block_dim <= 32 and n <= warp.config.metal_register_cholesky_max:
             return 0  # register-and-shuffle path (tile_cholesky.h metal_register_cholesky): no workspaces
         return 2 * n * n * elem  # W1, W2 workspaces
     if key in ("tile_cholesky_solve", "tile_lower_solve", "tile_upper_solve"):

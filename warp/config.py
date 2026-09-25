@@ -348,6 +348,12 @@ directly as a context manager.
 Note: Impacts performance when active due to call-stack introspection.
 """
 
+metal_register_cholesky_max: int = 40
+"""Largest matrix dimension that ``tile_cholesky`` factors in registers on Metal (one SIMD group,
+lanes own columns, SIMD-shuffle broadcasts, no barriers); larger matrices use the cooperative scalar
+path with a threadgroup barrier per column. Read when a module is built (part of its hash). Above
+about 64 the per-lane column registers spill."""
+
 max_unroll: int = 16
 """Maximum unroll factor for loops.
 

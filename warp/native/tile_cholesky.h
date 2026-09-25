@@ -80,6 +80,12 @@ namespace partitioned_gemm {
 // and WP_TILE_SYNC() is a no-op -- behaviour matches the prior single-threaded
 // scalar fallback.
 #if defined(__METAL_VERSION__)
+// Largest matrix dimension factored by the register path below (larger ones use the cooperative
+// scalar path with a threadgroup barrier per column). Set per module from warp.config.
+// metal_register_cholesky_max (codegen defines it; the Python scratch sizing reads the same value).
+#ifndef WP_METAL_REGISTER_CHOLESKY_MAX
+#define WP_METAL_REGISTER_CHOLESKY_MAX 40
+#endif
 // Register Cholesky for blocks of at most one SIMD group: lane l owns columns l, l+BD, ... of the
 // factor in registers; the owner of column j scales it, the column is broadcast with SIMD shuffles
 // and every lane applies the rank-1 update to its own columns. No threadgroup memory and no
@@ -163,7 +169,7 @@ template <bool Upper, typename TileA, typename TileOut>
 inline WP_FORCE_INLINE CUDA_CALLABLE void scalar_cholesky_impl(TileA WP_THREAD& A, TileOut WP_THREAD& Out)
 {
 #if defined(__METAL_VERSION__)
-    if constexpr (WP_TILE_BLOCK_DIM > 1 && WP_TILE_BLOCK_DIM <= 32 && TileA::Layout::Shape::dim(1) <= 40) {
+    if constexpr (WP_TILE_BLOCK_DIM > 1 && WP_TILE_BLOCK_DIM <= 32 && TileA::Layout::Shape::dim(1) <= WP_METAL_REGISTER_CHOLESKY_MAX) {
         metal_register_cholesky<Upper>(A, Out);
         return;
     }

@@ -3088,6 +3088,11 @@ class ModuleHasher:
         # the native headers the kernels compile against (see native_headers_digest())
         ch.update(native_headers_digest())
 
+        # Metal codegen settings read from warp.config at build time (only when changed from the
+        # default, so default builds keep their hashes)
+        if warp.config.metal_register_cholesky_max != 40:
+            ch.update(bytes(f"metal_register_cholesky_max:{int(warp.config.metal_register_cholesky_max)}", "utf-8"))
+
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output
         # configs get the same hash. This is fine because cuda_output only
@@ -3767,6 +3772,8 @@ class ModuleBuilder:
         type_defines = "" if "bfloat16" in source else "#define WP_NO_BFLOAT16\n"
         if device == "metal" and self.options.get("verify_fp"):
             type_defines += "#define WP_VERIFY_FP\n"  # CPU/CUDA pass this as a compiler flag
+        if device == "metal":
+            type_defines += f"#define WP_METAL_REGISTER_CHOLESKY_MAX {int(warp.config.metal_register_cholesky_max)}\n"
 
         # add headers
         #
