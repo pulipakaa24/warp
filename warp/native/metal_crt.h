@@ -198,6 +198,30 @@ inline float fmaf(float x, float y, float z) { return metal::fma(x, y, z); }
 inline float fminf(float x, float y) { return metal::fmin(x, y); }
 inline float fmaxf(float x, float y) { return metal::fmax(x, y); }
 inline float copysignf(float x, float y) { return metal::copysign(x, y); }
+// C99 nextafterf: the Metal library has none (air64 link error "Undefined symbol nextafterf" when native
+// snippets call it, e.g. Newton's VBD interval arithmetic). Bit-exact IEEE semantics, computed on the bit
+// patterns only: Apple GPUs flush float32 subnormals in comparisons, so a float compare would treat +-1 ULP
+// subnormals as zero. NaN in -> NaN, x == y -> y, +-0 -> smallest subnormal of y's sign, else one ULP toward y.
+inline int wp_metal_float_order(unsigned int u)
+{
+    return (u & 0x80000000u) ? -int(u & 0x7fffffffu) : int(u);
+}
+inline float nextafterf(float x, float y)
+{
+    const unsigned int ux = as_type<unsigned int>(x), uy = as_type<unsigned int>(y);
+    if ((ux & 0x7fffffffu) > 0x7f800000u || (uy & 0x7fffffffu) > 0x7f800000u)
+        return x + y;
+    const int kx = wp_metal_float_order(ux), ky = wp_metal_float_order(uy);
+    if (kx == ky)
+        return y;
+    if ((ux & 0x7fffffffu) == 0u)
+        return as_type<float>((ky > 0 ? 0u : 0x80000000u) | 1u);
+    const bool away_from_zero = (kx < ky) == ((ux & 0x80000000u) == 0u);
+    return as_type<float>(away_from_zero ? ux + 1u : ux - 1u);
+}
+// clang lowers __builtin_nextafterf to a libcall of nextafterf, which does not exist for air64; route the
+// builtin spelling (used by CPU branches of native snippets that Metal also takes) to the function above.
+#define __builtin_nextafterf(x, y) nextafterf((x), (y))
 inline float rsqrtf(float x) { return metal::rsqrt(x); }
 
 // Metal has no error functions. Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7)
