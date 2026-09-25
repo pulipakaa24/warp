@@ -504,9 +504,11 @@ def segmented_sort_pairs(
         apic_capture.track_array(segment_end_indices)
 
     if _runs_on_host(keys.device):
-        if keys.device.is_metal:
+        if keys.device.is_metal and not keys.device.is_capturing:
             # GPU semantics: malformed segment ranges are skipped instead of rejected (the CUDA path
-            # cannot validate them without a synchronous copy); filter them out before the host sort
+            # cannot validate them without a synchronous copy); filter them out before the host sort.
+            # Inside a graph capture the indices are not known yet (their kernels are only recorded) and
+            # the recorded host sort must trust them, as the CUDA path does.
             starts = segment_start_indices.numpy().astype(np.int32, copy=False)[:num_segments]
             ends = segment_end_indices.numpy().astype(np.int32, copy=False)[:num_segments]
             valid = (starts >= 0) & (starts <= ends) & (ends <= count)
