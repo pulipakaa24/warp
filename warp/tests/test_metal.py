@@ -152,9 +152,53 @@ def _make_tile_matmul_kernel(n: int):
     return tile_products
 
 
+# Newton's VBD interval arithmetic (newton/_src/solvers/vbd/interval_arithmetic.py) calls nextafterf through the
+# CPU branch of a native snippet on Metal; the Metal library has no nextafterf (air64 link error before the fix).
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
+return nextafterf(value, INFINITY);
+#else
+return __builtin_nextafterf(value, INFINITY);
+#endif
+"""
+)
+def next_float_up(value: float) -> float: ...
+
+
+@wp.func_native("return __builtin_nextafterf(value, toward);")
+def next_float_toward(value: float, toward: float) -> float: ...
+
+
+@wp.kernel
+def nextafter_kernel(x: wp.array[float], y: wp.array[float], up: wp.array[float], toward: wp.array[float]):
+    i = wp.tid()
+    up[i] = next_float_up(x[i])
+    toward[i] = next_float_toward(x[i], y[i])
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
+
+    def test_nextafterf(self):
+        """nextafterf and __builtin_nextafterf in native snippets: bit-exact against numpy and the CPU device."""
+        inf, nan = np.float32(np.inf), np.float32(np.nan)
+        tiny = np.float32(1.4e-45)
+        x = np.array([0.0, -0.0, 1.0, -1.0, 1.5e-38, -tiny, tiny, 3.4028235e38, -3.4028235e38, 0.1, -2.5, 1e-7, nan, inf, -inf, 7.0], np.float32)
+        y = np.array([1.0, -1.0, 0.0, 0.0, -1.0, 1.0, -1.0, inf, -inf, 0.1, -inf, 1.0, 0.0, 0.0, 0.0, nan], np.float32)
+        with np.errstate(over="ignore"):
+            ref_up = np.nextafter(x, np.full_like(x, inf))
+            ref_toward = np.nextafter(x, y)
+        for device in (self.device, "cpu"):
+            xs, ys = wp.array(x, device=device), wp.array(y, device=device)
+            up, toward = wp.zeros_like(xs), wp.zeros_like(xs)
+            wp.launch(nextafter_kernel, dim=len(x), inputs=[xs, ys, up, toward], device=device)
+            np.testing.assert_array_equal(up.numpy().view(np.uint32)[~np.isnan(ref_up)], ref_up.view(np.uint32)[~np.isnan(ref_up)], err_msg=device)
+            np.testing.assert_array_equal(np.isnan(up.numpy()), np.isnan(ref_up), err_msg=device)
+            fin = ~np.isnan(ref_toward)
+            np.testing.assert_array_equal(toward.numpy().view(np.uint32)[fin], ref_toward.view(np.uint32)[fin], err_msg=device)
+            np.testing.assert_array_equal(np.isnan(toward.numpy()), np.isnan(ref_toward), err_msg=device)
 
     def test_host_memory_prefix_then_whole(self):
         """A host range that starts inside an imported range but extends past it is mapped completely."""
