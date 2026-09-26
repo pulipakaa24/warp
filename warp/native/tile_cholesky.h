@@ -362,6 +362,47 @@ inline WP_FORCE_INLINE void metal_rolled_cholesky(TileA WP_THREAD& A, TileOut WP
     WP_TILE_SYNC();
 }
 
+// Split-loop form of the register step (MetalSim, experimental): the same products in the same order, but the
+// second column's update (rows >= BD only) is guarded by a condition on the compile-time row index, so after full
+// unrolling the rows below BD carry only the first column's update. Used by scripts/diagnostics/metal_cholesky_residency.py.
+template <int J, int N, int CPL, int BD, typename T>
+inline WP_FORCE_INLINE void metal_register_cholesky_step_split(thread T (&col)[CPL][N], int lane)
+{
+    if constexpr (J < N) {
+        constexpr int owner = J % BD;
+        constexpr int cj = J / BD;
+        if (lane == owner) {
+            const T d = wp::sqrt(col[cj][J]);
+            const T inv = T(1) / d;
+            col[cj][J] = d;
+#pragma clang loop unroll(full)
+            for (int i = J + 1; i < N; ++i)
+                col[cj][i] *= inv;
+        }
+        const int jc0 = lane;
+        T ljc0 = T {};
+        T ljc1 = T {};
+#pragma clang loop unroll(full)
+        for (int i = J; i < N; ++i) {
+            const T lij = metal::simd_shuffle(col[cj][i], ushort(owner));
+            if (i == jc0)
+                ljc0 = lij;
+            if (jc0 > J && i >= jc0)
+                col[0][i] -= lij * ljc0;
+            if constexpr (CPL > 1) {
+                if (i >= BD) {  // folds per unrolled iteration
+                    const int jc1 = lane + BD;
+                    if (i == jc1)
+                        ljc1 = lij;
+                    if (jc1 > J && i >= jc1)
+                        col[1][i] -= lij * ljc1;
+                }
+            }
+        }
+        metal_register_cholesky_step_split<J + 1, N, CPL, BD, T>(col, lane);
+    }
+}
+
 template <bool Upper, typename TileA, typename TileOut>
 inline WP_FORCE_INLINE void metal_register_cholesky(TileA WP_THREAD& A, TileOut WP_THREAD& Out)
 {
