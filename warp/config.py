@@ -371,6 +371,11 @@ metal_rolled_cholesky: int = int(_os.environ.get("WP_METAL_ROLLED_CHOLESKY", "0"
 operations in the same order, runtime loops (per-lane column arrays in thread memory, a few hundred instructions
 of code instead of ~n^2 unrolled). Experimental (2026-09-26); read when a module is built (part of its hash)."""
 
+metal_chol_split: bool = _os.environ.get("WP_METAL_CHOL_SPLIT", "1") != "0"
+"""Metal register Cholesky: use the split-loop step (scalar column pivots, second column guarded by the
+compile-time row index; the same products in the same order as the generic step). Read when a module is built
+(part of its hash)."""
+
 max_unroll: int = 16
 """Maximum unroll factor for loops.
 

@@ -362,9 +362,14 @@ inline WP_FORCE_INLINE void metal_rolled_cholesky(TileA WP_THREAD& A, TileOut WP
     WP_TILE_SYNC();
 }
 
-// Split-loop form of the register step (MetalSim, experimental): the same products in the same order, but the
-// second column's update (rows >= BD only) is guarded by a condition on the compile-time row index, so after full
-// unrolling the rows below BD carry only the first column's update. Used by scripts/diagnostics/metal_cholesky_residency.py.
+// Split-loop form of the register step (MetalSim): the same products in the same order (bitwise), but with scalar
+// column pivots (ljc0 / ljc1) instead of a per-lane array and the second column's update (rows >= BD only) guarded by
+// the compile-time row index. Measured 2026-09-26 in a native-snippet context at n = 43: 0.60 ms per 4096
+// factor + solve against 4.16 ms for the generic step (and 1.065 ms for the tile path with the generic step): the
+// generic form's indexed arrays compile badly on Metal. WP_METAL_CHOL_SPLIT (warp.config.metal_chol_split) selects it.
+#ifndef WP_METAL_CHOL_SPLIT
+#define WP_METAL_CHOL_SPLIT 1
+#endif
 template <int J, int N, int CPL, int BD, typename T>
 inline WP_FORCE_INLINE void metal_register_cholesky_step_split(thread T (&col)[CPL][N], int lane)
 {
@@ -431,7 +436,10 @@ inline WP_FORCE_INLINE void metal_register_cholesky(TileA WP_THREAD& A, TileOut 
             col[c][i] = (jc < n && i >= jc) ? (Upper ? A.data(tile_coord(jc, i)) : A.data(tile_coord(i, jc))) : T {};
     }
 
-    metal_register_cholesky_step<0, n, CPL, BD, T>(col, lane);
+    if constexpr (WP_METAL_CHOL_SPLIT && CPL <= 2)
+        metal_register_cholesky_step_split<0, n, CPL, BD, T>(col, lane);
+    else
+        metal_register_cholesky_step<0, n, CPL, BD, T>(col, lane);
 
     WP_TILE_SYNC();  // in-place callers alias A and Out: all reads are done before any write
 #pragma clang loop unroll(full)
