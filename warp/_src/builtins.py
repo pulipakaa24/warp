@@ -18415,6 +18415,56 @@ add_builtin(
 )
 
 
+def tile_cholesky_update_inplace_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return None
+    a = arg_types["A"]
+    x = arg_types["X"]
+    if not is_tile(a) or not is_tile(x):
+        raise TypeError("tile_cholesky_update_inplace() 'A' and 'X' must be tiles")
+    if not types_equal(a.dtype, x.dtype):
+        raise TypeError("tile_cholesky_update_inplace() arguments must have the same dtype")
+    if len(a.shape) != 2 or a.shape[0] != a.shape[1]:
+        raise ValueError("tile_cholesky_update_inplace() 'A' must be a square 2D tile")
+    if len(x.shape) != 2 or x.shape[1] != a.shape[0]:
+        raise ValueError("tile_cholesky_update_inplace() 'X' must be a 2D tile with as many columns as 'A' has rows")
+    return None
+
+
+def tile_cholesky_update_inplace_lto_dispatch_func(
+    arg_types: Mapping[str, type],
+    return_type: Any,
+    return_values: List[Var],
+    arg_values: Mapping[str, Var],
+    options: Mapping[str, Any],
+    builder: warp._src.context.ModuleBuilder,
+):
+    upper = _tile_cholesky_extract_fill_mode(arg_values, func_name="tile_cholesky_update_inplace")
+    a = arg_values["A"]
+    x = arg_values["X"]
+    a.type.storage = "shared"
+    x.type.storage = "shared"
+    return ((a, x, arg_values["count"]), [upper], [], 0)
+
+
+add_builtin(
+    "tile_cholesky_update_inplace",
+    input_types={"A": tile(dtype=Float, shape=tuple[int, int]), "X": tile(dtype=Float, shape=tuple[int, int]), "count": int, "fill_mode": str},
+    defaults={"fill_mode": "lower"},
+    value_func=tile_cholesky_update_inplace_value_func,
+    lto_dispatch_func=tile_cholesky_update_inplace_lto_dispatch_func,
+    variadic=True,
+    native_func="tile_cholesky_update_inplace",
+    doc="""Rank-1 updates of a Cholesky factor in place: for each of the first ``count`` rows ``x`` of ``X``,
+    ``L L^T <- L L^T + x x^T`` (``fill_mode="lower"``: ``A`` holds ``L``; ``"upper"``: ``A`` holds ``U = L^T``).
+    Additions only (the mju_cholUpdate recurrence, diagonal floored at 1e-15). ``fill_mode`` must be a
+    compile-time constant. No adjoint.""",
+    group="Tile Primitives",
+    export=False,
+    is_differentiable=False,
+)
+
+
 def _tile_cholesky_solve_generic_value_func(inplace: bool, arg_types, arg_values):
     if arg_types is None:
         if inplace:

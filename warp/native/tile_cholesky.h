@@ -773,6 +773,133 @@ CUDA_CALLABLE void adj_tile_cholesky(
     adj_tile_cholesky_impl<Upper>(fun_bkwd_gemm, fun_bkwd_trsm, Out, adj_A, adj_Out);
 }
 
+// Rank-1 Cholesky updates in place (MetalSim): for each of the first `count` rows x of X, L L^T <- L L^T + x x^T
+// (A holds L when Upper is false, U = L^T when true), the mju_cholUpdate recurrence: for k in 0..n-1,
+// r = sqrt(L[k,k]^2 + x[k]^2) (floored at 1e-15), c = r / L[k,k], s = x[k] / L[k,k], L[k,k] = r,
+// L[i,k] = (L[i,k] + s x[i]) / c and x[i] = c x[i] - s L[i,k] for i > k. Additions only (no downdates).
+#if defined(__METAL_VERSION__)
+// Register form for blocks of at most one SIMD group: lane l holds ROWS l, l+BD, ... of L (a rank-1 update walks the
+// columns in sequence and touches one element of every row below the diagonal per column, so rows are the parallel
+// dimension) and the x entries of the same indices; L[k,k] and x[k] are broadcast from their owner with SIMD
+// shuffles, no barriers. Column loop unrolled by template recursion (compile-time register indices).
+template <int K, int N, int CPL, int BD, typename T>
+inline WP_FORCE_INLINE void metal_register_cholesky_update_step(thread T (&row)[CPL][N], thread T (&xv)[CPL], int lane)
+{
+    if constexpr (K < N) {
+        constexpr int owner = K % BD;
+        constexpr int ck = K / BD;
+        const T Lkk = metal::simd_shuffle(row[ck][K], ushort(owner));
+        const T xk = metal::simd_shuffle(xv[ck], ushort(owner));
+        T tmp = Lkk * Lkk + xk * xk;
+        if (tmp < T(1e-15))
+            tmp = T(1e-15);
+        const T r = wp::sqrt(tmp);
+        const T c = r / Lkk;
+        const T cinv = T(1) / c;
+        const T s = xk / Lkk;
+        if (lane == owner)
+            row[ck][K] = r;
+#pragma clang loop unroll(full)
+        for (int cc = 0; cc < CPL; ++cc) {
+            const int jr = lane + cc * BD;
+            if (jr > K) {
+                const T l = (row[cc][K] + s * xv[cc]) * cinv;
+                row[cc][K] = l;
+                xv[cc] = c * xv[cc] - s * l;
+            }
+        }
+        metal_register_cholesky_update_step<K + 1, N, CPL, BD, T>(row, xv, lane);
+    }
+}
+
+template <bool Upper, typename TileA, typename TileX>
+inline WP_FORCE_INLINE void metal_register_cholesky_update(TileA WP_THREAD& A, TileX WP_THREAD& X, int count)
+{
+    using T = typename TileA::Type;
+    constexpr int n = TileA::Layout::Shape::dim(1);
+    constexpr int BD = WP_TILE_BLOCK_DIM;
+    constexpr int CPL = (n + BD - 1) / BD;  // rows per lane
+    const int lane = WP_TILE_THREAD_IDX;
+
+    auto idx = [](int r, int c) { return Upper ? tile_coord(c, r) : tile_coord(r, c); };  // L[r, c]
+
+    WP_TILE_SYNC();  // X and A may have been written by other lanes' tile ops
+    T row[CPL][n];
+    T xv[CPL];
+#pragma clang loop unroll(full)
+    for (int cc = 0; cc < CPL; ++cc) {
+        const int jr = lane + cc * BD;
+#pragma clang loop unroll(full)
+        for (int j = 0; j < n; ++j)
+            row[cc][j] = (jr < n && j <= jr) ? A.data(idx(jr, j)) : T {};
+    }
+    for (int v = 0; v < count; ++v) {
+#pragma clang loop unroll(full)
+        for (int cc = 0; cc < CPL; ++cc) {
+            const int jr = lane + cc * BD;
+            xv[cc] = (jr < n) ? X.data(tile_coord(v, jr)) : T {};
+        }
+        metal_register_cholesky_update_step<0, n, CPL, BD, T>(row, xv, lane);
+    }
+#pragma clang loop unroll(full)
+    for (int cc = 0; cc < CPL; ++cc) {
+        const int jr = lane + cc * BD;
+        if (jr < n) {
+#pragma clang loop unroll(full)
+            for (int j = 0; j < n; ++j)
+                if (j <= jr)
+                    A.data(idx(jr, j)) = row[cc][j];
+        }
+    }
+    WP_TILE_SYNC();
+}
+#endif  // __METAL_VERSION__
+
+template <bool Upper, typename TileA, typename TileX>
+inline CUDA_CALLABLE void tile_cholesky_update_inplace(TileA WP_THREAD& A, TileX WP_THREAD& X, int count)
+{
+    using T = typename TileA::Type;
+    constexpr int n = TileA::Layout::Shape::dim(1);
+#if defined(__METAL_VERSION__)
+    if constexpr (WP_TILE_BLOCK_DIM > 1 && WP_TILE_BLOCK_DIM <= 32 && n <= WP_METAL_REGISTER_CHOLESKY_MAX) {
+        metal_register_cholesky_update<Upper>(A, X, count);
+        return;
+    }
+#endif
+    auto idx = [](int r, int c) { return Upper ? tile_coord(c, r) : tile_coord(r, c); };  // L[r, c]
+    WP_TILE_SYNC();
+    if (WP_TILE_THREAD_IDX == 0) {
+        for (int v = 0; v < count; ++v) {
+            T x[n];
+            for (int i = 0; i < n; ++i)
+                x[i] = X.data(tile_coord(v, i));
+            for (int k = 0; k < n; ++k) {
+                const T Lkk = A.data(idx(k, k));
+                T tmp = Lkk * Lkk + x[k] * x[k];
+                if (tmp < T(1e-15))
+                    tmp = T(1e-15);
+                const T r = wp::sqrt(tmp);
+                const T c = r / Lkk;
+                const T cinv = T(1) / c;
+                const T s = x[k] / Lkk;
+                A.data(idx(k, k)) = r;
+                for (int i = k + 1; i < n; ++i) {
+                    const T l = (A.data(idx(i, k)) + s * x[i]) * cinv;
+                    A.data(idx(i, k)) = l;
+                    x[i] = c * x[i] - s * l;
+                }
+            }
+        }
+    }
+    WP_TILE_SYNC();
+}
+
+template <bool Upper, typename TileA, typename TileX, typename AdjTileA, typename AdjTileX>
+inline CUDA_CALLABLE void adj_tile_cholesky_update_inplace(TileA WP_THREAD& A, TileX WP_THREAD& X, int count, AdjTileA WP_THREAD& adj_A, AdjTileX WP_THREAD& adj_X, int adj_count)
+{
+    // MISSINGADJOINT
+}
+
 // Cholesky (inplace): tile_cholesky_inplace<false>(...) for lower, tile_cholesky_inplace<true>(...) for upper
 template <bool Upper, typename Fwd, typename TileA>
 CUDA_CALLABLE void tile_cholesky_inplace(Fwd fun_forward, TileA WP_THREAD& A)
