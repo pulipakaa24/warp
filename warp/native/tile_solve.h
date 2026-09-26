@@ -317,7 +317,7 @@ inline WP_FORCE_INLINE void metal_register_cholesky_solve2(TileA WP_THREAD& A, T
 }
 
 #ifndef WP_METAL_COMPACT_REGISTER_CHOLESKY
-#define WP_METAL_COMPACT_REGISTER_CHOLESKY 1
+#define WP_METAL_COMPACT_REGISTER_CHOLESKY 0
 #endif
 
 template <bool Upper, typename TileA, typename TileX, typename TileY>

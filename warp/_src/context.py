@@ -3094,8 +3094,8 @@ class ModuleHasher:
             ch.update(bytes(f"metal_register_cholesky_max:{int(warp.config.metal_register_cholesky_max)}", "utf-8"))
         if not warp.config.metal_register_solve:
             ch.update(b"metal_register_solve:0")
-        if not warp.config.metal_compact_register_cholesky:
-            ch.update(b"metal_compact_register_cholesky:0")
+        if warp.config.metal_compact_register_cholesky:
+            ch.update(b"metal_compact_register_cholesky:1")
 
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output
