@@ -167,9 +167,121 @@ inline CUDA_CALLABLE void scalar_cholesky_back_substitution(TileA WP_THREAD& A, 
     }
 }
 
+#if defined(__METAL_VERSION__)
+#ifndef WP_METAL_REGISTER_CHOLESKY_MAX
+#define WP_METAL_REGISTER_CHOLESKY_MAX 40
+#endif
+#ifndef WP_METAL_REGISTER_SOLVE
+#define WP_METAL_REGISTER_SOLVE 1
+#endif
+// Register triangular solves for blocks of at most one SIMD group (MetalSim). Lane l holds columns
+// l, l+BD, ... of L (= U^T when the factor is stored upper) in registers, as metal_register_cholesky
+// does, together with the right-hand side and solution entries of the same indices.
+//   forward, L y = b:   row i's dot product is a per-lane partial over the lane's columns jc < i and a
+//                       SIMD-group sum; the owner of column i divides by L[i, i].
+//   backward, L^T x = y: from the last row down, x_i is broadcast from its owner and every lane
+//                       subtracts L[i, jc] x_i from the right-hand sides of its columns jc < i.
+// No threadgroup memory traffic and no barriers inside the sweeps; the cooperative path above pays
+// two barriers per row per sweep. The row loops are unrolled by template recursion so that every
+// register-array index is a compile-time constant. Summation order differs from the cooperative
+// path (float noise). Disabled per module with WP_METAL_REGISTER_SOLVE 0 (warp.config.metal_register_solve).
+template <int I, int N, int CPL, int BD, typename T>
+inline WP_FORCE_INLINE void
+metal_register_forward_step(thread const T (&col)[CPL][N], thread T (&y)[CPL], thread const T (&b)[CPL], int lane)
+{
+    if constexpr (I < N) {
+        constexpr int owner = I % BD;
+        constexpr int ci = I / BD;
+        T partial = T {};
+#pragma clang loop unroll(full)
+        for (int c = 0; c < CPL; ++c) {
+            const int jc = lane + c * BD;
+            if (jc < I)
+                partial += col[c][I] * y[c];
+        }
+        const T total = metal::simd_sum(partial);
+        if (lane == owner) {
+            const T diag = col[ci][I];
+            const T v = b[ci] - total;
+            y[ci] = (diag != T(0)) ? v / diag : v;
+        }
+        metal_register_forward_step<I + 1, N, CPL, BD, T>(col, y, b, lane);
+    }
+}
+
+template <int I, int N, int CPL, int BD, typename T>
+inline WP_FORCE_INLINE void
+metal_register_backward_step(thread const T (&col)[CPL][N], thread T (&acc)[CPL], thread T (&x)[CPL], int lane)
+{
+    if constexpr (I >= 0) {
+        constexpr int owner = I % BD;
+        constexpr int ci = I / BD;
+        T v = T {};
+        if (lane == owner) {
+            const T diag = col[ci][I];
+            v = (diag != T(0)) ? acc[ci] / diag : acc[ci];
+            x[ci] = v;
+        }
+        const T xi = metal::simd_shuffle(v, ushort(owner));
+#pragma clang loop unroll(full)
+        for (int c = 0; c < CPL; ++c) {
+            const int jc = lane + c * BD;
+            if (jc < I)
+                acc[c] -= col[c][I] * xi;
+        }
+        metal_register_backward_step<I - 1, N, CPL, BD, T>(col, acc, x, lane);
+    }
+}
+
+template <bool Upper, typename TileA, typename TileX, typename TileY>
+inline WP_FORCE_INLINE void metal_register_cholesky_solve(TileA WP_THREAD& A, TileX WP_THREAD& X, TileY WP_THREAD& Y)
+{
+    using T = typename TileA::Type;
+    constexpr int n = TileA::Layout::Shape::dim(1);
+    constexpr int BD = WP_TILE_BLOCK_DIM;
+    constexpr int CPL = (n + BD - 1) / BD;  // columns per lane
+    const int lane = WP_TILE_THREAD_IDX;
+
+    // L[i, jc] for i >= jc is A(jc, i) when A holds U (Upper), A(i, jc) otherwise
+    T col[CPL][n];
+    T b[CPL];
+    T y[CPL];
+    T x[CPL];
+#pragma clang loop unroll(full)
+    for (int c = 0; c < CPL; ++c) {
+        const int jc = lane + c * BD;
+        b[c] = (jc < n) ? Y.data(tile_coord(jc)) : T {};
+        y[c] = T {};
+        x[c] = T {};
+#pragma clang loop unroll(full)
+        for (int i = 0; i < n; ++i)
+            col[c][i] = (jc < n && i >= jc) ? (Upper ? A.data(tile_coord(jc, i)) : A.data(tile_coord(i, jc))) : T {};
+    }
+    WP_TILE_SYNC();  // X may alias Y: every lane has read its right-hand side before any lane writes
+
+    metal_register_forward_step<0, n, CPL, BD, T>(col, y, b, lane);
+    metal_register_backward_step<n - 1, n, CPL, BD, T>(col, y, x, lane);
+
+#pragma clang loop unroll(full)
+    for (int c = 0; c < CPL; ++c) {
+        const int jc = lane + c * BD;
+        if (jc < n)
+            X.data(tile_coord(jc)) = x[c];
+    }
+    WP_TILE_SYNC();
+}
+#endif  // __METAL_VERSION__
+
 template <bool Upper, typename TileA, typename TileX, typename TileY>
 inline CUDA_CALLABLE void scalar_cholesky_solve(TileA WP_THREAD& A, TileX WP_THREAD& X, TileY WP_THREAD& Y)
 {
+#if defined(__METAL_VERSION__)
+    if constexpr (WP_METAL_REGISTER_SOLVE && TileY::Layout::Shape::N == 1 && WP_TILE_BLOCK_DIM > 1 && WP_TILE_BLOCK_DIM <= 32
+                  && TileA::Layout::Shape::dim(1) <= WP_METAL_REGISTER_CHOLESKY_MAX) {
+        metal_register_cholesky_solve<Upper>(A, X, Y);
+        return;
+    }
+#endif
     scalar_cholesky_forward_substitution<Upper>(A, X, Y);
     scalar_cholesky_back_substitution<Upper>(A, X);
 }
