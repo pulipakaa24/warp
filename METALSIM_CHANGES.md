@@ -22,6 +22,10 @@ innate-inc/warp (same blob). The changes below modify Apache-2.0 code and are of
 | `9050cb54` | `nextafterf` (and `__builtin_nextafterf`) in the Metal kernel runtime, bit-exact on float32 bit patterns (Newton's VBD solver needs it). |
 | `9ebfad43` | Merge of `metalsim-flex` (`9dcb1406`). |
 | `f194006a` | Merge of `9050cb54` into the merge above; the tree MetalSim's results were produced with. |
+| `27e63fd1`, `a5b65da1`, `0c9a1fb5` | Metal: register triangular solves in `tile_cholesky_solve` (vector RHS, blocks of at most one SIMD group, matrices up to `metal_register_cholesky_max`): lanes own the factor's columns as in the register Cholesky, forward substitution reduces each row with `simd_sum`, back substitution broadcasts with `simd_shuffle`, no barriers inside the sweeps (the cooperative path pays two per row per sweep). Solve 0.52 -> 0.34 ms per 4096 at n = 43; MuJoCo Warp's G1 step +5.2 %. Summation order only (1.3-3.4e-7 relative). `warp.config.metal_register_solve = False` / `WP_METAL_REGISTER_SOLVE=0` restores the cooperative path. |
+| `c44a3f16`, `139385a8` | Metal: compact two-column register layout for the register Cholesky and solve at 33-64 rows (bitwise the generic form). Measured 5-8 % slower at n = 43 / 48; off, `warp.config.metal_compact_register_cholesky` / `WP_METAL_COMPACT_REGISTER_CHOLESKY=1`. |
+| `2869a2f7` | Metal: rolled (runtime-loop) form of the register Cholesky, bitwise the unrolled form; 3.4x slower at n = 43 (thread-memory arrays); off, `warp.config.metal_rolled_cholesky` / `WP_METAL_ROLLED_CHOLESKY=<min n>`. |
+| `e29950ee` | `tile_cholesky_update_inplace(A, X, count, fill_mode)`: rank-1 Cholesky updates in place (the `mju_cholUpdate` recurrence, additions only), a Metal register form (lanes own rows, SIMD broadcasts) and a scalar path; no adjoint. Used by MuJoCo Warp's archived `MJW_ELLIPTIC_CONE_UPDATE` path. |
 
 The same seven code commits are exported as `patches/warp/0001-0007` in MetalSim; applying them to `ce15f6bb`
 gives the tree of `f194006a`. Tests for the Metal changes are in `warp/tests/test_metal.py`.
