@@ -26,6 +26,7 @@ innate-inc/warp (same blob). The changes below modify Apache-2.0 code and are of
 | `c44a3f16`, `139385a8` | Metal: compact two-column register layout for the register Cholesky and solve at 33-64 rows (bitwise the generic form). Measured 5-8 % slower at n = 43 / 48; off, `warp.config.metal_compact_register_cholesky` / `WP_METAL_COMPACT_REGISTER_CHOLESKY=1`. |
 | `2869a2f7` | Metal: rolled (runtime-loop) form of the register Cholesky, bitwise the unrolled form; 3.4x slower at n = 43 (thread-memory arrays); off, `warp.config.metal_rolled_cholesky` / `WP_METAL_ROLLED_CHOLESKY=<min n>`. |
 | `e29950ee` | `tile_cholesky_update_inplace(A, X, count, fill_mode)`: rank-1 Cholesky updates in place (the `mju_cholUpdate` recurrence, additions only), a Metal register form (lanes own rows, SIMD broadcasts) and a scalar path; no adjoint. Used by MuJoCo Warp's archived `MJW_ELLIPTIC_CONE_UPDATE` path. |
+| `2834cf31` | Metal: 64-lane register Cholesky (`metal_register_cholesky64`, two SIMD groups per matrix, one column per lane, the tile's own column storage as the per-column exchange with one barrier per column) and a `block_dim` 64 path for the register solve (group 0 computes). Bitwise the 32-lane form at n = 16..48; no faster at n = 43 (factor 0.998 vs 0.989 ms per 4096, solve 0.239 vs 0.326), so MuJoCo Warp keeps 32 lanes; `WP_METAL_CHOL64=0` removes the form. |
 
 The same seven code commits are exported as `patches/warp/0001-0007` in MetalSim; applying them to `ce15f6bb`
 gives the tree of `f194006a`. Tests for the Metal changes are in `warp/tests/test_metal.py`.
