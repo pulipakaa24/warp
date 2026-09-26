@@ -50,6 +50,10 @@ void* wp_metal_capture_pop(int) { return unavailable(), nullptr; }
 
 int wp_metal_capture_conditional(int, int, const int*, void*, void*, int, int) { return unavailable(); }
 
+int wp_metal_capture_range_begin(int, void*) { return unavailable(); }
+
+int wp_metal_capture_range_end(int) { return unavailable(); }
+
 bool wp_metal_capture_host_op(int, std::function<bool()>) { return false; }
 
 void wp_metal_defer_error(int) { }

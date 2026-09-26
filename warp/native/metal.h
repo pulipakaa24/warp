@@ -86,6 +86,11 @@ WP_API void* wp_metal_capture_pop(int ordinal);
 WP_API int wp_metal_capture_conditional(
     int ordinal, int is_loop, const int* condition, void* on_true, void* on_false, int own_true, int own_false
 );
+// Indirect execution range: the launches recorded between begin and end are replayed through an ICB execution
+// range the GPU reads from range_host (16 bytes in a Metal allocation: uint32 location, length, full length,
+// pad; location and lengths are filled in at end). A kernel of the replay may zero the length to skip them.
+WP_API int wp_metal_capture_range_begin(int ordinal, void* range_host);
+WP_API int wp_metal_capture_range_end(int ordinal);
 // Records a host function call (up to 8 integer/pointer args) to replay with the graph; 0 when not capturing.
 WP_API int wp_metal_capture_host_call(int ordinal, void* fn, const unsigned long long* args, int nargs);
 WP_API void wp_metal_graph_destroy(int ordinal, void* graph);

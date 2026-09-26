@@ -7010,6 +7010,10 @@ class Runtime:
                 ctypes.c_int,
             ]
             self.core.wp_metal_capture_conditional.restype = ctypes.c_int
+            self.core.wp_metal_capture_range_begin.argtypes = [ctypes.c_int, ctypes.c_void_p]
+            self.core.wp_metal_capture_range_begin.restype = ctypes.c_int
+            self.core.wp_metal_capture_range_end.argtypes = [ctypes.c_int]
+            self.core.wp_metal_capture_range_end.restype = ctypes.c_int
             self.core.wp_texture_create_metal.argtypes = [
                 ctypes.c_int,
                 ctypes.c_int,
@@ -13817,6 +13821,29 @@ def capture_begin(
         runtime._apic_graph = graph
 
     _register_capture(device, stream, graph, capture_id)
+
+
+def metal_capture_range_begin(ranges: warp.array, index: int = 0, device: DeviceLike = None) -> bool:
+    """Metal graph capture: the launches recorded until :func:`metal_capture_range_end` are replayed through an
+    indirect-command-buffer execution range that the GPU reads from ``ranges[4 * index : 4 * index + 4]``
+    (``uint32``: location, length, full length, pad; filled in at the range's end). A kernel recorded earlier in
+    the same graph may write 0 to the length, and the range's launches are then skipped in that replay: an exact
+    early exit of a fixed-count iteration loop without a conditional graph node. Returns False (and records
+    nothing special) when no Metal capture is in progress on the device."""
+    device = runtime.get_device(device)
+    if not device.is_metal or runtime._metal_graph is None:
+        return False
+    if ranges.dtype is not warp.uint32 or ranges.device != device:
+        raise TypeError("metal_capture_range_begin: ranges must be a uint32 array on the capturing Metal device")
+    if runtime.core.wp_metal_capture_range_begin(device.metal_ordinal, ctypes.c_void_p(ranges.ptr + 16 * index)) != 0:
+        raise RuntimeError(runtime.get_error_string())
+    return True
+
+
+def metal_capture_range_end(device: DeviceLike = None):
+    device = runtime.get_device(device)
+    if runtime.core.wp_metal_capture_range_end(device.metal_ordinal) != 0:
+        raise RuntimeError(runtime.get_error_string())
 
 
 def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Graph:

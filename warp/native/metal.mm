@@ -116,6 +116,19 @@ struct Graph {
     // Built lazily on the first launch; graphs with host ops keep the per-dispatch path.
     id<MTLIndirectCommandBuffer> icb;
     bool icb_tried = false;
+    // Indirect execution ranges (wp_metal_capture_range_begin / _end): the dispatches [start, start + count) are
+    // replayed through executeCommandsInBuffer:indirectBuffer:, whose {location, length} the GPU reads from
+    // range_host (a 16-byte Metal allocation: uint32 location, length, full length, pad). A kernel that ran
+    // earlier in the same replay can set length to 0 and the segment's dispatches are not executed at all: an
+    // exact per-world early exit of an iteration loop without a conditional graph node (MetalSim, 2026-09-26).
+    struct Segment {
+        size_t start, count;
+        void* range_host;
+        id<MTLBuffer> buffer;  // resolved at begin: the allocation may be freed (and retained by the graph) later
+        size_t offset;
+    };
+    std::vector<Segment> segments;
+    bool segment_open = false;
 };
 
 struct Device {
@@ -1302,6 +1315,12 @@ void* wp_metal_capture_end(int ordinal)
             return nullptr;
         }
         Graph* graph = dev->capture;
+        if (graph->segment_open) {
+            discard_recording(*dev, graph);
+            dev->capture = nullptr;
+            wp::set_error_string("Graph capture ended while an indirect execution range was still open");
+            return nullptr;
+        }
         dev->capture = nullptr;
         return finalize_capture(*dev, graph);
     }
@@ -1451,23 +1470,51 @@ static int graph_launch(Device& device, Graph* graph)
             const size_t count = graph->dispatches.size();
             const int batch = icb_batch() > 0 ? icb_batch() : int(std::max(count, size_t(1)) + dev->num_dispatches);
             size_t offset = 0;
-            while (offset < count) {
-                int room = batch - dev->num_dispatches;
-                if (room <= 0) {
+            auto room = [&]() -> int {
+                for (;;) {
+                    int r = batch - dev->num_dispatches;
+                    if (r > 0)
+                        return r;
                     if (!flush(*dev))
                         return -1;
-                    continue;
                 }
-                const size_t len = std::min(count - offset, size_t(room));
+            };
+            auto exec_plain = [&](size_t end) -> bool {
+                while (offset < end) {
+                    int r = room();
+                    if (r < 0)
+                        return false;
+                    const size_t len = std::min(end - offset, size_t(r));
+                    id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
+                    [encoder useResource:graph->buffer usage:MTLResourceUsageRead];
+                    [encoder executeCommandsInBuffer:graph->icb withRange:NSMakeRange(offset, len)];
+                    dev->n_dispatch += len;
+                    dev->num_dispatches += int(len);
+                    offset += len;
+                    if (dev->num_dispatches >= batch && !flush(*dev))
+                        return false;
+                }
+                return true;
+            };
+            for (const Graph::Segment& seg : graph->segments) {
+                if (!exec_plain(seg.start))
+                    return -1;
+                if (room() < 0)
+                    return -1;
+                // the range is read by the GPU when this command executes, after the preceding commands of the
+                // (serial) encoder and of the queue completed: a kernel among them may have zeroed the length
                 id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
                 [encoder useResource:graph->buffer usage:MTLResourceUsageRead];
-                [encoder executeCommandsInBuffer:graph->icb withRange:NSMakeRange(offset, len)];
-                dev->n_dispatch += len;
-                dev->num_dispatches += int(len);
-                offset += len;
+                [encoder useResource:seg.buffer usage:MTLResourceUsageRead];
+                [encoder executeCommandsInBuffer:graph->icb indirectBuffer:seg.buffer indirectBufferOffset:seg.offset];
+                dev->n_dispatch += seg.count;
+                dev->num_dispatches += int(seg.count);
+                offset = seg.start + seg.count;
                 if (dev->num_dispatches >= batch && !flush(*dev))
                     return -1;
             }
+            if (!exec_plain(count))
+                return -1;
             return 0;
         }
     }
@@ -1525,6 +1572,57 @@ bool wp_metal_capture_host_op(int ordinal, std::function<bool()> op)
 
 // Records a call to a host function taking up to 8 integer/pointer arguments (the Python utilities such as
 // array_scan and radix_sort_pairs run on the host for Metal); replayed in order with the graph's dispatches.
+int wp_metal_capture_range_begin(int ordinal, void* range_host)
+{
+    WP_METAL_LOCK();
+    Device* dev = get_device(ordinal);
+    if (!dev || !dev->capture) {
+        wp::set_error_string("No graph capture in progress");
+        return -1;
+    }
+    Graph* graph = dev->capture;
+    if (graph->segment_open) {
+        wp::set_error_string("An indirect execution range is already open in this capture");
+        return -1;
+    }
+    uintptr_t base = 0;
+    id<MTLBuffer> buffer = range_host && !(uintptr_t(range_host) & 15)
+        ? buffer_containing(dev->allocations, uint64_t(range_host), false, base, [](id<MTLBuffer> x) { return x; })
+        : nil;
+    if (!buffer || (uintptr_t(range_host) - base) + 16 > buffer.length) {
+        wp::set_error_string("The indirect execution range must be a 16-byte-aligned Metal allocation of 16 bytes");
+        return -1;
+    }
+    graph->segments.push_back({ graph->dispatches.size(), 0, range_host, buffer, size_t(uintptr_t(range_host) - base) });
+    graph->segment_open = true;
+    return 0;
+}
+
+int wp_metal_capture_range_end(int ordinal)
+{
+    WP_METAL_LOCK();
+    Device* dev = get_device(ordinal);
+    if (!dev || !dev->capture || !dev->capture->segment_open) {
+        wp::set_error_string("No indirect execution range is open");
+        return -1;
+    }
+    Graph* graph = dev->capture;
+    Graph::Segment& seg = graph->segments.back();
+    seg.count = graph->dispatches.size() - seg.start;
+    graph->segment_open = false;
+    if (seg.count == 0) {
+        graph->segments.pop_back();
+        return 0;
+    }
+    // unified memory: the recorded range is written in place; a kernel of the replay may zero the length
+    uint32_t* range = static_cast<uint32_t*>(seg.range_host);
+    range[0] = uint32_t(seg.start);
+    range[1] = uint32_t(seg.count);
+    range[2] = uint32_t(seg.count);
+    range[3] = 0;
+    return 0;
+}
+
 int wp_metal_capture_host_call(int ordinal, void* fn, const unsigned long long* args, int nargs)
 {
     if (!fn || nargs < 0 || nargs > 8)
