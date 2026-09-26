@@ -360,6 +360,11 @@ Metal (one SIMD group, lanes own columns, SIMD sums and shuffles, no barriers in
 matrices up to ``metal_register_cholesky_max``; False keeps the cooperative scalar path (two threadgroup
 barriers per row per sweep). Read when a module is built (part of its hash)."""
 
+metal_compact_register_cholesky: bool = _os.environ.get("WP_METAL_COMPACT_REGISTER_CHOLESKY", "1") != "0"
+"""Metal register Cholesky and register solve for 33..64 rows: hold the lane's second column compactly (rows
+>= 32 only, 54 instead of 86 registers at n = 43) and skip the rows it cannot have. Same operations in the same
+order (bitwise). False keeps the generic two-column form. Read when a module is built (part of its hash)."""
+
 max_unroll: int = 16
 """Maximum unroll factor for loops.
 

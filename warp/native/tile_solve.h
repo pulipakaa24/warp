@@ -233,6 +233,93 @@ metal_register_backward_step(thread const T (&col)[CPL][N], thread T (&acc)[CPL]
     }
 }
 
+// Two columns per lane, compact (see metal_register_cholesky2): c1 holds rows i >= BD of column lane + BD.
+template <int I, int N, int BD, typename T>
+inline WP_FORCE_INLINE void
+metal_register_forward_step2(thread const T (&c0)[N], thread const T (&c1)[N - BD], thread T (&y)[2], thread const T (&b)[2], int lane)
+{
+    if constexpr (I < N) {
+        constexpr int owner = I % BD;
+        constexpr int ci = I / BD;
+        T partial = T {};
+        if (lane < I)
+            partial += c0[I] * y[0];
+        if constexpr (I > BD) {
+            if (lane + BD < I)
+                partial += c1[I - BD] * y[1];
+        }
+        const T total = metal::simd_sum(partial);
+        if (lane == owner) {
+            const T diag = (ci == 0) ? c0[I] : c1[(I >= BD) ? (I - BD) : 0];
+            const T v = b[ci] - total;
+            y[ci] = (diag != T(0)) ? v / diag : v;
+        }
+        metal_register_forward_step2<I + 1, N, BD, T>(c0, c1, y, b, lane);
+    }
+}
+
+template <int I, int N, int BD, typename T>
+inline WP_FORCE_INLINE void
+metal_register_backward_step2(thread const T (&c0)[N], thread const T (&c1)[N - BD], thread T (&acc)[2], thread T (&x)[2], int lane)
+{
+    if constexpr (I >= 0) {
+        constexpr int owner = I % BD;
+        constexpr int ci = I / BD;
+        T v = T {};
+        if (lane == owner) {
+            const T diag = (ci == 0) ? c0[I] : c1[(I >= BD) ? (I - BD) : 0];
+            v = (diag != T(0)) ? acc[ci] / diag : acc[ci];
+            x[ci] = v;
+        }
+        const T xi = metal::simd_shuffle(v, ushort(owner));
+        if (lane < I)
+            acc[0] -= c0[I] * xi;
+        if constexpr (I > BD) {
+            if (lane + BD < I)
+                acc[1] -= c1[I - BD] * xi;
+        }
+        metal_register_backward_step2<I - 1, N, BD, T>(c0, c1, acc, x, lane);
+    }
+}
+
+template <bool Upper, typename TileA, typename TileX, typename TileY>
+inline WP_FORCE_INLINE void metal_register_cholesky_solve2(TileA WP_THREAD& A, TileX WP_THREAD& X, TileY WP_THREAD& Y)
+{
+    using T = typename TileA::Type;
+    constexpr int n = TileA::Layout::Shape::dim(1);
+    constexpr int BD = WP_TILE_BLOCK_DIM;
+    const int lane = WP_TILE_THREAD_IDX;
+    const int jc1 = lane + BD;
+
+    T c0[n];
+    T c1[n - BD];
+    T b[2];
+    T y[2];
+    T x[2];
+    b[0] = Y.data(tile_coord(lane));
+    b[1] = (jc1 < n) ? Y.data(tile_coord(jc1)) : T {};
+    y[0] = y[1] = x[0] = x[1] = T {};
+#pragma clang loop unroll(full)
+    for (int i = 0; i < n; ++i)
+        c0[i] = (i >= lane) ? (Upper ? A.data(tile_coord(lane, i)) : A.data(tile_coord(i, lane))) : T {};
+#pragma clang loop unroll(full)
+    for (int i = BD; i < n; ++i)
+        c1[i - BD] = (jc1 < n && i >= jc1) ? (Upper ? A.data(tile_coord(jc1, i)) : A.data(tile_coord(i, jc1))) : T {};
+    WP_TILE_SYNC();  // X may alias Y
+
+    metal_register_forward_step2<0, n, BD, T>(c0, c1, y, b, lane);
+    metal_register_backward_step2<n - 1, n, BD, T>(c0, c1, y, x, lane);
+
+    X.data(tile_coord(lane)) = x[0];
+    if (jc1 < n)
+        X.data(tile_coord(jc1)) = x[1];
+    WP_TILE_SYNC();
+}
+
+#ifndef WP_METAL_COMPACT_REGISTER_CHOLESKY
+#define WP_METAL_COMPACT_REGISTER_CHOLESKY 1
+#endif
+
 template <bool Upper, typename TileA, typename TileX, typename TileY>
 inline WP_FORCE_INLINE void metal_register_cholesky_solve(TileA WP_THREAD& A, TileX WP_THREAD& X, TileY WP_THREAD& Y)
 {
@@ -240,6 +327,10 @@ inline WP_FORCE_INLINE void metal_register_cholesky_solve(TileA WP_THREAD& A, Ti
     constexpr int n = TileA::Layout::Shape::dim(1);
     constexpr int BD = WP_TILE_BLOCK_DIM;
     constexpr int CPL = (n + BD - 1) / BD;  // columns per lane
+    if constexpr (WP_METAL_COMPACT_REGISTER_CHOLESKY && CPL == 2) {
+        metal_register_cholesky_solve2<Upper>(A, X, Y);
+        return;
+    }
     const int lane = WP_TILE_THREAD_IDX;
 
     // L[i, jc] for i >= jc is A(jc, i) when A holds U (Upper), A(i, jc) otherwise

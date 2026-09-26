@@ -126,6 +126,98 @@ inline WP_FORCE_INLINE void metal_register_cholesky_step(thread T (&col)[CPL][N]
     }
 }
 
+// Two columns per lane (33..64 rows in a 32-lane group), compact: the lane's second column jc1 = lane + BD
+// only has rows i >= BD, so it is held as c1[i - BD] (N - BD registers instead of N) and the unrolled
+// update loops skip the rows it cannot have. Same operations on the same elements in the same order as the
+// generic form above (bitwise). Rows are compile-time (template recursion over J, unrolled i).
+template <int J, int N, int BD, typename T>
+inline WP_FORCE_INLINE void metal_register_cholesky_step2(thread T (&c0)[N], thread T (&c1)[N - BD], int lane)
+{
+    if constexpr (J < N) {
+        constexpr int owner = J % BD;
+        constexpr bool second = J >= BD;
+        if (lane == owner) {
+            if constexpr (second) {
+                const T d = wp::sqrt(c1[J - BD]);
+                const T inv = T(1) / d;
+                c1[J - BD] = d;
+#pragma clang loop unroll(full)
+                for (int i = J + 1; i < N; ++i)
+                    c1[i - BD] *= inv;
+            } else {
+                const T d = wp::sqrt(c0[J]);
+                const T inv = T(1) / d;
+                c0[J] = d;
+#pragma clang loop unroll(full)
+                for (int i = J + 1; i < N; ++i)
+                    c0[i] *= inv;
+            }
+        }
+        const int jc0 = lane;
+        const int jc1 = lane + BD;
+        T l0 = T {};
+        T l1 = T {};
+#pragma clang loop unroll(full)
+        for (int i = J; i < N; ++i) {
+            T lij;
+            if constexpr (second)
+                lij = metal::simd_shuffle(c1[i - BD], ushort(owner));
+            else
+                lij = metal::simd_shuffle(c0[i], ushort(owner));
+            if (i == jc0)
+                l0 = lij;
+            if (jc0 > J && i >= jc0)
+                c0[i] -= lij * l0;
+            if (i >= BD) {
+                if (i == jc1)
+                    l1 = lij;
+                if (jc1 > J && i >= jc1)
+                    c1[i - BD] -= lij * l1;
+            }
+        }
+        metal_register_cholesky_step2<J + 1, N, BD, T>(c0, c1, lane);
+    }
+}
+
+template <bool Upper, typename TileA, typename TileOut>
+inline WP_FORCE_INLINE void metal_register_cholesky2(TileA WP_THREAD& A, TileOut WP_THREAD& Out)
+{
+    using T = typename TileA::Type;
+    constexpr int n = TileA::Layout::Shape::dim(1);
+    constexpr int BD = WP_TILE_BLOCK_DIM;
+    constexpr int N1 = n - BD;
+    const int lane = WP_TILE_THREAD_IDX;
+    const int jc1 = lane + BD;
+
+    auto idx = [](int row, int col) { return Upper ? tile_coord(col, row) : tile_coord(row, col); };
+
+    T c0[n];
+    T c1[N1];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < n; ++i)
+        c0[i] = (i >= lane) ? (Upper ? A.data(tile_coord(lane, i)) : A.data(tile_coord(i, lane))) : T {};
+#pragma clang loop unroll(full)
+    for (int i = BD; i < n; ++i)
+        c1[i - BD] = (jc1 < n && i >= jc1) ? (Upper ? A.data(tile_coord(jc1, i)) : A.data(tile_coord(i, jc1))) : T {};
+
+    metal_register_cholesky_step2<0, n, BD, T>(c0, c1, lane);
+
+    WP_TILE_SYNC();  // in-place callers alias A and Out: all reads are done before any write
+#pragma clang loop unroll(full)
+    for (int i = 0; i < n; ++i)
+        Out.data(idx(i, lane)) = (i >= lane) ? c0[i] : T {};
+    if (jc1 < n) {
+#pragma clang loop unroll(full)
+        for (int i = 0; i < n; ++i)
+            Out.data(idx(i, jc1)) = (i >= jc1) ? c1[(i >= BD) ? (i - BD) : 0] : T {};
+    }
+    WP_TILE_SYNC();
+}
+
+#ifndef WP_METAL_COMPACT_REGISTER_CHOLESKY
+#define WP_METAL_COMPACT_REGISTER_CHOLESKY 1
+#endif
+
 template <bool Upper, typename TileA, typename TileOut>
 inline WP_FORCE_INLINE void metal_register_cholesky(TileA WP_THREAD& A, TileOut WP_THREAD& Out)
 {
@@ -133,6 +225,10 @@ inline WP_FORCE_INLINE void metal_register_cholesky(TileA WP_THREAD& A, TileOut 
     constexpr int n = TileA::Layout::Shape::dim(1);
     constexpr int BD = WP_TILE_BLOCK_DIM;
     constexpr int CPL = (n + BD - 1) / BD;  // columns per lane
+    if constexpr (WP_METAL_COMPACT_REGISTER_CHOLESKY && CPL == 2) {
+        metal_register_cholesky2<Upper>(A, Out);
+        return;
+    }
     const int lane = WP_TILE_THREAD_IDX;
 
     auto idx = [](int row, int col) { return Upper ? tile_coord(col, row) : tile_coord(row, col); };
