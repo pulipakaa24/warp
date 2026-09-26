@@ -354,7 +354,7 @@ lanes own columns, SIMD-shuffle broadcasts, no barriers); larger matrices use th
 path with a threadgroup barrier per column. Read when a module is built (part of its hash). Above
 about 64 the per-lane column registers spill."""
 
-metal_register_solve: bool = True
+metal_register_solve: bool = os.environ.get("WP_METAL_REGISTER_SOLVE", "1") != "0"
 """Whether ``tile_cholesky_solve`` with a vector right-hand side runs the register triangular solves on
 Metal (one SIMD group, lanes own columns, SIMD sums and shuffles, no barriers in the sweeps) for
 matrices up to ``metal_register_cholesky_max``; False keeps the cooperative scalar path (two threadgroup
