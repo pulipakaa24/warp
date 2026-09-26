@@ -325,13 +325,14 @@ inline WP_FORCE_INLINE void metal_register_cholesky_solve(TileA WP_THREAD& A, Ti
 {
     using T = typename TileA::Type;
     constexpr int n = TileA::Layout::Shape::dim(1);
-    constexpr int BD = WP_TILE_BLOCK_DIM;
+    constexpr int BD = (WP_TILE_BLOCK_DIM > 32) ? 32 : WP_TILE_BLOCK_DIM;  // one SIMD group computes; a second idles at the barriers
     constexpr int CPL = (n + BD - 1) / BD;  // columns per lane
     if constexpr (WP_METAL_COMPACT_REGISTER_CHOLESKY && CPL == 2) {
         metal_register_cholesky_solve2<Upper>(A, X, Y);
         return;
     }
     const int lane = WP_TILE_THREAD_IDX;
+    const bool active = lane < BD;
 
     // L[i, jc] for i >= jc is A(jc, i) when A holds U (Upper), A(i, jc) otherwise
     T col[CPL][n];
@@ -341,23 +342,24 @@ inline WP_FORCE_INLINE void metal_register_cholesky_solve(TileA WP_THREAD& A, Ti
 #pragma clang loop unroll(full)
     for (int c = 0; c < CPL; ++c) {
         const int jc = lane + c * BD;
-        b[c] = (jc < n) ? Y.data(tile_coord(jc)) : T {};
+        b[c] = (active && jc < n) ? Y.data(tile_coord(jc)) : T {};
         y[c] = T {};
         x[c] = T {};
 #pragma clang loop unroll(full)
         for (int i = 0; i < n; ++i)
-            col[c][i] = (jc < n && i >= jc) ? (Upper ? A.data(tile_coord(jc, i)) : A.data(tile_coord(i, jc))) : T {};
+            col[c][i] = (active && jc < n && i >= jc) ? (Upper ? A.data(tile_coord(jc, i)) : A.data(tile_coord(i, jc))) : T {};
     }
     WP_TILE_SYNC();  // X may alias Y: every lane has read its right-hand side before any lane writes
 
-    metal_register_forward_step<0, n, CPL, BD, T>(col, y, b, lane);
-    metal_register_backward_step<n - 1, n, CPL, BD, T>(col, y, x, lane);
-
+    if (active) {
+        metal_register_forward_step<0, n, CPL, BD, T>(col, y, b, lane);
+        metal_register_backward_step<n - 1, n, CPL, BD, T>(col, y, x, lane);
 #pragma clang loop unroll(full)
-    for (int c = 0; c < CPL; ++c) {
-        const int jc = lane + c * BD;
-        if (jc < n)
-            X.data(tile_coord(jc)) = x[c];
+        for (int c = 0; c < CPL; ++c) {
+            const int jc = lane + c * BD;
+            if (jc < n)
+                X.data(tile_coord(jc)) = x[c];
+        }
     }
     WP_TILE_SYNC();
 }
@@ -367,7 +369,7 @@ template <bool Upper, typename TileA, typename TileX, typename TileY>
 inline CUDA_CALLABLE void scalar_cholesky_solve(TileA WP_THREAD& A, TileX WP_THREAD& X, TileY WP_THREAD& Y)
 {
 #if defined(__METAL_VERSION__)
-    if constexpr (WP_METAL_REGISTER_SOLVE && TileY::Layout::Shape::N == 1 && WP_TILE_BLOCK_DIM > 1 && WP_TILE_BLOCK_DIM <= 32
+    if constexpr (WP_METAL_REGISTER_SOLVE && TileY::Layout::Shape::N == 1 && WP_TILE_BLOCK_DIM > 1 && (WP_TILE_BLOCK_DIM <= 32 || WP_TILE_BLOCK_DIM == 64)
                   && TileA::Layout::Shape::dim(1) <= WP_METAL_REGISTER_CHOLESKY_MAX) {
         metal_register_cholesky_solve<Upper>(A, X, Y);
         return;

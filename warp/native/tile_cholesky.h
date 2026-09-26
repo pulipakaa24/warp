@@ -214,6 +214,76 @@ inline WP_FORCE_INLINE void metal_register_cholesky2(TileA WP_THREAD& A, TileOut
     WP_TILE_SYNC();
 }
 
+// 64-lane register Cholesky (MetalSim, WP_METAL_CHOL64): two SIMD groups per matrix of up to 64 rows, one column
+// per lane (43 registers at n = 43 instead of 86). The owner of column J writes its unscaled column and the
+// pivot d = sqrt(A[J,J]) into the tile's own storage of column J (final only after this step, read by nobody
+// before), one threadgroup barrier, then every lane forms L[i,J] = column[i] * (1/d) itself (the same products
+// the 32-lane form broadcasts) and applies the rank-1 update to its own column. Every lane writes its final
+// column (factor and the zeros of the opposite triangle) at the end. Same operations in the same order as
+// metal_register_cholesky (bitwise), no SIMD shuffles, one barrier per column.
+template <int J, int N, int BD, bool Upper, typename T, typename TileA, typename TileOut>
+inline WP_FORCE_INLINE void metal_register_cholesky64_step(thread T (&col)[N], int lane, TileA WP_THREAD& A, TileOut WP_THREAD& Out)
+{
+    if constexpr (J < N) {
+        auto cidx = [](int row, int c) { return Upper ? tile_coord(c, row) : tile_coord(row, c); };  // L[row, c]
+        if (lane == J) {
+            const T d = wp::sqrt(col[J]);
+            A.data(cidx(J, J)) = d;
+#pragma clang loop unroll(full)
+            for (int i = J + 1; i < N; ++i)
+                A.data(cidx(i, J)) = col[i];
+        }
+        WP_TILE_SYNC();
+        const T d = A.data(cidx(J, J));
+        const T inv = T(1) / d;
+        if (lane == J) {
+            col[J] = d;
+#pragma clang loop unroll(full)
+            for (int i = J + 1; i < N; ++i)
+                col[i] *= inv;
+        } else if (lane > J && lane < N) {
+            const T ljc = A.data(cidx(lane, J)) * inv;
+#pragma clang loop unroll(full)
+            for (int i = J + 1; i < N; ++i) {
+                if (i >= lane)
+                    col[i] -= (A.data(cidx(i, J)) * inv) * ljc;
+            }
+        }
+        metal_register_cholesky64_step<J + 1, N, BD, Upper, T, TileA, TileOut>(col, lane, A, Out);
+    }
+}
+
+template <bool Upper, typename TileA, typename TileOut>
+inline WP_FORCE_INLINE void metal_register_cholesky64(TileA WP_THREAD& A, TileOut WP_THREAD& Out)
+{
+    using T = typename TileA::Type;
+    constexpr int n = TileA::Layout::Shape::dim(1);
+    constexpr int BD = WP_TILE_BLOCK_DIM;
+    const int lane = WP_TILE_THREAD_IDX;
+
+    auto idx = [](int row, int c) { return Upper ? tile_coord(c, row) : tile_coord(row, c); };
+
+    T col[n];
+#pragma clang loop unroll(full)
+    for (int i = 0; i < n; ++i)
+        col[i] = (lane < n && i >= lane) ? A.data(idx(i, lane)) : T {};
+    WP_TILE_SYNC();  // every lane has read its column before any owner overwrites the tile
+
+    metal_register_cholesky64_step<0, n, BD, Upper, T, TileA, TileOut>(col, lane, A, Out);
+
+    WP_TILE_SYNC();
+    if (lane < n) {
+#pragma clang loop unroll(full)
+        for (int i = 0; i < n; ++i)
+            Out.data(idx(i, lane)) = (i >= lane) ? col[i] : T {};
+    }
+    WP_TILE_SYNC();
+}
+
+#ifndef WP_METAL_CHOL64
+#define WP_METAL_CHOL64 1
+#endif
+
 #ifndef WP_METAL_COMPACT_REGISTER_CHOLESKY
 #define WP_METAL_COMPACT_REGISTER_CHOLESKY 0
 #endif
@@ -345,6 +415,10 @@ inline WP_FORCE_INLINE CUDA_CALLABLE void scalar_cholesky_impl(TileA WP_THREAD& 
 #if defined(__METAL_VERSION__)
     if constexpr (WP_TILE_BLOCK_DIM > 1 && WP_TILE_BLOCK_DIM <= 32 && TileA::Layout::Shape::dim(1) <= WP_METAL_REGISTER_CHOLESKY_MAX) {
         metal_register_cholesky<Upper>(A, Out);
+        return;
+    }
+    if constexpr (WP_METAL_CHOL64 && WP_TILE_BLOCK_DIM == 64 && TileA::Layout::Shape::dim(1) <= 64) {
+        metal_register_cholesky64<Upper>(A, Out);
         return;
     }
 #endif
