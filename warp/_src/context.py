@@ -3096,6 +3096,8 @@ class ModuleHasher:
             ch.update(b"metal_register_solve:0")
         if warp.config.metal_compact_register_cholesky:
             ch.update(b"metal_compact_register_cholesky:1")
+        if warp.config.metal_rolled_cholesky:
+            ch.update(bytes(f"metal_rolled_cholesky:{int(warp.config.metal_rolled_cholesky)}", "utf-8"))
 
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output
@@ -3780,6 +3782,8 @@ class ModuleBuilder:
             type_defines += f"#define WP_METAL_REGISTER_CHOLESKY_MAX {int(warp.config.metal_register_cholesky_max)}\n"
             type_defines += f"#define WP_METAL_REGISTER_SOLVE {1 if warp.config.metal_register_solve else 0}\n"
             type_defines += f"#define WP_METAL_COMPACT_REGISTER_CHOLESKY {1 if warp.config.metal_compact_register_cholesky else 0}\n"
+            if warp.config.metal_rolled_cholesky:
+                type_defines += f"#define WP_METAL_ROLLED_CHOLESKY 1\n#define WP_METAL_ROLLED_CHOLESKY_MIN {int(warp.config.metal_rolled_cholesky)}\n"
 
         # add headers
         #

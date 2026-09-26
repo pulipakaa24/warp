@@ -218,6 +218,80 @@ inline WP_FORCE_INLINE void metal_register_cholesky2(TileA WP_THREAD& A, TileOut
 #define WP_METAL_COMPACT_REGISTER_CHOLESKY 0
 #endif
 
+// Rolled form of the register Cholesky (MetalSim, WP_METAL_ROLLED_CHOLESKY): the same lane / column layout and the
+// same operations in the same order, but the column loop is a runtime loop and the row loops are not unrolled, so
+// the per-lane column arrays live in thread (stack) memory instead of registers and the code is a few hundred
+// instructions instead of ~n^2 unrolled ones. For n >= 33 the fully unrolled form's cost grows 9x from n = 33 to
+// 48 for 3x the flops (measured), which suggests instruction fetch, not arithmetic, bounds it.
+#ifndef WP_METAL_ROLLED_CHOLESKY
+#define WP_METAL_ROLLED_CHOLESKY 0
+#endif
+#ifndef WP_METAL_ROLLED_CHOLESKY_MIN
+#define WP_METAL_ROLLED_CHOLESKY_MIN 32
+#endif
+template <bool Upper, typename TileA, typename TileOut>
+inline WP_FORCE_INLINE void metal_rolled_cholesky(TileA WP_THREAD& A, TileOut WP_THREAD& Out)
+{
+    using T = typename TileA::Type;
+    constexpr int n = TileA::Layout::Shape::dim(1);
+    constexpr int BD = WP_TILE_BLOCK_DIM;
+    constexpr int CPL = (n + BD - 1) / BD;  // columns per lane
+    const int lane = WP_TILE_THREAD_IDX;
+
+    auto idx = [](int row, int col) { return Upper ? tile_coord(col, row) : tile_coord(row, col); };
+
+    T col[CPL][n];
+#pragma clang loop unroll(disable)
+    for (int c = 0; c < CPL; ++c) {
+        const int jc = lane + c * BD;
+#pragma clang loop unroll(disable)
+        for (int i = 0; i < n; ++i)
+            col[c][i] = (jc < n && i >= jc) ? (Upper ? A.data(tile_coord(jc, i)) : A.data(tile_coord(i, jc))) : T {};
+    }
+
+#pragma clang loop unroll(disable)
+    for (int J = 0; J < n; ++J) {
+        const int owner = J % BD;
+        const int cj = J / BD;
+        if (lane == owner) {
+            const T d = wp::sqrt(col[cj][J]);
+            const T inv = T(1) / d;
+            col[cj][J] = d;
+#pragma clang loop unroll(disable)
+            for (int i = J + 1; i < n; ++i)
+                col[cj][i] *= inv;
+        }
+        T ljc[CPL];
+#pragma clang loop unroll(disable)
+        for (int c = 0; c < CPL; ++c)
+            ljc[c] = T {};
+#pragma clang loop unroll(disable)
+        for (int i = J; i < n; ++i) {
+            const T lij = metal::simd_shuffle(col[cj][i], ushort(owner));
+#pragma clang loop unroll(disable)
+            for (int c = 0; c < CPL; ++c) {
+                const int jc = lane + c * BD;
+                if (i == jc)
+                    ljc[c] = lij;
+                if (jc > J && i >= jc)
+                    col[c][i] -= lij * ljc[c];
+            }
+        }
+    }
+
+    WP_TILE_SYNC();  // in-place callers alias A and Out: all reads are done before any write
+#pragma clang loop unroll(disable)
+    for (int c = 0; c < CPL; ++c) {
+        const int jc = lane + c * BD;
+        if (jc < n) {
+#pragma clang loop unroll(disable)
+            for (int i = 0; i < n; ++i)
+                Out.data(idx(i, jc)) = (i >= jc) ? col[c][i] : T {};
+        }
+    }
+    WP_TILE_SYNC();
+}
+
 template <bool Upper, typename TileA, typename TileOut>
 inline WP_FORCE_INLINE void metal_register_cholesky(TileA WP_THREAD& A, TileOut WP_THREAD& Out)
 {
@@ -225,6 +299,10 @@ inline WP_FORCE_INLINE void metal_register_cholesky(TileA WP_THREAD& A, TileOut 
     constexpr int n = TileA::Layout::Shape::dim(1);
     constexpr int BD = WP_TILE_BLOCK_DIM;
     constexpr int CPL = (n + BD - 1) / BD;  // columns per lane
+    if constexpr (WP_METAL_ROLLED_CHOLESKY && n > WP_METAL_ROLLED_CHOLESKY_MIN) {
+        metal_rolled_cholesky<Upper>(A, Out);
+        return;
+    }
     if constexpr (WP_METAL_COMPACT_REGISTER_CHOLESKY && CPL == 2) {
         metal_register_cholesky2<Upper>(A, Out);
         return;
