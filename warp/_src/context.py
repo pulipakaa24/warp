@@ -3098,8 +3098,8 @@ class ModuleHasher:
             ch.update(b"metal_compact_register_cholesky:1")
         if warp.config.metal_rolled_cholesky:
             ch.update(bytes(f"metal_rolled_cholesky:{int(warp.config.metal_rolled_cholesky)}", "utf-8"))
-        if not warp.config.metal_chol_split:
-            ch.update(b"metal_chol_split:0")
+        if warp.config.metal_chol_split:
+            ch.update(b"metal_chol_split:1")
 
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output

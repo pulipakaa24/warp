@@ -371,10 +371,11 @@ metal_rolled_cholesky: int = int(_os.environ.get("WP_METAL_ROLLED_CHOLESKY", "0"
 operations in the same order, runtime loops (per-lane column arrays in thread memory, a few hundred instructions
 of code instead of ~n^2 unrolled). Experimental (2026-09-26); read when a module is built (part of its hash)."""
 
-metal_chol_split: bool = _os.environ.get("WP_METAL_CHOL_SPLIT", "1") != "0"
+metal_chol_split: bool = _os.environ.get("WP_METAL_CHOL_SPLIT", "0") == "1"
 """Metal register Cholesky: use the split-loop step (scalar column pivots, second column guarded by the
-compile-time row index; the same products in the same order as the generic step). Read when a module is built
-(part of its hash)."""
+compile-time row index; the same products in the same order as the generic step, bitwise). Off by default: on the
+tile path it measures the same as the generic step (0.971 vs 0.973 ms per 4096 at n = 43); it is 7x faster than the
+generic step only in a native-snippet context, where the generic step compiles badly. Part of the module hash."""
 
 max_unroll: int = 16
 """Maximum unroll factor for loops.

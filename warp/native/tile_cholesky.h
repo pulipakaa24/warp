@@ -365,10 +365,11 @@ inline WP_FORCE_INLINE void metal_rolled_cholesky(TileA WP_THREAD& A, TileOut WP
 // Split-loop form of the register step (MetalSim): the same products in the same order (bitwise), but with scalar
 // column pivots (ljc0 / ljc1) instead of a per-lane array and the second column's update (rows >= BD only) guarded by
 // the compile-time row index. Measured 2026-09-26 in a native-snippet context at n = 43: 0.60 ms per 4096
-// factor + solve against 4.16 ms for the generic step (and 1.065 ms for the tile path with the generic step): the
-// generic form's indexed arrays compile badly on Metal. WP_METAL_CHOL_SPLIT (warp.config.metal_chol_split) selects it.
+// factor + solve against 4.16 ms for the generic step in the same snippet context, but the same 0.97 ms as the
+// generic step on the tile path (the snippet context compiles the generic form badly, the tile path does not).
+// Off by default; WP_METAL_CHOL_SPLIT=1 (warp.config.metal_chol_split) selects it.
 #ifndef WP_METAL_CHOL_SPLIT
-#define WP_METAL_CHOL_SPLIT 1
+#define WP_METAL_CHOL_SPLIT 0
 #endif
 template <int J, int N, int CPL, int BD, typename T>
 inline WP_FORCE_INLINE void metal_register_cholesky_step_split(thread T (&col)[CPL][N], int lane)
