@@ -1083,7 +1083,7 @@ def make_bilinear_dispatch_kernel(
 
         # write block value
         block_offset = test_node_offset * max_nodes_per_element + trial_node
-        if wp.static(tile_size) > 1:
+        if wp.static(tile_size > 1):
             val_sum = wp.tile_sum(wp.tile(val_sum, preserve_type=True))[0]
 
             for dof in range(lane, wp.static(TEST_NODE_DOF_COUNT * TRIAL_NODE_DOF_COUNT), wp.static(tile_size)):

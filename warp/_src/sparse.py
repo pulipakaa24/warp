@@ -3658,7 +3658,7 @@ def make_bsr_mm_count_coeffs(tile_size):
             block_counts[x_block + 1] = block_count
             row_count += block_count
 
-        if wp.static(tile_size) > 1:
+        if wp.static(tile_size > 1):
             row_count = wp.tile_sum(wp.tile(row_count))[0]
             min_col = wp.tile_min(wp.tile(min_col))[0]
             max_col = wp.tile_max(wp.tile(max_col))[0]

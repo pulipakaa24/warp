@@ -478,6 +478,38 @@ class TestMetal(unittest.TestCase):
                 np.testing.assert_allclose(product.numpy(), ref, rtol=1e-3, atol=1e-3, err_msg=msg)
                 np.testing.assert_allclose(acc.numpy(), a_np + ref, rtol=1e-3, atol=1e-3, err_msg=msg)
 
+    def test_fem_dispatch_bilinear_wide_blocks(self):
+        """Dispatched bilinear assembly with 6x6 node blocks (Newton's implicit MPM).
+
+        The dispatch kernel runs with one lane per block off CUDA. Its tile reduction must be compiled out
+        then, or it reserves 256 lanes of 6x6 tile scratch (about 75 KB) and the launch exceeds the 32 KB
+        threadgroup limit.
+        """
+        import warp.fem as fem  # noqa: PLC0415
+
+        @fem.integrand
+        def mass_form(s: fem.Sample, u: fem.Field, v: fem.Field):
+            return wp.dot(u(s), v(s))
+
+        results = {}
+        for device in (self.device, "cpu"):
+            with wp.ScopedDevice(device):
+                geo = fem.Grid3D(res=wp.vec3i(2, 2, 2))
+                space = fem.make_polynomial_space(geo, degree=1, dtype=wp.types.vector(6, wp.float32))
+                domain = fem.Cells(geo)
+                u = fem.make_trial(space, domain=domain)
+                v = fem.make_test(space, domain=domain)
+                mat = fem.integrate(
+                    mass_form,
+                    fields={"u": u, "v": v},
+                    assembly="dispatch",
+                    accumulate_dtype=wp.float32,
+                    output_dtype=wp.float32,
+                )
+                results[device] = warp.sparse.bsr_get_diag(mat).numpy()
+        np.testing.assert_allclose(results[self.device], results["cpu"], rtol=1e-6, atol=1e-7)
+        self.assertGreater(np.abs(results["cpu"]).max(), 0.0)
+
 
 class TestMetalInlineBudget(unittest.TestCase):
     """Forced inlining is bounded by the fully inlined size (pure codegen logic, no device needed)."""
