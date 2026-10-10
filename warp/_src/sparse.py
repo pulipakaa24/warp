@@ -1086,12 +1086,38 @@ def _bsr_set_from_triplets_native(
         if device.is_cpu:
             _mark_apic_deferred_nnz_update(dest, apic_capture)
 
+    scalar_size = type_size_in_bytes(dest.scalar_type) if values is not None else 0
+
+    from warp._src import metal_sparse  # noqa: PLC0415
+
+    if metal_sparse.enabled(device):
+        # GPU kernels, no host synchronization (see warp/_src/metal_sparse.py)
+        metal_sparse.bsr_from_triplets(
+            dest.nrow,
+            dest.ncol,
+            dest.block_size,
+            nnz,
+            count,
+            rows,
+            columns,
+            values,
+            scalar_size,
+            zero_value_mask,
+            masked,
+            summed_triplet_offsets,
+            summed_triplet_indices,
+            dest_offsets,
+            dest_row_counts,
+            dest_columns,
+        )
+        if refresh_nnz_transfer:
+            dest._refresh_nnz_transfer_if_pending()
+        return
+
     if warp._src.utils._runs_on_host(device, "BSR topology operations"):  # CPU, and Metal
         native_func = runtime.core.wp_bsr_matrix_from_triplets_host
     else:
         native_func = runtime.core.wp_bsr_matrix_from_triplets_device
-
-    scalar_size = type_size_in_bytes(dest.scalar_type) if values is not None else 0
 
     with wp.ScopedDevice(device):
         native_func(
@@ -2702,9 +2728,13 @@ def bsr_set_transpose(
 
         _bsr_ensure_independent_row_counts(dest)
 
+        from warp._src import metal_sparse  # noqa: PLC0415
         from warp._src.context import _get_apic_capture_for_device, runtime  # noqa: PLC0415
 
-        if warp._src.utils._runs_on_host(dest.values.device, "BSR topology operations"):  # CPU, and Metal
+        on_metal_gpu = metal_sparse.enabled(dest.values.device)
+        if on_metal_gpu:
+            native_func = None
+        elif warp._src.utils._runs_on_host(dest.values.device, "BSR topology operations"):  # CPU, and Metal
             native_func = runtime.core.wp_bsr_transpose_host
         else:
             native_func = runtime.core.wp_bsr_transpose_device
@@ -2737,19 +2767,35 @@ def bsr_set_transpose(
         with wp.ScopedDevice(dest.device):
             if restore_capacity is not None:
                 wp.copy(dest=dest.offsets, src=restore_capacity, count=dest.nrow + 1)
-            native_func(
-                src.nrow,
-                src.ncol,
-                nnz,
-                ctypes.cast(src.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
-                _optional_ctypes_pointer(src.row_counts, ctype=ctypes.c_int32),
-                ctypes.cast(src.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
-                ctypes.cast(dest.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
-                ctypes.cast(dest.row_counts.ptr, ctypes.POINTER(ctypes.c_int32)),
-                ctypes.cast(dest.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
-                ctypes.cast(block_index_map.ptr, ctypes.POINTER(ctypes.c_int32)),
-                ctypes.cast(status.ptr, ctypes.POINTER(ctypes.c_int32)),
-            )
+            if on_metal_gpu:
+                metal_sparse.bsr_transpose(
+                    src.nrow,
+                    src.ncol,
+                    nnz,
+                    src.offsets,
+                    src.row_counts,
+                    src.columns,
+                    dest.offsets,
+                    dest.row_counts,
+                    dest.columns,
+                    block_index_map,
+                    status,
+                    _BSR_STATUS_ROW_CAPACITY_EXCEEDED,
+                )
+            else:
+                native_func(
+                    src.nrow,
+                    src.ncol,
+                    nnz,
+                    ctypes.cast(src.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    _optional_ctypes_pointer(src.row_counts, ctype=ctypes.c_int32),
+                    ctypes.cast(src.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.cast(dest.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.cast(dest.row_counts.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.cast(dest.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.cast(block_index_map.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.cast(status.ptr, ctypes.POINTER(ctypes.c_int32)),
+                )
 
         wp.launch(
             _bsr_transpose_values,
@@ -2789,9 +2835,13 @@ def bsr_set_transpose(
         # Increase dest array sizes if needed
         _bsr_ensure_fits(dest, nnz=nnz)
 
+        from warp._src import metal_sparse  # noqa: PLC0415
         from warp._src.context import _get_apic_capture_for_device, runtime  # noqa: PLC0415
 
-        if warp._src.utils._runs_on_host(dest.values.device, "BSR topology operations"):  # CPU, and Metal
+        on_metal_gpu = metal_sparse.enabled(dest.values.device)
+        if on_metal_gpu:
+            native_func = None
+        elif warp._src.utils._runs_on_host(dest.values.device, "BSR topology operations"):  # CPU, and Metal
             native_func = runtime.core.wp_bsr_transpose_host
         else:
             native_func = runtime.core.wp_bsr_transpose_device
@@ -2820,19 +2870,35 @@ def bsr_set_transpose(
                 _mark_apic_deferred_nnz_update(dest, apic_capture)
 
         with wp.ScopedDevice(dest.device):
-            native_func(
-                src.nrow,
-                src.ncol,
-                nnz,
-                ctypes.cast(src.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
-                _optional_ctypes_pointer(src.row_counts, ctype=ctypes.c_int32),
-                ctypes.cast(src.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
-                ctypes.cast(dest.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
-                None,  # transposed row counts
-                ctypes.cast(dest.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
-                ctypes.cast(block_index_map.ptr, ctypes.POINTER(ctypes.c_int32)),
-                None,  # status
-            )
+            if on_metal_gpu:
+                metal_sparse.bsr_transpose(
+                    src.nrow,
+                    src.ncol,
+                    nnz,
+                    src.offsets,
+                    src.row_counts,
+                    src.columns,
+                    dest.offsets,
+                    None,  # transposed row counts
+                    dest.columns,
+                    block_index_map,
+                    None,  # status
+                    _BSR_STATUS_ROW_CAPACITY_EXCEEDED,
+                )
+            else:
+                native_func(
+                    src.nrow,
+                    src.ncol,
+                    nnz,
+                    ctypes.cast(src.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    _optional_ctypes_pointer(src.row_counts, ctype=ctypes.c_int32),
+                    ctypes.cast(src.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.cast(dest.offsets.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    None,  # transposed row counts
+                    ctypes.cast(dest.columns.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    ctypes.cast(block_index_map.ptr, ctypes.POINTER(ctypes.c_int32)),
+                    None,  # status
+                )
 
             dest._refresh_nnz_transfer_if_pending()
 
