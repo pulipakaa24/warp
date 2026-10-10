@@ -3804,6 +3804,8 @@ class ModuleBuilder:
         source = type_defines + module_header + extra_preamble + warp._src.codegen.codegen_cast_macros + source
 
         if device == "metal":
+            # fuse_fp selects FMA contraction in builtin.h, as --fmad does for NVRTC
+            source = f"#define WP_FUSE_FP {int(bool(self.options.get('fuse_fp', True)))}\n" + source
             # Metal compiles from an in-memory string without include paths
             source = warp._src.build.expand_includes(source)
             source = warp._src.build.metal_rewrite_printf(source)  # shader logging has no %s

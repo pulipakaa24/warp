@@ -957,6 +957,32 @@ class TestMetal(unittest.TestCase):
             )
             self.assertEqual(_read_tree(bvh, is_mesh=False)["constructor"], code)
 
+    def test_fuse_fp_contracts_multiply_add(self):
+        """The fuse_fp module option (default on) contracts a * b + c into an FMA, as --fmad=true does on CUDA.
+
+        Inputs are chosen with c close to -a * b, so a single rounding of a * b + c differs from rounding the product
+        first for most elements. With fuse_fp off the result is the twice-rounded one.
+        """
+        rng = np.random.default_rng(0)
+        n = 4096
+        a = rng.uniform(-2.0, 2.0, n).astype(np.float32)
+        b = rng.uniform(-2.0, 2.0, n).astype(np.float32)
+        c = (-(a.astype(np.float64) * b) + rng.uniform(-1e-6, 1e-6, n)).astype(np.float32)
+        fused = (a.astype(np.float64) * b + c).astype(np.float32)  # exact product, one rounding
+        separate = (a * b).astype(np.float32) + c
+        self.assertGreater(np.mean(fused != separate), 0.5)
+        for fuse_fp, expected in ((True, fused), (False, separate)):
+
+            @wp.kernel(module="unique", module_options={"fuse_fp": fuse_fp})
+            def madd(a: wp.array[float], b: wp.array[float], c: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                out[i] = a[i] * b[i] + c[i]
+
+            out = wp.zeros(n, dtype=float, device=self.device)
+            wp.launch(madd, n, inputs=[wp.array(a, device=self.device), wp.array(b, device=self.device),
+                                       wp.array(c, device=self.device), out], device=self.device)
+            np.testing.assert_array_equal(out.numpy(), expected, err_msg=f"fuse_fp={fuse_fp}")
+
 
 class TestMetalInlineBudget(unittest.TestCase):
     """Forced inlining is bounded by the fully inlined size (pure codegen logic, no device needed)."""

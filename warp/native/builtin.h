@@ -22,6 +22,13 @@
 #define WP_FORCE_INLINE __attribute__((always_inline))
 #define CUDA_CALLABLE
 #define CUDA_CALLABLE_DEVICE
+// The fuse_fp module option (default on): CUDA compiles with --fmad=true, contracting a * b + c into FMAs across
+// expressions and inlined calls; ask the Metal compiler for the same contraction so kernels round as on CUDA.
+#if !defined(WP_FUSE_FP) || WP_FUSE_FP
+#pragma clang fp contract(fast)
+#else
+#pragma clang fp contract(off)
+#endif
 #elif !defined(__CUDACC__)
 #define WP_FORCE_INLINE
 #define CUDA_CALLABLE
