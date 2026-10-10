@@ -360,6 +360,25 @@ CUDA_CALLABLE inline float diff_product(float a, float b, float c, float d)
     return diff + error;
 }
 
+#if WP_METAL
+// a * b - c * d with the sign of the exact value, for the watertight fallback below. CUDA evaluates it from exact
+// double products; Metal has no double, so it is built from error-free products and an exact two-sum. Contraction
+// must stay off here: a fused a * b - c * d is not antisymmetric (U(a, b, c, d) != -U(c, d, a, b)), and the two
+// triangles sharing an edge would then disagree about which side a ray passes.
+CUDA_CALLABLE inline float diff_product_exact_sign(float a, float b, float c, float d)
+{
+#pragma clang fp contract(off)
+    const float p = a * b;
+    const float ep = fmaf(a, b, -p);  // a * b == p + ep exactly
+    const float q = c * d;
+    const float eq = fmaf(c, d, -q);  // c * d == q + eq exactly
+    const float s = p - q;  // two-sum: s + es == p - q exactly
+    const float bv = s - p;
+    const float es = (p - (s - bv)) + (-q - bv);
+    return s + (es + (ep - eq));
+}
+#endif
+
 // http://jcgt.org/published/0002/01/05/
 CUDA_CALLABLE inline bool intersect_ray_tri_woop(
     const vec3 WP_THREAD& p,
@@ -412,6 +431,11 @@ CUDA_CALLABLE inline bool intersect_ray_tri_woop(
     float W = diff_product(Bx, Ay, By, Ax);
 
     if (U == 0.0f || V == 0.0f || W == 0.0f) {
+#if WP_METAL
+        U = diff_product_exact_sign(Cx, By, Cy, Bx);
+        V = diff_product_exact_sign(Ax, Cy, Ay, Cx);
+        W = diff_product_exact_sign(Bx, Ay, By, Ax);
+#else
         wide_float CxBy = (wide_float)Cx * (wide_float)By;
         wide_float CyBx = (wide_float)Cy * (wide_float)Bx;
         U = (float)(CxBy - CyBx);
@@ -421,6 +445,7 @@ CUDA_CALLABLE inline bool intersect_ray_tri_woop(
         wide_float BxAy = (wide_float)Bx * (wide_float)Ay;
         wide_float ByAx = (wide_float)By * (wide_float)Ax;
         W = (float)(BxAy - ByAx);
+#endif
     }
 
     if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f)) {
@@ -530,6 +555,11 @@ CUDA_CALLABLE inline void adj_intersect_ray_tri_woop(
     float W = Bx * Ay - By * Ax;
 
     if (U == 0.0f || V == 0.0f || W == 0.0f) {
+#if WP_METAL
+        U = diff_product_exact_sign(Cx, By, Cy, Bx);
+        V = diff_product_exact_sign(Ax, Cy, Ay, Cx);
+        W = diff_product_exact_sign(Bx, Ay, By, Ax);
+#else
         wide_float CxBy = (wide_float)Cx * (wide_float)By;
         wide_float CyBx = (wide_float)Cy * (wide_float)Bx;
         U = (float)(CxBy - CyBx);
@@ -539,6 +569,7 @@ CUDA_CALLABLE inline void adj_intersect_ray_tri_woop(
         wide_float BxAy = (wide_float)Bx * (wide_float)Ay;
         wide_float ByAx = (wide_float)By * (wide_float)Ax;
         W = (float)(BxAy - ByAx);
+#endif
     }
 
     if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f))
