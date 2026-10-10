@@ -377,6 +377,12 @@ compile-time row index; the same products in the same order as the generic step,
 tile path it measures the same as the generic step (0.971 vs 0.973 ms per 4096 at n = 43); it is 7x faster than the
 generic step only in a native-snippet context, where the generic step compiles badly. Part of the module hash."""
 
+metal_gpu_utilities: bool = _os.environ.get("WP_METAL_GPU_UTILITIES", "1") != "0"
+"""Whether :func:`warp.utils.radix_sort_pairs`, :func:`warp.utils.runlength_encode` and integer
+:func:`warp.utils.array_scan` run as GPU kernels on Metal devices (bitwise the same results as the host
+implementations, no host synchronization, recordable into graph captures as kernel dispatches). False runs them
+on the host after draining the GPU, as before. Floating-point scans always run on the host. Read at each call."""
+
 max_unroll: int = 16
 """Maximum unroll factor for loops.
 

@@ -19,6 +19,7 @@ import numpy as np
 
 import warp as wp
 import warp._src.context as context
+import warp._src.metal_primitives
 import warp._src.types
 from warp._src import logger as _logger_module
 from warp._src.context import Allocator, CaptureMode, DeviceLike, _validate_allocator, timing_result_t
@@ -144,6 +145,17 @@ def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) 
         apic_capture.track_array(in_array)
         apic_capture.track_array(out_array)
 
+    if (
+        in_array.device.is_metal
+        and wp.config.metal_gpu_utilities
+        and wp._src.metal_primitives.supports_scan(scalar_type)
+        and wp._src.metal_primitives.scan_aliasing_ok(in_array, out_array, in_stride, out_stride, dtype_size)
+    ):
+        wp._src.metal_primitives.array_scan(
+            in_array, out_array, scalar_type, type_length, in_stride, out_stride, inclusive
+        )
+        return
+
     if _runs_on_host(in_array.device):
         if scalar_type == wp.int32:
             native_func = runtime.core.wp_array_scan_int_host
@@ -260,6 +272,10 @@ def radix_sort_pairs(
     if apic_capture is not None:
         apic_capture.track_array(keys)
         apic_capture.track_array(values)
+
+    if keys.device.is_metal and wp.config.metal_gpu_utilities:
+        wp._src.metal_primitives.radix_sort_pairs(keys, values, count, begin_bit, end_bit, value_size)
+        return
 
     if _runs_on_host(keys.device):
         if keys.dtype == wp.int32:
@@ -658,7 +674,14 @@ def runlength_encode(
         apic_capture.track_array(run_lengths)
         apic_capture.track_array(run_count)
 
-    if _runs_on_host(values.device):
+    if (
+        values.device.is_metal
+        and wp.config.metal_gpu_utilities
+        and values.dtype == wp.int32
+        and not wp._src.metal_primitives.overlaps(values, value_count, (run_values, run_lengths, run_count))
+    ):
+        wp._src.metal_primitives.runlength_encode(values, run_values, run_lengths, run_count, value_count)
+    elif _runs_on_host(values.device):
         if values.dtype == wp.int32:
             _host_call(
                 values.device,
