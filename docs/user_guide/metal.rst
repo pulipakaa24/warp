@@ -96,8 +96,15 @@ Limitations
     operations on 64-bit integers.
 * Spinlocks built from ``wp.atomic_cas()`` can hang: Apple GPUs do not guarantee forward progress between
   SIMD lanes.
-* ``wp.fixedarray``, fabric arrays, deterministic mode (``wp.config.deterministic``) and saveable (APIC) captures
-  are not supported.
+* ``wp.fixedarray``, fabric arrays and saveable (APIC) captures are not supported.
+* Deterministic mode (``wp.config.deterministic`` or the ``"deterministic"`` module option) does not use CUDA's
+  record, sort and replay machinery. Instead, every kernel of a deterministic module that reaches an atomic
+  operation is launched as one SIMD-group that strides over the launch's tasks, so atomics are issued in task order
+  (lane order within each stride of 32 tasks, the order in which one CUDA warp issues them). Counter slots are then
+  handed out in task order and floating-point accumulations add in task order, the same on every run. The launch
+  runs on 32 threads, so it suits small launches (a single simulated world); kernels without atomics, tile kernels
+  and backward launches keep their parallel launch. A kernel that waits on a later task (a spinlock or a flag
+  written by another thread) can hang under this mode.
 * Host-side utilities that are not recorded into a graph, such as building or changing the topology of a
   :class:`warp.sparse.BsrMatrix`, raise when called during a graph capture on Metal. Call them outside the
   capture.

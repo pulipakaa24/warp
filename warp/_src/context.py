@@ -1094,9 +1094,13 @@ class KernelHooks:
         backward_smem_shortfall: str | None = None,
         metal_unsupported: str | None = None,
         metal_fixed_bytes: int = 0,
+        metal_forward_ordered=None,
     ):
         self.forward = forward
         self.backward = backward
+        # Metal entry point that runs every task of the launch on one SIMD-group, in task order (kernels with
+        # atomics in deterministic modules; see codegen.metal_module_template_forward_ordered)
+        self.metal_forward_ordered = metal_forward_ordered
         # per-thread bytes of fixed-array scratch the Metal entry points expect after the arguments
         self.metal_fixed_bytes = metal_fixed_bytes
         # builtins without a Metal implementation reached by the kernel; launching raises (see invoke_metal)
@@ -3088,6 +3092,13 @@ class ModuleHasher:
         # the native headers the kernels compile against (see native_headers_digest())
         ch.update(native_headers_digest())
 
+        # deterministic modules carry ordered Metal entry points (codegen_module); salted so that binaries
+        # built before those entry points existed are not reused (non-deterministic modules keep their hashes)
+        if options.get("deterministic", warp.config.DeterministicMode.NOT_GUARANTEED) != (
+            warp.config.DeterministicMode.NOT_GUARANTEED
+        ):
+            ch.update(b"metal_ordered_atomics:1")
+
         # Metal codegen settings read from warp.config at build time (only when changed from the
         # default, so default builds keep their hashes)
         if warp.config.metal_register_cholesky_max != 40:
@@ -3852,6 +3863,7 @@ class ModuleExec:
         # Metal: kernel name -> builtins it reaches that have no Metal implementation
         self.metal_unsupported: dict[str, str] = {}
         self.metal_backward_unsupported: set[str] = set()  # kernels whose adjoint cannot run on Metal (tiles)
+        self.metal_ordered: set[str] = set()  # kernels with an ordered entry point (deterministic atomics on Metal)
         self.metal_backward_error: str | None = None  # compile error that forced a forward-only build
         # Compute capability the loaded binary was actually compiled for (None for
         # CPU). Cluster classification must use this frozen target, not the current
@@ -4034,6 +4046,15 @@ class ModuleExec:
             backward_name = warp._src.codegen.cuda_kernel_backward_name(kernel)
             if options["enable_backward"] and not unsupported and name not in self.metal_backward_unsupported:
                 backward = runtime.core.wp_metal_get_kernel(self.handle, (name + "_metal_backward").encode("utf-8"))
+            forward_ordered = None
+            if not unsupported and name in self.metal_ordered:
+                forward_ordered = runtime.core.wp_metal_get_kernel(
+                    self.handle, (name + "_metal_forward_ordered").encode("utf-8")
+                )
+                if not forward_ordered:
+                    raise RuntimeError(
+                        f"Failed to load kernel '{kernel.key}' on device '{self.device}': {runtime.get_error_string()}"
+                    )
             hooks = KernelHooks(
                 forward,
                 backward,
@@ -4042,6 +4063,7 @@ class ModuleExec:
                 det_launch_meta=self.det_launch_meta_map.get(name),
                 metal_unsupported=unsupported,
                 metal_fixed_bytes=self.meta.get(warp._src.codegen.cuda_kernel_forward_name(kernel) + "_fixed_bytes", 0),
+                metal_forward_ordered=forward_ordered,
             )
 
         else:
@@ -4703,8 +4725,15 @@ class Module:
             target = "cpu" if is_cpu else "cuda"  # ``is_cpu`` is the upstream signature
 
         if target == "metal":
-            # deterministic gradient scatter (deterministic.h) is not ported to Metal yet
-            options = options | {"deterministic": warp.config.DeterministicMode.NOT_GUARANTEED}
+            # deterministic scatter/counter records (deterministic.h) are not ported to Metal; deterministic modules
+            # instead get an ordered entry point for their atomic kernels (see codegen_module)
+            ordered = options.get("deterministic", warp.config.DeterministicMode.NOT_GUARANTEED) != (
+                warp.config.DeterministicMode.NOT_GUARANTEED
+            )
+            options = options | {
+                "deterministic": warp.config.DeterministicMode.NOT_GUARANTEED,
+                "metal_ordered_atomics": ordered,
+            }
         builder = ModuleBuilder(
             self,
             options,
@@ -5094,7 +5123,12 @@ class Module:
 
                 module_load_timer.extra_msg = " (compiled)" if compiled else " (cached)"
 
-            det_launch_meta_map = self._snapshot_deterministic_metadata(active_block_dim, options, rebuild=not compiled)
+            # Metal runs deterministic modules as ordered launches and never reads the record metadata
+            det_launch_meta_map = (
+                {}
+                if device.is_metal
+                else self._snapshot_deterministic_metadata(active_block_dim, options, rebuild=not compiled)
+            )
 
             # -----------------------------------------------------------
             # Load CPU or CUDA binary
@@ -5160,6 +5194,7 @@ class Module:
                 # markers written by codegen_kernel for kernels that reach unsupported builtins
                 metal_unsupported = dict(re.findall(r"^// wp_metal_unsupported (\S+): (.*)$", source, re.M))
                 metal_backward_unsupported = set(re.findall(r"^// wp_metal_backward_unsupported (\S+)$", source, re.M))
+                metal_ordered = set(re.findall(r"^// wp_metal_ordered (\S+)$", source, re.M))
                 if backward_error is not None:
                     warp._src.logger.log_warning(
                         f"Backward kernels of module '{self.name}' are not available on Metal (forward-only build used):\n"
@@ -5180,6 +5215,7 @@ class Module:
                 )
                 module_exec.metal_unsupported = metal_unsupported
                 module_exec.metal_backward_unsupported = metal_backward_unsupported
+                module_exec.metal_ordered = metal_ordered
                 module_exec.metal_backward_error = backward_error  # set when the adjoints failed to compile
                 self.execs[(device.context, active_block_dim)] = module_exec
 
@@ -11370,6 +11406,10 @@ def _metal_append_fixed_scratch(args, device: Device, nbytes: int):
     return wrapper(args, scratch[-1].ptr)
 
 
+# SIMD-group width of Apple GPUs (threadExecutionWidth); an ordered launch is exactly one SIMD-group
+METAL_SIMD_WIDTH = 32
+
+
 def invoke_metal(kernel, hooks, params: Sequence[Any], device: Device, block_dim: int, adjoint: bool = False):
     """Dispatch a forward or backward kernel on a Metal device."""
     if hooks.metal_unsupported:
@@ -11401,10 +11441,18 @@ def invoke_metal(kernel, hooks, params: Sequence[Any], device: Device, block_dim
         offsets = (ctypes.c_size_t * len(pointer_offsets))(*pointer_offsets)
         args_type._metal_pointer_offsets = offsets
 
+    pipeline = hooks.backward if adjoint else hooks.forward
+    num_threads = bounds.size
+    if not adjoint and hooks.metal_forward_ordered:
+        # deterministic atomics: one SIMD-group strides over all tasks, so atomics are issued in task order
+        pipeline = hooks.metal_forward_ordered
+        num_threads = min(bounds.size, METAL_SIMD_WIDTH)
+        block_dim = METAL_SIMD_WIDTH
+
     if runtime.core.wp_metal_launch_kernel(
         device.metal_ordinal,
-        hooks.backward if adjoint else hooks.forward,
-        bounds.size,
+        pipeline,
+        num_threads,
         block_dim,  # the module was compiled for this threadgroup size (WP_TILE_BLOCK_DIM)
         ctypes.byref(bounds),
         ctypes.sizeof(bounds),

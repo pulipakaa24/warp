@@ -2002,6 +2002,7 @@ class Adjoint:
         adj.used_by_backward_kernel = False
         # keys of unsupported builtins reached on Metal, filled by build() (see METAL_UNSUPPORTED_BUILTIN_PREFIXES)
         adj.metal_unsupported_builtins = set()
+        adj.metal_has_atomics = False
         # Whether to force adjoint code generation regardless of enable_backward setting.
         # This is used by warp.grad() to ensure the adjoint exists even in forward-only modules.
         adj.force_adjoint_codegen = False
@@ -2341,6 +2342,8 @@ class Adjoint:
         # Emit loops as for(;;)/break/continue instead of labels and goto (Metal has no goto).
         adj.structured_loops = adj.metal
         adj.metal_unsupported_builtins = set()
+        # whether the function reaches an atomic builtin (Metal ordered launches, see codegen_module)
+        adj.metal_has_atomics = False
 
         # holds current indent level
         adj.indentation = ""
@@ -3150,6 +3153,11 @@ class Adjoint:
                 )
             elif not func.is_builtin() and func.adj is not None:
                 adj.metal_unsupported_builtins |= func.adj.metal_unsupported_builtins
+            if func.is_builtin():
+                if func.key.startswith("atomic_"):
+                    adj.metal_has_atomics = True
+            elif func.adj is not None and getattr(func.adj, "metal_has_atomics", False):
+                adj.metal_has_atomics = True
         use_initializer_list = func.initializer_list_func(bound_args, return_type)
 
         # For user functions, check which parameters are wp.ref[T] / Reference(T)
@@ -7729,6 +7737,25 @@ WP_FORCE_INLINE void {name}_cpu_kernel_backward(
 
 """
 
+# Metal ordered entry point (deterministic modules, kernels that use atomics): the launch runs one SIMD-group that
+# strides over the tasks, so every atomic is issued in task order (lane order within a stride). Atomics then reach
+# memory in the order CUDA's warps reach them when they issue in launch order.
+metal_module_template_forward_ordered = """
+
+kernel void {name}_metal_forward_ordered(
+    constant wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
+    constant {forward_args_struct}* _wp_args [[buffer(1)]],
+    threadgroup char* _wp_arena [[threadgroup(0)]],
+    uint task_start [[thread_position_in_grid]],
+    uint task_stride [[threads_per_grid]])
+{{
+    wp::tile_shared_storage_t::init(_wp_arena);
+    for (size_t task_index = task_start; task_index < dim.size; task_index += task_stride)
+        {name}_cpu_kernel_forward(_wp_arena, {fixed_scratch}, dim, task_index, {forward_args_ref});
+}}
+
+"""
+
 # Metal backward entry point: both argument structs travel in one constant buffer.
 metal_module_template_backward = """
 
@@ -8976,6 +9003,19 @@ def codegen_module(kernel, device, options):
                 fixed_scratch_bwd="(device char*)nullptr",
             )
         source = metal_module_template_forward.format(**template_fmt_args)
+        kernel_options = options | kernel.options
+        ordered = kernel_options.get("metal_ordered_atomics", False)
+        if "deterministic" in kernel.options:
+            ordered = kernel.options["deterministic"] != warp.config.DeterministicMode.NOT_GUARANTEED
+        if (
+            ordered
+            and kernel.adj.metal_has_atomics
+            and not kernel.adj.metal_unsupported_builtins
+            and not any(is_tile(v.type) for v in kernel.adj.variables)
+        ):
+            # Module.load reads this marker back to select the ordered entry point at launch
+            source = f"// wp_metal_ordered {name}\n" + source
+            source += metal_module_template_forward_ordered.format(**template_fmt_args)
         # a Metal forward-only rebuild (see Module.load) drops every adjoint, including per-kernel opt-ins
         if (options | kernel.options)["enable_backward"] and not options.get("metal_forward_only"):
             if any(is_tile(v.type) for v in kernel.adj.variables):
