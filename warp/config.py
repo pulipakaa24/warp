@@ -381,7 +381,12 @@ metal_gpu_utilities: bool = _os.environ.get("WP_METAL_GPU_UTILITIES", "1") != "0
 """Whether :func:`warp.utils.radix_sort_pairs`, :func:`warp.utils.runlength_encode` and integer
 :func:`warp.utils.array_scan` run as GPU kernels on Metal devices (bitwise the same results as the host
 implementations, no host synchronization, recordable into graph captures as kernel dispatches). False runs them
-on the host after draining the GPU, as before. Floating-point scans always run on the host. Read at each call."""
+on the host after draining the GPU, as before. Floating-point scans always run on the host. Read at each call.
+
+Also selects the GPU BSR topology builders of :func:`warp.sparse.bsr_set_from_triplets` (and the functions built on
+it, :func:`warp.sparse.bsr_from_triplets`, :func:`warp.sparse.bsr_assign`, :func:`warp.sparse.bsr_axpy`,
+``warp.fem`` assembly) and :func:`warp.sparse.bsr_set_transpose` on Metal: the same topology as the host, with
+duplicate triplets summed in increasing triplet order (a stable sort, as on CUDA)."""
 
 max_unroll: int = 16
 """Maximum unroll factor for loops.
