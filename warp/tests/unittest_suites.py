@@ -138,6 +138,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.geometry.test_sparse_marching_cubes import TestSparseMarchingCubes
     from warp.tests.geometry.test_swept_volume import TestSweptVolume
     from warp.tests.geometry.test_volume import TestVolume
+    from warp.tests.geometry.test_volume_metal import TestVolumeMetal
     from warp.tests.geometry.test_volume_validation import TestVolumeValidation
     from warp.tests.geometry.test_volume_write import TestVolumeWrite
     from warp.tests.interop.test_dlpack import TestDLPack
@@ -514,6 +515,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestVerifyFP,
         TestVersion,
         TestVolume,
+        TestVolumeMetal,
         TestVolumeValidation,
         TestVolumeWrite,
     ]

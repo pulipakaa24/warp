@@ -6499,6 +6499,8 @@ class Volume:
 
         if self.device.is_cpu:
             self.runtime.core.wp_volume_get_tiles_host(self.id, out.ptr)
+        elif (grid_type := _metal_volume_grid_type(self)) is not None:
+            warp._src.metal_volume.get_tiles(self, grid_type, out)
         else:
             self.runtime.core.wp_volume_get_tiles_device(self.id, out.ptr)
 
@@ -6565,6 +6567,8 @@ class Volume:
 
         if self.device.is_cpu:
             self.runtime.core.wp_volume_get_voxels_host(self.id, out.ptr)
+        elif (grid_type := _metal_volume_grid_type(self)) is not None:
+            warp._src.metal_volume.get_voxels(self, grid_type, out)
         else:
             self.runtime.core.wp_volume_get_voxels_device(self.id, out.ptr)
 
@@ -7394,7 +7398,12 @@ class Volume:
         point_mask_ptr = ctypes.c_void_p(0 if point_mask is None else point_mask.ptr)
 
         if bg_value is None:
-            if not volume.device.is_cpu:
+            if not rebuildable and _metal_volume_enabled(volume.device):
+                volume.id, volume._metal_grid = warp._src.metal_volume.allocate(
+                    device, tile_points, tile_points.shape[0], point_mask, transform_buf, translation_buf,
+                    in_world_space, "tiles",
+                )  # fmt: skip
+            elif not volume.device.is_cpu:
                 volume.id = volume.runtime.core.wp_volume_index_from_tiles_device(
                     volume.device.context,
                     ctypes.c_void_p(tile_points.ptr),
@@ -7454,7 +7463,12 @@ class Volume:
             cvalue_size = ctypes.sizeof(cvalue)
             cvalue_type = nvdb_type.encode("ascii")
 
-            if not volume.device.is_cpu:
+            if not rebuildable and _metal_volume_enabled(volume.device):
+                volume.id, volume._metal_grid = warp._src.metal_volume.allocate(
+                    device, tile_points, tile_points.shape[0], point_mask, transform_buf, translation_buf,
+                    in_world_space, "tiles", nvdb_type, cvalue,
+                )  # fmt: skip
+            elif not volume.device.is_cpu:
                 volume.id = volume.runtime.core.wp_volume_from_tiles_device(
                     volume.device.context,
                     ctypes.c_void_p(tile_points.ptr),
@@ -7616,7 +7630,12 @@ class Volume:
         point_mask = _volume_point_mask_array(point_mask, voxel_points.shape[0], device)
         point_mask_ptr = ctypes.c_void_p(0 if point_mask is None else point_mask.ptr)
 
-        if not volume.device.is_cpu:
+        if not rebuildable and _metal_volume_enabled(volume.device):
+            volume.id, volume._metal_grid = warp._src.metal_volume.allocate(
+                device, voxel_points, voxel_points.shape[0], point_mask, transform_buf, translation_buf,
+                in_world_space, "voxels",
+            )  # fmt: skip
+        elif not volume.device.is_cpu:
             volume.id = volume.runtime.core.wp_volume_from_active_voxels_device(
                 volume.device.context,
                 ctypes.c_void_p(voxel_points.ptr),
@@ -7716,7 +7735,13 @@ class Volume:
         in_world_space = type_scalar_type(tile_points.dtype) is float32
         transform_buf, translation_buf = self._grid_transform_buffers()
 
-        if self.is_index:
+        if _metal_volume_enabled(self.device):
+            warp._src.metal_volume.rebuild(
+                self, tile_points, tile_points.shape[0], point_mask, transform_buf, translation_buf, in_world_space,
+                status, None if self.is_index else self._rebuild_bg_type,
+                None if self.is_index else self._rebuild_bg_value,
+            )  # fmt: skip
+        elif self.is_index:
             if not self.device.is_cpu:
                 self.runtime.core.wp_volume_index_rebuild_from_tiles_device(
                     self.id,
@@ -7794,7 +7819,12 @@ class Volume:
         in_world_space = type_scalar_type(voxel_points.dtype) is float32
         transform_buf, translation_buf = self._grid_transform_buffers()
 
-        if not self.device.is_cpu:
+        if _metal_volume_enabled(self.device):
+            warp._src.metal_volume.rebuild(
+                self, voxel_points, voxel_points.shape[0], point_mask, transform_buf, translation_buf, in_world_space,
+                status,
+            )  # fmt: skip
+        elif not self.device.is_cpu:
             self.runtime.core.wp_volume_rebuild_from_active_voxels_device(
                 self.id,
                 ctypes.c_void_p(voxel_points.ptr),
@@ -7850,6 +7880,22 @@ def _volume_rebuild_status_array(status: array, device) -> array:
     if status.device != device:
         raise RuntimeError(f"status must be on device {device}")
     return status
+
+
+def _metal_volume_enabled(device) -> builtins.bool:
+    # NanoVDB volumes are built by GPU kernels on Metal (warp._src.metal_volume)
+    if not device.is_metal or not warp.config.metal_gpu_volume:
+        return False
+    from warp._src import metal_volume  # noqa: F401, PLC0415 (sets warp._src.metal_volume)
+
+    return True
+
+
+def _metal_volume_grid_type(volume: Volume) -> int | None:
+    # grid type for the Metal GPU get_voxels / get_tiles, or None for the native path
+    if not _metal_volume_enabled(volume.device):
+        return None
+    return warp._src.metal_volume.grid_type_of(volume)
 
 
 def _volume_point_mask_array(point_mask: array | None, point_count: int, device) -> array | None:
