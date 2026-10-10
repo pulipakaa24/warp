@@ -377,6 +377,13 @@ compile-time row index; the same products in the same order as the generic step,
 tile path it measures the same as the generic step (0.971 vs 0.973 ms per 4096 at n = 43); it is 7x faster than the
 generic step only in a native-snippet context, where the generic step compiles badly. Part of the module hash."""
 
+metal_gpu_volume: bool = _os.environ.get("WP_METAL_GPU_VOLUME", "1") != "0"
+"""Whether :meth:`warp.Volume.allocate_by_tiles` / :meth:`warp.Volume.allocate_by_voxels` (non-rebuildable),
+:meth:`warp.Volume.rebuild`, :meth:`warp.Volume.get_voxels` and :meth:`warp.Volume.get_tiles` run as GPU kernels
+on Metal devices (the key-based builder of ``volume_builder.cpp``; the grid buffers are byte for byte the host
+builder's). Rebuilds then need no host synchronization. False drains the GPU and runs the host builder on unified
+memory, as before. Rebuildable allocation always uses the host builder. Read at each call."""
+
 metal_gpu_utilities: bool = _os.environ.get("WP_METAL_GPU_UTILITIES", "1") != "0"
 """Whether :func:`warp.utils.radix_sort_pairs`, :func:`warp.utils.runlength_encode` and integer
 :func:`warp.utils.array_scan` run as GPU kernels on Metal devices (bitwise the same results as the host
