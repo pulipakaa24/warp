@@ -177,6 +177,345 @@ def nextafter_kernel(x: wp.array[float], y: wp.array[float], up: wp.array[float]
     toward[i] = next_float_toward(x[i], y[i])
 
 
+# ---------------------------------------------------------------------------------------------------
+# Reference LBVH: a direct NumPy transcription of LinearBVHBuilderGPU::build and bvh_refit_kernel in
+# warp/native/bvh.cu (Warp 1.16.0), for checking the tree a Metal device builds bit for bit.
+
+_NODE_DTYPE = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("ib", "<u4")])
+
+
+def _cuda_fmin(a, b):
+    """``fminf`` as the GPU computes it: NaN is missing, -0.0 orders below +0.0."""
+    out = np.fmin(a, b)
+    zero = (a == 0) & (b == 0)
+    return np.where(zero, np.where(np.signbit(a) | np.signbit(b), np.float32(-0.0), np.float32(0.0)), out)
+
+
+def _cuda_fmax(a, b):
+    out = np.fmax(a, b)
+    zero = (a == 0) & (b == 0)
+    return np.where(zero, np.where(np.signbit(a) & np.signbit(b), np.float32(-0.0), np.float32(0.0)), out)
+
+
+def _part1by2(n):
+    n = n.astype(np.uint32)
+    n = (n ^ (n << np.uint32(16))) & np.uint32(0xFF0000FF)
+    n = (n ^ (n << np.uint32(8))) & np.uint32(0x0300F00F)
+    n = (n ^ (n << np.uint32(4))) & np.uint32(0x030C30C3)
+    n = (n ^ (n << np.uint32(2))) & np.uint32(0x09249249)
+    return n
+
+
+def _clz64(x):
+    return 64 if x == 0 else 64 - int(x).bit_length()
+
+
+def _reference_lbvh(item_lowers, item_uppers, groups=None, leaf_size=1):
+    lo = np.asarray(item_lowers, dtype=np.float32)
+    up = np.asarray(item_uppers, dtype=np.float32)
+    n = len(lo)
+    m = 2 * n - 1
+
+    # compute_total_bounds, compute_total_inv_edges
+    total_lower = np.full(3, np.finfo(np.float32).max, dtype=np.float32)
+    total_upper = -total_lower
+    for i in range(n):
+        total_lower = _cuda_fmin(total_lower, lo[i])
+        total_upper = _cuda_fmax(total_upper, up[i])
+    edges = (total_upper - total_lower) + np.float32(0.0001)
+    inv_edges = np.float32(1.0) / edges
+
+    # compute_morton_codes
+    center = np.float32(0.5) * (lo + up)
+    local = (center - total_lower) * inv_edges
+    q = np.clip((local * np.float32(1024)).astype(np.int32), 0, 1023)
+    morton = (_part1by2(q[:, 2]) << np.uint32(2)) | (_part1by2(q[:, 1]) << np.uint32(1)) | _part1by2(q[:, 0])
+    group = np.zeros(n, dtype=np.uint64) if groups is None else np.asarray(groups).astype(np.uint32).astype(np.uint64)
+    unsorted_keys = (group << np.uint64(32)) | morton.astype(np.uint64)
+
+    # stable radix sort of (key, index) pairs
+    indices = np.argsort(unsorted_keys, kind="stable").astype(np.int32)
+    keys = [int(k) for k in unsorted_keys[indices]]
+    prims = [int(i) for i in indices]
+    deltas = [_clz64(keys[i] ^ keys[i + 1]) for i in range(n - 1)]
+
+    # build_leaves
+    lower_b = np.zeros((m, 3), dtype=np.float32)
+    upper_b = np.zeros((m, 3), dtype=np.float32)
+    lower_i = [0] * m
+    upper_i = [0] * m
+    leaf = [False] * m
+    lower_b[:n] = lo[indices]
+    upper_b[:n] = up[indices]
+    for i in range(n):
+        lower_i[i] = upper_i[i] = i
+        leaf[i] = True
+    range_lefts = list(range(n)) + [0] * (n - 1)
+    range_rights = list(range(n)) + [0] * (n - 1)
+    parents = [0] * m
+    num_children = [0] * m
+    root = -1
+
+    # build_hierarchy
+    for thread in range(n):
+        index = thread
+        while True:
+            left, right = range_lefts[index], range_rights[index]
+            if left == 0 and right == n - 1:
+                root = index
+                parents[index] = -1
+                break
+            if left == 0:
+                parent_right = True
+            else:
+                decided = False
+                if keys[left] >> 32 == keys[right] >> 32:
+                    g = keys[left] >> 32
+                    go_right = right < n - 1 and keys[right + 1] >> 32 == g
+                    go_left = keys[left - 1] >> 32 == g
+                    if go_right != go_left:
+                        parent_right = go_right
+                        decided = True
+                if not decided:
+                    if right != n - 1 and deltas[right] >= deltas[left - 1]:
+                        if deltas[right] == deltas[left - 1]:
+                            parent_right = bool((prims[left - 1] % 2) ^ (prims[right] % 2))
+                        else:
+                            parent_right = True
+                    else:
+                        parent_right = False
+            if parent_right:
+                parent = right + n
+                lower_i[parent] = index
+                range_lefts[parent] = left
+            else:
+                parent = left + n - 1
+                upper_i[parent] = index
+                range_rights[parent] = right
+            parents[index] = parent
+            num_children[parent] += 1
+            if num_children[parent] != 2:
+                break
+            lc, rc = lower_i[parent], upper_i[parent]
+            lower_b[parent] = _cuda_fmin(lower_b[lc], lower_b[rc])
+            upper_b[parent] = _cuda_fmax(upper_b[lc], upper_b[rc])
+            leaf[parent] = False
+            index = parent
+
+    # mark_packed_leaf_nodes
+    for node in range(m):
+        depth, p = 1, parents[node]
+        while p != -1:
+            p = parents[p]
+            depth += 1
+        left, right = range_lefts[node], range_rights[node] + 1
+        if keys[left] >> 32 == keys[right - 1] >> 32 and (right - left <= leaf_size or depth >= 32):
+            leaf[node] = True
+            lower_i[node] = left
+            upper_i[node] = right
+
+    return {
+        "lower_b": lower_b,
+        "upper_b": upper_b,
+        "lower_i": np.array(lower_i, dtype=np.uint32),
+        "upper_i": np.array(upper_i, dtype=np.uint32),
+        "leaf": np.array(leaf, dtype=bool),
+        "parents": np.array(parents, dtype=np.int32),
+        "prims": np.array(prims, dtype=np.int32),
+        "root": root,
+    }
+
+
+def _reference_lbvh_refit(tree, item_lowers, item_uppers):
+    """bvh_refit_kernel of warp/native/bvh.cu, one leaf thread after the other."""
+    lo = np.asarray(item_lowers, dtype=np.float32)
+    up = np.asarray(item_uppers, dtype=np.float32)
+    t = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in tree.items()}
+    leaf, parents = t["leaf"], t["parents"]
+    n = len(t["prims"])
+
+    def leaf_bounds(node):
+        b_lo = np.full(3, np.finfo(np.float32).max, dtype=np.float32)
+        b_up = -b_lo
+        for c in range(t["lower_i"][node], t["upper_i"][node]):
+            p = t["prims"][c]
+            b_lo = np.where(lo[p] < b_lo, lo[p], b_lo)  # bounds3::add_bounds (std_min / std_max)
+            b_up = np.where(up[p] > b_up, up[p], b_up)
+        t["lower_b"][node], t["upper_b"][node] = b_lo, b_up
+
+    count = np.zeros(len(leaf), dtype=np.int32)
+    for index in range(n):
+        if not leaf[index]:
+            continue
+        parent = parents[index]
+        if parent == -1 or not leaf[parent]:
+            leaf_bounds(index)
+        while True:
+            parent = parents[index]
+            if parent == -1:
+                break
+            count[parent] += 1
+            if count[parent] != 2:
+                break
+            if leaf[parent]:
+                if parents[parent] == -1 or not leaf[parents[parent]]:
+                    leaf_bounds(parent)
+            else:
+                lc, rc = t["lower_i"][parent], t["upper_i"][parent]
+                t["lower_b"][parent] = _cuda_fmin(t["lower_b"][lc], t["lower_b"][rc])
+                t["upper_b"][parent] = _cuda_fmax(t["upper_b"][lc], t["upper_b"][rc])
+            index = parent
+    return t
+
+
+def _read_tree(obj, is_mesh):
+    """The tree arrays of a Bvh or Mesh, through ``wp_bvh_get_tree``."""
+    core = wp._src.context.runtime.core
+    on_device = 0 if obj.device.is_cpu else 1
+    info = np.zeros(6, dtype=np.int32)
+    if not core.wp_bvh_get_tree(obj.id, on_device, int(is_mesh), info.ctypes.data, None, None, None, None):
+        raise RuntimeError("wp_bvh_get_tree failed")
+    max_nodes, num_items = int(info[0]), int(info[1])
+    lowers = np.zeros(max_nodes, dtype=_NODE_DTYPE)
+    uppers = np.zeros(max_nodes, dtype=_NODE_DTYPE)
+    parents = np.zeros(max_nodes, dtype=np.int32)
+    prims = np.zeros(num_items, dtype=np.int32)
+    core.wp_bvh_get_tree(
+        obj.id,
+        on_device,
+        int(is_mesh),
+        info.ctypes.data,
+        lowers.ctypes.data,
+        uppers.ctypes.data,
+        parents.ctypes.data,
+        prims.ctypes.data,
+    )
+    return {
+        "lower_b": np.stack([lowers["x"], lowers["y"], lowers["z"]], axis=1),
+        "upper_b": np.stack([uppers["x"], uppers["y"], uppers["z"]], axis=1),
+        "lower_i": lowers["ib"] & np.uint32(0x7FFFFFFF),
+        "upper_i": uppers["ib"] & np.uint32(0x7FFFFFFF),
+        "leaf": (lowers["ib"] >> np.uint32(31)).astype(bool),
+        "upper_flag": (uppers["ib"] >> np.uint32(31)).astype(bool),
+        "parents": parents,
+        "prims": prims,
+        "root": int(info[2]),
+        "num_leaf_nodes": int(info[3]),
+        "constructor": int(info[4]),
+    }
+
+
+def _assert_same_tree(test, tree, ref, msg=""):
+    test.assertEqual(tree["root"], ref["root"], msg)
+    np.testing.assert_array_equal(tree["prims"], ref["prims"], err_msg=msg)
+    np.testing.assert_array_equal(tree["parents"], ref["parents"], err_msg=msg)
+    np.testing.assert_array_equal(tree["leaf"], ref["leaf"], err_msg=msg)
+    test.assertFalse(tree["upper_flag"].any(), msg)
+    np.testing.assert_array_equal(tree["lower_i"], ref["lower_i"], err_msg=msg)
+    np.testing.assert_array_equal(tree["upper_i"], ref["upper_i"], err_msg=msg)
+    # bit for bit, signed zeros included
+    np.testing.assert_array_equal(tree["lower_b"].view(np.uint32), ref["lower_b"].view(np.uint32), err_msg=msg)
+    np.testing.assert_array_equal(tree["upper_b"].view(np.uint32), ref["upper_b"].view(np.uint32), err_msg=msg)
+
+
+def _box_mesh(res, half_extents=(0.5, 0.3, 0.2)):
+    """A closed box surface with ``res`` x ``res`` quads per face (as two triangles each)."""
+    points, tris = [], []
+    hx = np.asarray(half_extents, dtype=np.float32)
+    for axis in range(3):
+        for side in (-1.0, 1.0):
+            u_axis, v_axis = (axis + 1) % 3, (axis + 2) % 3
+            base = len(points)
+            for a in range(res + 1):
+                for b in range(res + 1):
+                    p = np.zeros(3, dtype=np.float32)
+                    p[axis] = side * hx[axis]
+                    p[u_axis] = (2.0 * a / res - 1.0) * hx[u_axis]
+                    p[v_axis] = (2.0 * b / res - 1.0) * hx[v_axis]
+                    points.append(p)
+            for a in range(res):
+                for b in range(res):
+                    i0 = base + a * (res + 1) + b
+                    i1, i2, i3 = i0 + 1, i0 + res + 1, i0 + res + 2
+                    if side > 0:
+                        tris += [i0, i2, i1, i1, i2, i3]
+                    else:
+                        tris += [i0, i1, i2, i1, i3, i2]
+    return np.array(points, dtype=np.float32), np.array(tris, dtype=np.int32)
+
+
+def _triangle_bounds(points, tris):
+    t = points[tris.reshape(-1, 3)]
+    lower = _cuda_fmin(_cuda_fmin(t[:, 0], t[:, 1]), t[:, 2])
+    upper = _cuda_fmax(_cuda_fmax(t[:, 0], t[:, 1]), t[:, 2])
+    return lower, upper
+
+
+@wp.kernel
+def mesh_closest_kernel(
+    mesh: wp.uint64, pts: wp.array[wp.vec3], face: wp.array[int], dist: wp.array[float], max_dist: float
+):
+    i = wp.tid()
+    q = wp.mesh_query_point_no_sign(mesh, pts[i], max_dist)
+    if q.result:
+        face[i] = q.face
+        dist[i] = wp.length(wp.mesh_eval_position(mesh, q.face, q.u, q.v) - pts[i])
+    else:
+        face[i] = -1
+        dist[i] = -1.0
+
+
+@wp.kernel
+def mesh_winding_sign_kernel(mesh: wp.uint64, pts: wp.array[wp.vec3], sign: wp.array[float]):
+    i = wp.tid()
+    q = wp.mesh_query_point_sign_winding_number(mesh, pts[i], 10.0)
+    sign[i] = q.sign
+
+
+def _lbvh_cases():
+    """(name, lowers, uppers, groups) item bounds exercising the LBVH builder's branches."""
+    rng = np.random.default_rng(7)
+    cases = []
+    c = rng.uniform(-1.0, 1.0, (1000, 3)).astype(np.float32)
+    e = rng.uniform(0.001, 0.05, (1000, 3)).astype(np.float32)
+    cases.append(("random", c - e, c + e, None))
+    # many equal Morton keys: the parity tie-break and the depth limit of leaf packing
+    c = (rng.integers(0, 4, (500, 3)) * 0.25).astype(np.float32)
+    cases.append(("duplicates", c - np.float32(0.01), c + np.float32(0.01), None))
+    same = np.zeros((200, 3), dtype=np.float32)
+    cases.append(("identical", same - np.float32(0.5), same + np.float32(0.5), None))
+    # unsorted group ids
+    c = rng.uniform(-1.0, 1.0, (600, 3)).astype(np.float32)
+    cases.append(("grouped", c - np.float32(0.02), c + np.float32(0.02), rng.integers(0, 5, 600).astype(np.int32)))
+    # signed zeros in the bounds
+    z = np.array([[-0.0, 0.0, -0.0], [0.0, -0.0, 0.0], [-0.0, -0.0, 0.0], [0.5, 0.0, -0.0]], dtype=np.float32)
+    cases.append(("signed_zeros", z, z + np.array([0.0, 0.0, 0.0], dtype=np.float32), None))
+    for n in (1, 2, 3):
+        c = rng.uniform(-1.0, 1.0, (n, 3)).astype(np.float32)
+        cases.append((f"n={n}", c - np.float32(0.1), c + np.float32(0.1), None))
+    return cases
+
+
+class TestMetalLbvhHost(unittest.TestCase):
+    """The host LBVH builder (used for Metal trees) against the CUDA reference, through the host entry point."""
+
+    def test_host_lbvh_matches_cuda_build(self):
+        core = wp._src.context.runtime.core
+        for name, lowers, uppers, groups in _lbvh_cases():
+            lo = np.ascontiguousarray(lowers, dtype=np.float32)
+            up = np.ascontiguousarray(uppers, dtype=np.float32)
+            gr = None if groups is None else np.ascontiguousarray(groups, dtype=np.int32)
+            bvh_id = core.wp_bvh_create_host(
+                lo.ctypes.data, up.ctypes.data, len(lo), 2, None if gr is None else gr.ctypes.data, 4
+            )
+            self.assertNotEqual(bvh_id, 0, name)
+            try:
+                holder = type("HostBvh", (), {"id": bvh_id, "device": wp.get_device("cpu")})()
+                _assert_same_tree(self, _read_tree(holder, is_mesh=False), _reference_lbvh(lo, up, gr, 4), name)
+            finally:
+                core.wp_bvh_destroy_host(bvh_id)
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
@@ -509,6 +848,114 @@ class TestMetal(unittest.TestCase):
                 results[device] = warp.sparse.bsr_get_diag(mat).numpy()
         np.testing.assert_allclose(results[self.device], results["cpu"], rtol=1e-6, atol=1e-7)
         self.assertGreater(np.abs(results["cpu"]).max(), 0.0)
+
+    def test_lbvh_tree_matches_cuda_build(self):
+        """A Metal LBVH is bitwise the tree the CUDA LBVH kernels build (reference: ``_reference_lbvh``)."""
+        for name, lowers, uppers, groups in _lbvh_cases():
+            for leaf_size in (1, 4):
+                msg = f"{name}, leaf_size={leaf_size}"
+                with self.subTest(case=name, leaf_size=leaf_size):
+                    lo = wp.array(lowers, dtype=wp.vec3, device=self.device)
+                    up = wp.array(uppers, dtype=wp.vec3, device=self.device)
+                    gr = None if groups is None else wp.array(groups, dtype=wp.int32, device=self.device)
+                    bvh = wp.Bvh(lo, up, groups=gr, leaf_size=leaf_size)  # default constructor: LBVH, as on CUDA
+                    tree = _read_tree(bvh, is_mesh=False)
+                    self.assertEqual(tree["constructor"], 2, msg)
+                    self.assertEqual(tree["num_leaf_nodes"], len(lowers), msg)
+                    _assert_same_tree(self, tree, _reference_lbvh(lowers, uppers, groups, leaf_size), msg)
+
+    def test_lbvh_refit_and_rebuild_match_cuda(self):
+        rng = np.random.default_rng(3)
+        _, lowers, uppers, _ = _lbvh_cases()[0]
+        moved_lo = (lowers + rng.normal(0.0, 0.05, lowers.shape)).astype(np.float32)
+        moved_up = np.maximum(moved_lo, (uppers + rng.normal(0.0, 0.05, uppers.shape)).astype(np.float32))
+
+        lo = wp.array(lowers, dtype=wp.vec3, device=self.device)
+        up = wp.array(uppers, dtype=wp.vec3, device=self.device)
+        bvh = wp.Bvh(lo, up, constructor="lbvh", leaf_size=4)
+        ref = _reference_lbvh(lowers, uppers, None, 4)
+        lo.assign(moved_lo)
+        up.assign(moved_up)
+        bvh.refit()
+        _assert_same_tree(self, _read_tree(bvh, is_mesh=False), _reference_lbvh_refit(ref, moved_lo, moved_up), "refit")
+
+        # in-place rebuild is LBVH, as on CUDA, also for a tree built with SAH
+        lo.assign(lowers)
+        up.assign(uppers)
+        sah = wp.Bvh(lo, up, constructor="sah", leaf_size=4)
+        self.assertEqual(_read_tree(sah, is_mesh=False)["constructor"], 0)
+        lo.assign(moved_lo)
+        up.assign(moved_up)
+        for tree_bvh in (bvh, sah):
+            tree_bvh.rebuild()
+            tree = _read_tree(tree_bvh, is_mesh=False)
+            self.assertEqual(tree["constructor"], 2)
+            _assert_same_tree(self, tree, _reference_lbvh(moved_lo, moved_up, None, 4), "rebuild")
+
+    def test_lbvh_mesh_matches_cuda_build(self):
+        points, tris = _box_mesh(8)
+        pts = wp.array(points, dtype=wp.vec3, device=self.device)
+        mesh = wp.Mesh(points=pts, indices=wp.array(tris, dtype=wp.int32, device=self.device))  # default: LBVH
+        tree = _read_tree(mesh, is_mesh=True)
+        self.assertEqual(tree["constructor"], 2)
+        ref = _reference_lbvh(*_triangle_bounds(points, tris), None, 4)
+        _assert_same_tree(self, tree, ref, "mesh")
+
+        # closest-point queries agree with a CPU (SAH) mesh in distance
+        rng = np.random.default_rng(5)
+        queries = rng.uniform(-0.8, 0.8, (4096, 3)).astype(np.float32)
+        dists = {}
+        for device, m in (
+            (self.device, mesh),
+            (
+                "cpu",
+                wp.Mesh(
+                    points=wp.array(points, dtype=wp.vec3, device="cpu"),
+                    indices=wp.array(tris, dtype=wp.int32, device="cpu"),
+                ),
+            ),
+        ):
+            q = wp.array(queries, dtype=wp.vec3, device=device)
+            face = wp.zeros(len(queries), dtype=int, device=device)
+            dist = wp.zeros(len(queries), dtype=float, device=device)
+            wp.launch(mesh_closest_kernel, dim=len(queries), inputs=[m.id, q, face, dist, 10.0], device=device)
+            self.assertTrue((face.numpy() >= 0).all())
+            dists[device] = dist.numpy()
+        np.testing.assert_allclose(dists[self.device], dists["cpu"], rtol=0.0, atol=2e-6)
+
+        # winding-number signs (solid-angle refit from the LBVH root)
+        signs = {}
+        for device in (self.device, "cpu"):
+            m = wp.Mesh(
+                points=wp.array(points, dtype=wp.vec3, device=device),
+                indices=wp.array(tris, dtype=wp.int32, device=device),
+                support_winding_number=True,
+            )
+            q = wp.array(queries, dtype=wp.vec3, device=device)
+            sign = wp.zeros(len(queries), dtype=float, device=device)
+            wp.launch(mesh_winding_sign_kernel, dim=len(queries), inputs=[m.id, q, sign], device=device)
+            signs[device] = sign.numpy()
+        inside = np.all(np.abs(queries) < np.array([0.5, 0.3, 0.2], dtype=np.float32), axis=1)
+        np.testing.assert_array_equal(signs["cpu"], np.where(inside, -1.0, 1.0))
+        np.testing.assert_array_equal(signs[self.device], signs["cpu"])
+
+        # refit after moving the points
+        moved = (points * np.float32(1.25) + np.float32(0.1)).astype(np.float32)
+        pts.assign(moved)
+        mesh.refit()
+        _assert_same_tree(
+            self, _read_tree(mesh, is_mesh=True), _reference_lbvh_refit(ref, *_triangle_bounds(moved, tris)), "refit"
+        )
+
+    def test_lbvh_explicit_sah_and_median_still_build(self):
+        _, lowers, uppers, _ = _lbvh_cases()[0]
+        for constructor, code in (("sah", 0), ("median", 1)):
+            bvh = wp.Bvh(
+                wp.array(lowers, dtype=wp.vec3, device=self.device),
+                wp.array(uppers, dtype=wp.vec3, device=self.device),
+                constructor=constructor,
+            )
+            self.assertEqual(_read_tree(bvh, is_mesh=False)["constructor"], code)
 
 
 class TestMetalInlineBudget(unittest.TestCase):

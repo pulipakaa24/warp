@@ -224,7 +224,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_logger import TestLogger
     from warp.tests.test_lvalue import TestLValue
     from warp.tests.test_math import TestMath
-    from warp.tests.test_metal import TestMetal, TestMetalInlineBudget
+    from warp.tests.test_metal import TestMetal, TestMetalInlineBudget, TestMetalLbvhHost
     from warp.tests.test_module_contamination import TestModuleContamination
     from warp.tests.test_module_hashing import TestModuleHashing
     from warp.tests.test_module_parallel_load import (
@@ -414,6 +414,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMath,
         TestMetal,
         TestMetalInlineBudget,
+        TestMetalLbvhHost,
         TestCudaMaxRegisters,
         TestMempool,
         TestMesh,

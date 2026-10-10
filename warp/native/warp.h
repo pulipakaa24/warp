@@ -115,6 +115,22 @@ WP_API void wp_bvh_destroy_device(uint64_t id);
 WP_API void wp_bvh_refit_device(uint64_t id);
 WP_API void wp_bvh_rebuild_device(uint64_t id);
 
+// Copies the tree arrays of a BVH, or of a mesh's BVH (is_mesh), to host buffers, for tests and
+// debugging. info receives {max_nodes, num_items, root, num_leaf_nodes, constructor_type, leaf_size};
+// the arrays are written when non-null (node halves as 16-byte BVHPackedNodeHalf, max_nodes each;
+// primitive indices, num_items). Host objects (device == 0) and Metal objects (device != 0) are
+// supported; returns 0 for an unknown id or a CUDA object.
+WP_API int wp_bvh_get_tree(
+    uint64_t id,
+    int device,
+    int is_mesh,
+    int* info,
+    void* node_lowers,
+    void* node_uppers,
+    int* node_parents,
+    int* primitive_indices
+);
+
 // create a user-accessible copy of the mesh, it is the
 // users responsibility to keep-alive the points/tris data for the duration of the mesh lifetime
 WP_API uint64_t wp_mesh_create_host(

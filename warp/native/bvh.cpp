@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cmath>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <vector>
@@ -694,6 +696,343 @@ void reorder_top_down_bvh(BVH& bvh_host)
 }
 
 
+/////////////////////////////////////////////////////////////////////////////////////////////
+// Host LBVH: a sequential execution of the CUDA LBVH builder (LinearBVHBuilderGPU::build in
+// bvh.cu) and of its refit kernel. Used for Metal trees, whose host-built arrays are read by
+// Metal kernels: the tree (node order, child indices, leaf packing, parents, primitive order and
+// node bounds) is bitwise the one the CUDA build produces from the same item bounds.
+//
+// Why sequential execution is exact: every CUDA kernel of the build is a pure function of its
+// thread index and of data that is fixed before the kernel runs, except build_hierarchy and the
+// refit, whose atomics only decide which of a node's two children goes on to process the parent;
+// the parent's contents (child slots written by each child, range, bounds) do not depend on it.
+// The key sort is CUB's radix sort of (key, index) pairs, which is stable; a stable sort by key of
+// the identity permutation gives the same order.
+//
+// Floating point: the only arithmetic is the Morton quantization (0.5f * (lower + upper),
+// (center - grid_lower) * inv_edges, x * 1024, edges + 0.0001f, 1.0f / edges) and min/max. None of
+// these is a multiply feeding an add, so nvcc's --fmad=true has nothing to fuse; contraction is
+// also switched off here so the host compiler cannot fuse either. Min/max follow the CUDA fminf /
+// fmaxf semantics (NaN is missing data) where the kernels use wp::min/max, and bounds3::add_bounds
+// where they use it. Equal zeros of opposite sign are ordered -0.0 < +0.0, taken to be what the
+// GPU min/max instructions return; this is the one assumption not verified against a CUDA run, and
+// it matters only for bounds holding signed zeros.
+
+namespace {
+
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+
+inline float lbvh_fmin(float a, float b)
+{
+    if (a != a)
+        return b;
+    if (b != b)
+        return a;
+    if (a == b)
+        return std::signbit(a) ? a : b;
+    return (a < b) ? a : b;
+}
+
+inline float lbvh_fmax(float a, float b)
+{
+    if (a != a)
+        return b;
+    if (b != b)
+        return a;
+    if (a == b)
+        return std::signbit(a) ? b : a;
+    return (a > b) ? a : b;
+}
+
+inline vec3 lbvh_min(const vec3& a, const vec3& b)
+{
+    return vec3(lbvh_fmin(a[0], b[0]), lbvh_fmin(a[1], b[1]), lbvh_fmin(a[2], b[2]));
+}
+
+inline vec3 lbvh_max(const vec3& a, const vec3& b)
+{
+    return vec3(lbvh_fmax(a[0], b[0]), lbvh_fmax(a[1], b[1]), lbvh_fmax(a[2], b[2]));
+}
+
+inline vec3 node_bound(const BVHPackedNodeHalf& n) { return vec3(n.x, n.y, n.z); }
+
+inline void set_node_bound(BVHPackedNodeHalf& n, const vec3& b)
+{
+    n.x = b[0];
+    n.y = b[1];
+    n.z = b[2];
+}
+
+inline int lbvh_clz64(uint64_t x) { return x == 0 ? 64 : __builtin_clzll(x); }
+
+// Morton key of one item (bvh.cu: compute_morton_codes)
+inline uint64_t lbvh_key(
+    const vec3& lower, const vec3& upper, const vec3& grid_lower, const vec3& grid_inv_edges, const int* groups, int i
+)
+{
+    vec3 center = 0.5f * (lower + upper);
+    vec3 local = cw_mul((center - grid_lower), grid_inv_edges);
+    const uint64_t morton_code = static_cast<uint64_t>(morton3<1024>(local[0], local[1], local[2]));
+    const uint64_t group = groups ? static_cast<uint32_t>(groups[i]) : 0u;
+    return (group << 32) | morton_code;
+}
+
+}  // anonymous namespace
+
+// Builds an LBVH into bvh's existing arrays (node_lowers, node_uppers, node_parents of max_nodes = 2n - 1
+// entries, primitive_indices of n, root); reads bvh.item_lowers/uppers/groups and bvh.leaf_size.
+void lbvh_build_host(BVH& bvh)
+{
+    const int n = bvh.num_items;
+    if (n <= 0)
+        return;
+    const vec3* item_lowers = bvh.item_lowers;
+    const vec3* item_uppers = bvh.item_uppers;
+    const int* item_groups = bvh.item_groups;
+    const int max_nodes = 2 * n - 1;
+
+    // compute_total_bounds (from +/-FLT_MAX) and compute_total_inv_edges
+    vec3 total_lower(FLT_MAX);
+    vec3 total_upper(-FLT_MAX);
+    for (int i = 0; i < n; ++i) {
+        total_lower = lbvh_min(total_lower, item_lowers[i]);
+        total_upper = lbvh_max(total_upper, item_uppers[i]);
+    }
+    vec3 edges = (total_upper - total_lower);
+    edges += vec3(0.0001f);
+    const vec3 inv_edges = vec3(1.0f / edges[0], 1.0f / edges[1], 1.0f / edges[2]);
+
+    // compute_morton_codes, then the (stable) radix sort of (key, index) pairs
+    std::vector<uint64_t> unsorted_keys(n);
+    std::vector<int> indices(n);
+    for (int i = 0; i < n; ++i) {
+        unsorted_keys[i] = lbvh_key(item_lowers[i], item_uppers[i], total_lower, inv_edges, item_groups, i);
+        indices[i] = i;
+    }
+    std::stable_sort(indices.begin(), indices.end(), [&](int a, int b) { return unsorted_keys[a] < unsorted_keys[b]; });
+    std::vector<uint64_t> keys(n);
+    for (int i = 0; i < n; ++i) {
+        keys[i] = unsorted_keys[indices[i]];
+        bvh.primitive_indices[i] = indices[i];
+    }
+
+    // compute_key_deltas
+    std::vector<int> deltas(n);
+    for (int i = 0; i < n - 1; ++i)
+        deltas[i] = lbvh_clz64(keys[i] ^ keys[i + 1]);
+
+    // build_leaves
+    std::vector<int> range_lefts(max_nodes), range_rights(max_nodes), num_children(max_nodes, 0);
+    BVHPackedNodeHalf* lowers = bvh.node_lowers;
+    BVHPackedNodeHalf* uppers = bvh.node_uppers;
+    int* parents = bvh.node_parents;
+    for (int i = 0; i < n; ++i) {
+        const int item = indices[i];
+        lowers[i] = make_node(item_lowers[item], i, true);
+        uppers[i] = make_node(item_uppers[item], i, false);
+        range_lefts[i] = i;
+        range_rights[i] = i;
+    }
+
+    // build_hierarchy, one leaf "thread" after the other
+    const int* primitive_indices = bvh.primitive_indices;
+    const int internal_offset = n;
+    for (int thread = 0; thread < n; ++thread) {
+        int index = thread;
+        for (;;) {
+            const int left = range_lefts[index];
+            const int right = range_rights[index];
+
+            if (left == 0 && right == n - 1) {
+                *bvh.root = index;
+                parents[index] = -1;
+                break;
+            }
+
+            bool parent_right = false;
+            if (left == 0) {
+                parent_right = true;
+            } else {
+                bool decided = false;
+                const uint32_t group_left = (uint32_t)(keys[left] >> 32);
+                const uint32_t group_right = (uint32_t)(keys[right] >> 32);
+                if (group_left == group_right) {
+                    const uint32_t group = group_left;
+                    const bool can_go_right_same = (right < n - 1) && ((uint32_t)(keys[right + 1] >> 32) == group);
+                    const bool can_go_left_same = ((uint32_t)(keys[left - 1] >> 32) == group);
+                    if (can_go_right_same ^ can_go_left_same) {
+                        parent_right = can_go_right_same;
+                        decided = true;
+                    }
+                }
+                if (!decided) {
+                    if (right != n - 1 && deltas[right] >= deltas[left - 1]) {
+                        if (deltas[right] == deltas[left - 1])
+                            parent_right = (primitive_indices[left - 1] % 2) ^ (primitive_indices[right] % 2);
+                        else
+                            parent_right = true;
+                    } else {
+                        parent_right = false;
+                    }
+                }
+            }
+
+            int parent;
+            if (parent_right) {
+                parent = right + internal_offset;
+                parents[index] = parent;
+                lowers[parent].i = index;
+                range_lefts[parent] = left;
+            } else {
+                parent = left + internal_offset - 1;
+                parents[index] = parent;
+                uppers[parent].i = index;
+                range_rights[parent] = right;
+            }
+
+            if (num_children[parent]++ == 1) {
+                const int left_child = lowers[parent].i;
+                const int right_child = uppers[parent].i;
+                const vec3 lower = lbvh_min(node_bound(lowers[left_child]), node_bound(lowers[right_child]));
+                const vec3 upper = lbvh_max(node_bound(uppers[left_child]), node_bound(uppers[right_child]));
+                lowers[parent] = make_node(lower, left_child, false);
+                uppers[parent] = make_node(upper, right_child, false);
+                index = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // mark_packed_leaf_nodes
+    for (int node_index = 0; node_index < max_nodes; ++node_index) {
+        int depth = 1;
+        int parent = parents[node_index];
+        while (parent != -1) {
+            parent = parents[parent];
+            depth++;
+        }
+        const int left = range_lefts[node_index];
+        const int right = range_rights[node_index] + 1;
+        const bool single_group = (keys[left] >> 32) == (keys[right - 1] >> 32);
+        if (single_group && (right - left <= bvh.leaf_size || depth >= BVH_QUERY_STACK_SIZE)) {
+            lowers[node_index].b = 1;
+            lowers[node_index].i = left;
+            uppers[node_index].i = right;
+        }
+    }
+
+    bvh.max_nodes = max_nodes;
+    bvh.num_nodes = max_nodes;
+    bvh.num_leaf_nodes = n;
+    bvh.max_depth = 0;
+    bvh.constructor_type = BVH_CONSTRUCTOR_LBVH;
+}
+
+// Allocates and builds an LBVH (bvh_create_device's LBVH branch in bvh.cu).
+void lbvh_create_host(vec3* lowers, vec3* uppers, int num_items, int* groups, int leaf_size, BVH& bvh)
+{
+    memset(&bvh, 0, sizeof(BVH));
+    bvh.item_lowers = lowers;
+    bvh.item_uppers = uppers;
+    bvh.item_groups = groups;
+    bvh.num_items = num_items;
+    bvh.leaf_size = leaf_size;
+    bvh.constructor_type = BVH_CONSTRUCTOR_LBVH;
+    if (num_items <= 0) {
+        bvh.num_items = 0;
+        return;
+    }
+    if (num_items > INT_MAX / 2) {
+        fprintf(stderr, "Error: Primitive count %d is too large and would cause an integer overflow.\n", num_items);
+        bvh.num_items = 0;
+        return;
+    }
+    const int max_nodes = 2 * num_items - 1;
+    bvh.max_nodes = max_nodes;
+    bvh.node_lowers
+        = static_cast<BVHPackedNodeHalf*>(wp_alloc_host(sizeof(BVHPackedNodeHalf) * max_nodes, "(native:bvh)"));
+    bvh.node_uppers
+        = static_cast<BVHPackedNodeHalf*>(wp_alloc_host(sizeof(BVHPackedNodeHalf) * max_nodes, "(native:bvh)"));
+    bvh.node_parents = static_cast<int*>(wp_alloc_host(sizeof(int) * max_nodes, "(native:bvh)"));
+    bvh.primitive_indices = static_cast<int*>(wp_alloc_host(sizeof(int) * num_items, "(native:bvh)"));
+    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int), "(native:bvh)"));
+    memset(bvh.node_lowers, 0, sizeof(BVHPackedNodeHalf) * max_nodes);
+    memset(bvh.node_uppers, 0, sizeof(BVHPackedNodeHalf) * max_nodes);
+    *bvh.root = 0;
+    lbvh_build_host(bvh);
+}
+
+// bvh_refit_kernel in bvh.cu, one leaf "thread" after the other. Like the kernel it leaves the bounds of
+// nodes muted by leaf packing as they are (no query reaches them).
+void lbvh_refit_host(BVH& bvh)
+{
+    const int num_leaves = bvh.num_leaf_nodes;
+    if (!bvh.node_lowers || num_leaves <= 0)
+        return;
+    BVHPackedNodeHalf* lowers = bvh.node_lowers;
+    BVHPackedNodeHalf* uppers = bvh.node_uppers;
+    const int* parents = bvh.node_parents;
+
+    auto leaf_bounds = [&](int node) {
+        bounds3 bound;
+        for (int c = lowers[node].i; c < int(uppers[node].i); c++) {
+            const int primitive = bvh.primitive_indices[c];
+            bound.add_bounds(bvh.item_lowers[primitive], bvh.item_uppers[primitive]);
+        }
+        set_node_bound(lowers[node], bound.lower);
+        set_node_bound(uppers[node], bound.upper);
+    };
+
+    std::vector<int> child_count(bvh.max_nodes, 0);
+    for (int thread = 0; thread < num_leaves; ++thread) {
+        int index = thread;
+        if (!lowers[index].b)
+            continue;
+        int parent = parents[index];
+        if (parent == -1 || !lowers[parent].b)
+            leaf_bounds(index);
+
+        for (;;) {
+            parent = parents[index];
+            if (parent == -1)
+                break;
+            if (child_count[parent]++ != 1)
+                break;
+            if (lowers[parent].b) {
+                const int parent_parent = parents[parent];
+                if (parent_parent == -1 || !lowers[parent_parent].b)
+                    leaf_bounds(parent);
+            } else {
+                const int left_child = lowers[parent].i;
+                const int right_child = uppers[parent].i;
+                set_node_bound(
+                    lowers[parent], lbvh_min(node_bound(lowers[left_child]), node_bound(lowers[right_child]))
+                );
+                set_node_bound(
+                    uppers[parent], lbvh_max(node_bound(uppers[left_child]), node_bound(uppers[right_child]))
+                );
+            }
+            index = parent;
+        }
+    }
+}
+
+// Triangle bounds as compute_triangle_bounds in mesh.cu computes them (min(min(p, q), r) with the CUDA
+// min/max semantics), for meshes whose BVH is an LBVH.
+void lbvh_triangle_bounds(const vec3& p, const vec3& q, const vec3& r, vec3& lower, vec3& upper)
+{
+    lower = lbvh_min(lbvh_min(p, q), r);
+    upper = lbvh_max(lbvh_max(p, q), r);
+}
+
+#if defined(__clang__)
+#pragma clang fp contract(on)
+#endif
+
+
 void bvh_refit_recursive(BVH& bvh, int index)
 {
     BVHPackedNodeHalf& lower = bvh.node_lowers[index];
@@ -733,7 +1072,14 @@ void bvh_refit_recursive(BVH& bvh, int index)
     }
 }
 
-void bvh_refit_host(BVH& bvh) { bvh_refit_recursive(bvh, *bvh.root); }
+void bvh_refit_host(BVH& bvh)
+{
+    if (bvh.constructor_type == BVH_CONSTRUCTOR_LBVH) {
+        lbvh_refit_host(bvh);
+        return;
+    }
+    bvh_refit_recursive(bvh, *bvh.root);
+}
 void bvh_rebuild_host(BVH& bvh, int constructor_type)
 {
     if (constructor_type == BVH_CONSTRUCTOR_CUBQL) {
@@ -752,6 +1098,12 @@ void bvh_rebuild_host(BVH& bvh, int constructor_type)
 
     if (bvh.constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         wp::set_error_string("Warp error: cannot rebuild a cuBQL BVH with a different constructor in place");
+        return;
+    }
+
+    if (constructor_type == BVH_CONSTRUCTOR_LBVH) {
+        // in place, as bvh_rebuild_device in bvh.cu (the buffers of any non-cuBQL tree fit)
+        lbvh_build_host(bvh);
         return;
     }
 
@@ -802,6 +1154,11 @@ void bvh_create_host(
         }
         cubql_bvh_create_host(lowers, uppers, num_items, leaf_size, bvh);
         bvh.constructor_type = constructor_type;
+        return;
+    }
+
+    if (constructor_type == BVH_CONSTRUCTOR_LBVH) {
+        lbvh_create_host(lowers, uppers, num_items, groups, leaf_size, bvh);
         return;
     }
 
@@ -903,11 +1260,65 @@ void wp_bvh_destroy_host(uint64_t id)
 }
 
 
+namespace wp {
+// Copies a host-addressable tree (see wp_bvh_get_tree)
+int bvh_copy_tree(
+    const BVH& bvh, int* info, void* node_lowers, void* node_uppers, int* node_parents, int* primitive_indices
+)
+{
+    if (info) {
+        info[0] = bvh.max_nodes;
+        info[1] = bvh.num_items;
+        info[2] = bvh.root ? *bvh.root : -1;
+        info[3] = bvh.num_leaf_nodes;
+        info[4] = bvh.constructor_type;
+        info[5] = bvh.leaf_size;
+    }
+    const size_t nodes = bvh.node_lowers ? size_t(bvh.max_nodes) : 0;
+    const size_t items = bvh.primitive_indices ? size_t(bvh.num_items) : 0;
+    if (node_lowers && nodes)
+        memcpy(node_lowers, bvh.node_lowers, sizeof(BVHPackedNodeHalf) * nodes);
+    if (node_uppers && nodes)
+        memcpy(node_uppers, bvh.node_uppers, sizeof(BVHPackedNodeHalf) * nodes);
+    if (node_parents && nodes && bvh.node_parents)
+        memcpy(node_parents, bvh.node_parents, sizeof(int) * nodes);
+    if (primitive_indices && items)
+        memcpy(primitive_indices, bvh.primitive_indices, sizeof(int) * items);
+    return 1;
+}
+}  // namespace wp
+
+// defined with the Metal mesh registry in mesh.cpp (0 elsewhere)
+uint64_t metal_mesh_host_id(uint64_t id);
+uint64_t metal_bvh_host_id(uint64_t id);
+
+int wp_bvh_get_tree(
+    uint64_t id,
+    int device,
+    int is_mesh,
+    int* info,
+    void* node_lowers,
+    void* node_uppers,
+    int* node_parents,
+    int* primitive_indices
+)
+{
+    uint64_t host_id = id;
+    if (device)
+        host_id = is_mesh ? metal_mesh_host_id(id) : metal_bvh_host_id(id);
+    if (!host_id)
+        return 0;
+    const BVH& bvh = is_mesh ? reinterpret_cast<const Mesh*>(host_id)->bvh : *reinterpret_cast<const BVH*>(host_id);
+    return wp::bvh_copy_tree(bvh, info, node_lowers, node_uppers, node_parents, primitive_indices);
+}
+
 #if defined(__APPLE__)
 
 // On Apple platforms the device is a Metal GPU: the tree is built and refitted by the host code
 // above, in Metal memory, and kernels read a descriptor holding GPU addresses (see metal_host.h).
-// LBVH construction is CUDA-only, so it falls back to SAH.
+// LBVH trees are built by lbvh_build_host, a sequential execution of the CUDA LBVH kernels, so a
+// Metal tree is bitwise the tree CUDA builds from the same bounds; in-place rebuilds are LBVH, as
+// on CUDA.
 namespace {
 std::map<uint64_t, MetalMirror<BVH>> g_metal_bvhs;
 
@@ -927,8 +1338,6 @@ uint64_t wp_bvh_create_device(
     if (wp_metal_synchronize(ordinal) != 0)  // the bounds may still be written by GPU kernels
         return 0;
     ScopedMetalHostAlloc scope(ordinal);
-    if (constructor_type == BVH_CONSTRUCTOR_LBVH)
-        constructor_type = BVH_CONSTRUCTOR_SAH;
     MetalMirror<BVH> m { ordinal, wp_bvh_create_host(lowers, uppers, num_items, constructor_type, groups, leaf_size),
                          nullptr };
     if (!m.host_id)
@@ -942,6 +1351,15 @@ uint64_t wp_bvh_create_device(
     }
     g_metal_bvhs[id] = m;
     return id;
+}
+
+uint64_t metal_bvh_host_id(uint64_t id)
+{
+    auto it = g_metal_bvhs.find(id);
+    if (it == g_metal_bvhs.end())
+        return 0;
+    wp_metal_synchronize(it->second.ordinal);  // a recorded rebuild or refit may still be pending
+    return it->second.host_id;
 }
 
 // Runs a host-side BVH update now, or records it so a graph replays it in order with its dispatches.
@@ -975,7 +1393,11 @@ void wp_bvh_refit_device(uint64_t id)
 void wp_bvh_rebuild_device(uint64_t id)
 {
     metal_bvh_apply(id, [](const MetalMirror<BVH>& m) {
-        wp_bvh_rebuild_host(m.host_id, reinterpret_cast<BVH*>(m.host_id)->constructor_type);
+        // bvh_rebuild_device in bvh.cu: cuBQL trees rebuild with cuBQL, every other tree becomes an LBVH
+        const int constructor_type = reinterpret_cast<BVH*>(m.host_id)->constructor_type;
+        wp_bvh_rebuild_host(
+            m.host_id, constructor_type == BVH_CONSTRUCTOR_CUBQL ? BVH_CONSTRUCTOR_CUBQL : BVH_CONSTRUCTOR_LBVH
+        );
     });
 }
 
@@ -990,7 +1412,13 @@ void wp_bvh_destroy_device(uint64_t id)
     g_metal_bvhs.erase(it);
 }
 
-#elif !WP_ENABLE_CUDA
+#else
+
+uint64_t metal_bvh_host_id(uint64_t id) { return 0; }
+
+#endif  // __APPLE__
+
+#if !defined(__APPLE__) && !WP_ENABLE_CUDA
 
 // stubs for platforms without a GPU backend
 uint64_t wp_bvh_create_device(

@@ -7678,6 +7678,18 @@ class Runtime:
             self.core.wp_bvh_refit_device.argtypes = [ctypes.c_uint64]
             self.core.wp_bvh_rebuild_device.argtypes = [ctypes.c_uint64]
 
+            self.core.wp_bvh_get_tree.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            self.core.wp_bvh_get_tree.restype = ctypes.c_int
+
             self.core.wp_mesh_create_host.restype = ctypes.c_uint64
             self.core.wp_mesh_create_host.argtypes = [
                 warp._src.types.array_t,

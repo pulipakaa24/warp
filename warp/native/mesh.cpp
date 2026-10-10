@@ -115,7 +115,11 @@ void bvh_refit_with_solid_angle_recursive_host(BVH& bvh, int index, Mesh& mesh)
     }
 }
 
-void bvh_refit_with_solid_angle_host(BVH& bvh, Mesh& mesh) { bvh_refit_with_solid_angle_recursive_host(bvh, 0, mesh); }
+void bvh_refit_with_solid_angle_host(BVH& bvh, Mesh& mesh)
+{
+    if (bvh.num_items > 0)
+        bvh_refit_with_solid_angle_recursive_host(bvh, *bvh.root, mesh);
+}
 
 uint64_t wp_mesh_create_host(
     array_t<wp::vec3> points,
@@ -143,13 +147,17 @@ uint64_t wp_mesh_create_host(
         wp::vec3& p2 = points[indices[i * 3 + 2]];
 
         // compute triangle bounds
-        bounds3 b;
-        b.add_point(p0);
-        b.add_point(p1);
-        b.add_point(p2);
+        if (constructor_type == BVH_CONSTRUCTOR_LBVH) {
+            lbvh_triangle_bounds(p0, p1, p2, m->lowers[i], m->uppers[i]);
+        } else {
+            bounds3 b;
+            b.add_point(p0);
+            b.add_point(p1);
+            b.add_point(p2);
 
-        m->lowers[i] = b.lower;
-        m->uppers[i] = b.upper;
+            m->lowers[i] = b.lower;
+            m->uppers[i] = b.upper;
+        }
 
         // compute edge lengths
         sum += length(p0 - p1) + length(p0 - p2) + length(p2 - p1);
@@ -220,13 +228,17 @@ void wp_mesh_refit_host(uint64_t id)
         wp::vec3 p2 = m->points.data[m->indices.data[i * 3 + 2]];
 
         // compute triangle bounds
-        bounds3 b;
-        b.add_point(p0);
-        b.add_point(p1);
-        b.add_point(p2);
+        if (m->bvh.constructor_type == BVH_CONSTRUCTOR_LBVH) {
+            lbvh_triangle_bounds(p0, p1, p2, m->lowers[i], m->uppers[i]);
+        } else {
+            bounds3 b;
+            b.add_point(p0);
+            b.add_point(p1);
+            b.add_point(p2);
 
-        m->lowers[i] = b.lower;
-        m->uppers[i] = b.upper;
+            m->lowers[i] = b.lower;
+            m->uppers[i] = b.upper;
+        }
 
         sum += length(p0 - p1) + length(p0 - p2) + length(p2 - p1);
     }
@@ -274,7 +286,7 @@ void wp_mesh_set_velocities_host(uint64_t id, wp::array_t<wp::vec3> velocities)
 
 // On Apple platforms the device is a Metal GPU: the mesh and its BVH are built and refitted by the
 // host code above, in Metal memory, and kernels read a descriptor holding GPU addresses (see
-// metal_host.h). LBVH construction is CUDA-only, so it falls back to SAH.
+// metal_host.h). LBVH trees are built by the host execution of the CUDA LBVH builder (bvh.cpp).
 namespace {
 std::map<uint64_t, MetalMirror<Mesh>> g_metal_meshes;
 
@@ -313,8 +325,6 @@ uint64_t wp_mesh_create_device(
     if (wp_metal_synchronize(ordinal) != 0)  // the points may still be written by GPU kernels
         return 0;
     ScopedMetalHostAlloc scope(ordinal);
-    if (constructor_type == BVH_CONSTRUCTOR_LBVH)
-        constructor_type = BVH_CONSTRUCTOR_SAH;
     MetalMirror<Mesh> m { ordinal,
                           wp_mesh_create_host(
                               points, velocities, tris, num_points, num_tris, support_winding_number, constructor_type,
@@ -343,6 +353,12 @@ void wp_mesh_destroy_device(uint64_t id)
     wp_mesh_destroy_host(it->second.host_id);
     wp_free_host(it->second.descriptor);
     g_metal_meshes.erase(it);
+}
+
+uint64_t metal_mesh_host_id(uint64_t id)
+{
+    MetalMirror<Mesh>* m = metal_mesh_acquire(id);
+    return m ? m->host_id : 0;
 }
 
 // Mesh updates during a capture are recorded as host operations replayed in order by the graph.
@@ -381,7 +397,13 @@ void wp_mesh_set_velocities_device(uint64_t id, wp::array_t<wp::vec3> velocities
     metal_mesh_apply(id, [velocities](MetalMirror<Mesh>& m) { wp_mesh_set_velocities_host(m.host_id, velocities); });
 }
 
-#elif !WP_ENABLE_CUDA
+#else
+
+uint64_t metal_mesh_host_id(uint64_t id) { return 0; }
+
+#endif  // __APPLE__
+
+#if !defined(__APPLE__) && !WP_ENABLE_CUDA
 
 // stubs for platforms without a GPU backend
 WP_API uint64_t wp_mesh_create_device(

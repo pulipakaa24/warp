@@ -749,6 +749,24 @@ void bvh_create_host(
 );
 void bvh_destroy_host(wp::BVH WP_THREAD& bvh);
 void bvh_refit_host(wp::BVH WP_THREAD& bvh);
+// Host execution of the CUDA LBVH builder and refit (bvh.cu), bitwise the CUDA tree; used for Metal trees.
+void lbvh_create_host(
+    vec3 WP_THREAD* lowers,
+    vec3 WP_THREAD* uppers,
+    int num_items,
+    int WP_THREAD* groups,
+    int leaf_size,
+    BVH WP_THREAD& bvh
+);
+void lbvh_build_host(BVH WP_THREAD& bvh);
+void lbvh_refit_host(BVH WP_THREAD& bvh);
+void lbvh_triangle_bounds(
+    const vec3 WP_THREAD& p,
+    const vec3 WP_THREAD& q,
+    const vec3 WP_THREAD& r,
+    vec3 WP_THREAD& lower,
+    vec3 WP_THREAD& upper
+);
 void cubql_bvh_create_host(
     vec3 WP_THREAD* lowers, vec3 WP_THREAD* uppers, int num_items, int leaf_size, BVH WP_THREAD& bvh
 );
