@@ -576,14 +576,20 @@ class TestMetal(unittest.TestCase):
         np.testing.assert_array_equal(data, expected)
 
     def test_bsr_topology_inside_capture_raises(self):
-        """Host-side BSR operations cannot be replayed by a Metal graph, so they refuse to run in a capture."""
+        """With the host BSR path (``metal_gpu_utilities`` off), BSR topology cannot be replayed by a Metal graph, so it
+        refuses to run in a capture. The GPU path is capturable (``TestMetalSparse``)."""
         rows = wp.array([0, 1], dtype=int, device=self.device)
         cols = wp.array([0, 1], dtype=int, device=self.device)
         vals = wp.array([1.0, 2.0], dtype=float, device=self.device)
         m = wp.sparse.bsr_zeros(2, 2, block_type=float, device=self.device)
-        with self.assertRaisesRegex(RuntimeError, "inside a graph capture"):
-            with wp.ScopedCapture(device=self.device):
-                wp.sparse.bsr_set_from_triplets(m, rows, cols, vals)
+        saved = wp.config.metal_gpu_utilities
+        wp.config.metal_gpu_utilities = False
+        try:
+            with self.assertRaisesRegex(RuntimeError, "inside a graph capture"):
+                with wp.ScopedCapture(device=self.device):
+                    wp.sparse.bsr_set_from_triplets(m, rows, cols, vals)
+        finally:
+            wp.config.metal_gpu_utilities = saved
         self.assertFalse(wp.get_device(self.device).is_capturing)
         wp.sparse.bsr_set_from_triplets(m, rows, cols, vals)  # fine outside a capture
         self.assertEqual(m.nnz_sync(), 2)
