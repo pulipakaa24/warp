@@ -86,6 +86,14 @@ int wp_metal_launch_kernel(
     return unavailable();
 }
 
+int wp_metal_launch_kernel_bounded(
+    int, void*, size_t, int, const void*, size_t, const void*, size_t, const size_t*, int, size_t, const void*, size_t,
+    size_t, size_t
+)
+{
+    return unavailable();
+}
+
 int wp_metal_memset(int, void*, int, size_t) { return unavailable(); }
 
 int wp_metal_memtile(int, void*, const void*, size_t, size_t) { return unavailable(); }

@@ -227,6 +227,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_math import TestMath
     from warp.tests.test_metal import TestMetal, TestMetalInlineBudget, TestMetalLbvhHost
     from warp.tests.test_metal_deterministic import TestMetalDeterministic
+    from warp.tests.test_metal_bounded_launch import TestBoundedLaunchCpu, TestMetalBoundedLaunch
     from warp.tests.test_metal_primitives import TestMetalPrimitives
     from warp.tests.test_metal_sparse import TestMetalSparse
     from warp.tests.test_module_contamination import TestModuleContamination
@@ -420,6 +421,8 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMetalDeterministic,
         TestMetalInlineBudget,
         TestMetalLbvhHost,
+        TestMetalBoundedLaunch,
+        TestBoundedLaunchCpu,
         TestMetalPrimitives,
         TestMetalSparse,
         TestCudaMaxRegisters,

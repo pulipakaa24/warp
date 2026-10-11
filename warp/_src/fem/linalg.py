@@ -422,8 +422,13 @@ def symmetric_eigenvalues_qr(A: Any, tol: Any):
     return ev, P
 
 
-def array_axpy(x: wp.array, y: wp.array, alpha: float = 1.0, beta: float = 1.0):
-    """Compute ``y = alpha*x + beta*y``."""
+def array_axpy(x: wp.array, y: wp.array, alpha: float = 1.0, beta: float = 1.0, dim_limit: wp.array | None = None):
+    """Compute ``y = alpha*x + beta*y``.
+
+    Args:
+        dim_limit: Optional device-side bound on the first dimension (see :func:`warp.launch`): entries at or past
+          ``dim_limit[0]`` may be left unchanged.
+    """
     from warp._src.context import runtime  # noqa: PLC0415
 
     dtype = type_scalar_type(y.dtype)
@@ -440,7 +445,7 @@ def array_axpy(x: wp.array, y: wp.array, alpha: float = 1.0, beta: float = 1.0):
 
     # temporarily disable tape to avoid printing warning that kernel is not differentiable
     (tape, runtime.tape) = (runtime.tape, None)
-    wp.launch(kernel=_array_axpy_kernel, dim=x.shape, device=x.device, inputs=[x, y, alpha, beta])
+    wp.launch(kernel=_array_axpy_kernel, dim=x.shape, device=x.device, inputs=[x, y, alpha, beta], dim_limit=dim_limit)
     runtime.tape = tape
 
     if tape is not None and (x.requires_grad or y.requires_grad):

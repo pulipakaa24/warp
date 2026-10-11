@@ -385,6 +385,12 @@ builder's). Rebuilds then need no host synchronization. False drains the GPU and
 memory, as before. Rebuildable allocation always uses the host builder. Read at each call."""
 
 metal_gpu_utilities: bool = _os.environ.get("WP_METAL_GPU_UTILITIES", "1") != "0"
+
+metal_bounded_launch: bool = _os.environ.get("WP_METAL_BOUNDED_LAUNCH", "1") != "0"
+"""Honor device-side launch bounds on Metal (``wp.launch(..., dim_limit=...)``, also used by ``warp.fem`` and the GPU
+utilities for fixed-capacity buffers): only the threadgroups below the bound are dispatched, sized on the GPU.
+``False`` (or ``WP_METAL_BOUNDED_LAUNCH=0``) runs every such launch over its full ``dim`` instead, as on other
+devices; results are the same either way."""
 """Whether :func:`warp.utils.radix_sort_pairs`, :func:`warp.utils.runlength_encode` and integer
 :func:`warp.utils.array_scan` run as GPU kernels on Metal devices (bitwise the same results as the host
 implementations, no host synchronization, recordable into graph captures as kernel dispatches). False runs them

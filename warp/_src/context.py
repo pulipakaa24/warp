@@ -7085,6 +7085,14 @@ class Runtime:
                 ctypes.c_size_t,  # threadgroup memory bytes
             ]
             self.core.wp_metal_launch_kernel.restype = ctypes.c_int
+            self.core.wp_metal_launch_kernel_bounded.argtypes = [
+                *self.core.wp_metal_launch_kernel.argtypes,
+                ctypes.c_void_p,  # int32 launch bound (dim_limit) in a Metal allocation
+                ctypes.c_size_t,  # leading launch dimension
+                ctypes.c_size_t,  # tasks per leading index
+                ctypes.c_size_t,  # elements of the bound per leading index (the bound is ceil(count / divisor))
+            ]
+            self.core.wp_metal_launch_kernel_bounded.restype = ctypes.c_int
             self.core.wp_metal_synchronize.argtypes = [ctypes.c_int]
             self.core.wp_metal_synchronize.restype = ctypes.c_int
             self.core.wp_metal_memset.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
@@ -11410,8 +11418,20 @@ def _metal_append_fixed_scratch(args, device: Device, nbytes: int):
 METAL_SIMD_WIDTH = 32
 
 
-def invoke_metal(kernel, hooks, params: Sequence[Any], device: Device, block_dim: int, adjoint: bool = False):
-    """Dispatch a forward or backward kernel on a Metal device."""
+def invoke_metal(
+    kernel,
+    hooks,
+    params: Sequence[Any],
+    device: Device,
+    block_dim: int,
+    adjoint: bool = False,
+    dim_limit: warp.array | None = None,
+):
+    """Dispatch a forward or backward kernel on a Metal device.
+
+    With ``dim_limit`` (a forward launch), only the threadgroups holding tasks whose leading index is below
+    ``dim_limit[0]`` run (see :func:`warp.launch`).
+    """
     if hooks.metal_unsupported:
         raise RuntimeError(
             f"Kernel '{kernel.key}' uses builtins that are not supported on Metal yet: {hooks.metal_unsupported}"
@@ -11449,7 +11469,7 @@ def invoke_metal(kernel, hooks, params: Sequence[Any], device: Device, block_dim
         num_threads = min(bounds.size, METAL_SIMD_WIDTH)
         block_dim = METAL_SIMD_WIDTH
 
-    if runtime.core.wp_metal_launch_kernel(
+    launch_args = (
         device.metal_ordinal,
         pipeline,
         num_threads,
@@ -11461,7 +11481,22 @@ def invoke_metal(kernel, hooks, params: Sequence[Any], device: Device, block_dim
         offsets,
         len(offsets),
         hooks.backward_smem_bytes if adjoint else hooks.forward_smem_bytes,
+    )
+    if (
+        dim_limit is not None
+        and warp.config.metal_bounded_launch
+        and not adjoint
+        and pipeline is hooks.forward
+        and num_threads == bounds.size
     ):
+        # bounded launch: an indirect dispatch sized on the GPU from dim_limit[0] (leading dimension)
+        limit = bounds.shape[0]
+        status = runtime.core.wp_metal_launch_kernel_bounded(
+            *launch_args, ctypes.c_void_p(dim_limit.ptr), limit, bounds.size // limit, 1
+        )
+    else:
+        status = runtime.core.wp_metal_launch_kernel(*launch_args)
+    if status:
         message = runtime.get_error_string()
 
         def foreign_arrays(label, value):
@@ -11616,6 +11651,7 @@ class Launch:
         adjoint: bool = False,
         fwd_args: list[Any] | None = None,
         adj_args: list[Any] | None = None,
+        dim_limit: warp.array | None = None,
     ):
         block_dim = _resolve_launch_block_dim(device, block_dim)
 
@@ -11706,6 +11742,9 @@ class Launch:
         # launch falls back to direct execution and is not APIC-recordable.
         self.fwd_args = fwd_args
         self.adj_args = adj_args
+
+        self.dim_limit = dim_limit
+        """Device-side bound on the first launch dimension (see :func:`warp.launch`), or ``None``."""
 
     def set_dim(self, dim: int | list[int] | tuple[int, ...]):
         """Set the launch dimensions.
@@ -11919,7 +11958,15 @@ class Launch:
         """
         apic_capture = _get_apic_capture_for_device(self.device)
         if self.device.is_metal:
-            invoke_metal(self.kernel, self.hooks, self.params, self.device, self.block_dim, self.adjoint)
+            invoke_metal(
+                self.kernel,
+                self.hooks,
+                self.params,
+                self.device,
+                self.block_dim,
+                self.adjoint,
+                dim_limit=self.dim_limit,
+            )
         elif self.device.is_cpu:
             if apic_capture is not None:
                 # Under an active APIC CPU capture, record the launch so it
@@ -12187,6 +12234,15 @@ def _resolve_launch_block_dim(device: Device, block_dim: int | None) -> int:
     return block_dim
 
 
+def _validate_dim_limit(dim_limit, device: Device) -> None:
+    if not warp._src.types.is_array(dim_limit) or dim_limit.dtype != warp.int32:
+        raise TypeError(f"dim_limit must be a Warp array of int32, got {type(dim_limit).__name__}")
+    if dim_limit.size < 1:
+        raise ValueError("dim_limit must hold at least one element")
+    if dim_limit.device != device:
+        raise ValueError(f"dim_limit is on device '{dim_limit.device}' but the launch is on device '{device}'")
+
+
 def launch(
     kernel,
     dim: int | Sequence[int],
@@ -12201,6 +12257,7 @@ def launch(
     record_cmd: bool = False,
     max_blocks: int = 0,
     block_dim: int | None = None,
+    dim_limit: warp.array | None = None,
 ):
     """Launch a Warp kernel on the target device
 
@@ -12244,6 +12301,13 @@ def launch(
           values from 2 through 1024 are honored when
           :attr:`warp.config.enable_cpu_blocks` is ``True`` and otherwise
           resolve to 1.
+        dim_limit: A device-side bound on the first launch dimension: a 1-element ``int32`` array on the launch
+          device (or a 1-element view) whose value ``n`` is only known on the device, e.g. the active part of a
+          fixed-capacity buffer. Tasks whose first index is at least ``n`` *may* be skipped, so the kernel must not
+          rely on them running: on Metal only the threadgroups that hold tasks with first index below
+          ``min(n, dim[0])`` are dispatched (an indirect dispatch sized on the GPU; captured graphs re-read ``n``
+          at every replay), on other devices the full ``dim`` runs. Tasks that do run see the same ``wp.tid()``
+          and ``dim`` as in the full launch. Ignored for adjoint launches and deterministic (ordered) launches.
     """
 
     init()
@@ -12271,6 +12335,9 @@ def launch(
         )
 
     dim, total_dim_size = _normalize_launch_dim(dim)
+
+    if dim_limit is not None:
+        _validate_dim_limit(dim_limit, device)
 
     if total_dim_size > 0:
         fwd_args = []
@@ -12414,8 +12481,9 @@ def launch(
                     adjoint=adjoint,
                     fwd_args=fwd_args,
                     adj_args=adj_args,
+                    dim_limit=dim_limit,
                 )
-            invoke_metal(kernel, hooks, params, device, block_dim, adjoint)
+            invoke_metal(kernel, hooks, params, device, block_dim, adjoint, dim_limit=dim_limit)
 
         # run kernel
         elif device.is_cpu:
