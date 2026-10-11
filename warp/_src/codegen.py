@@ -7703,7 +7703,7 @@ cpu_kernel_template_forward = """
 
 WP_FORCE_INLINE void {name}_cpu_kernel_forward(
     WP_FUNC_PARAM {forward_args},
-    WP_CONSTANT wp_args_{name}* _wp_args)
+    WP_ARGS wp_args_{name}* _wp_args)
 {{
 {forward_body}}}
 
@@ -7713,8 +7713,8 @@ WP_FORCE_INLINE void {name}_cpu_kernel_forward(
 metal_module_template_forward = """
 
 {fixed_struct_forward}kernel void {name}_metal_forward(
-    constant wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
-    constant {forward_args_struct}* _wp_args [[buffer(1)]],
+    WP_ARGS wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
+    WP_ARGS {forward_args_struct}* _wp_args [[buffer(1)]],
     threadgroup char* _wp_arena [[threadgroup(0)]],
     uint task_index [[thread_position_in_grid]])
 {{
@@ -7730,8 +7730,8 @@ cpu_kernel_template_backward = """
 
 WP_FORCE_INLINE void {name}_cpu_kernel_backward(
     WP_FUNC_PARAM {reverse_args},
-    WP_CONSTANT wp_args_{name} *_wp_args,
-    WP_CONSTANT wp_args_{name} *_wp_adj_args)
+    WP_ARGS wp_args_{name} *_wp_args,
+    WP_ARGS wp_args_{name} *_wp_adj_args)
 {{
 {reverse_body}}}
 
@@ -7743,8 +7743,8 @@ WP_FORCE_INLINE void {name}_cpu_kernel_backward(
 metal_module_template_forward_ordered = """
 
 kernel void {name}_metal_forward_ordered(
-    constant wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
-    constant {forward_args_struct}* _wp_args [[buffer(1)]],
+    WP_ARGS wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
+    WP_ARGS {forward_args_struct}* _wp_args [[buffer(1)]],
     threadgroup char* _wp_arena [[threadgroup(0)]],
     uint task_start [[thread_position_in_grid]],
     uint task_stride [[threads_per_grid]])
@@ -7765,15 +7765,15 @@ struct wp_bwd_args_{name} {{
 }};
 
 {fixed_struct_backward}kernel void {name}_metal_backward(
-    constant wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
-    constant {backward_args_struct}* _wp_bwd [[buffer(1)]],
+    WP_ARGS wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
+    WP_ARGS {backward_args_struct}* _wp_bwd [[buffer(1)]],
     threadgroup char* _wp_arena [[threadgroup(0)]],
     uint task_index [[thread_position_in_grid]])
 {{
     if (task_index >= dim.size)
         return;
     wp::tile_shared_storage_t::init(_wp_arena);
-    constant wp_bwd_args_{name}* _wp = {backward_args_ref};
+    WP_ARGS wp_bwd_args_{name}* _wp = {backward_args_ref};
     {name}_cpu_kernel_backward(_wp_arena, {fixed_scratch_bwd}, dim, task_index, &_wp->args, &_wp->adj_args);
 }}
 

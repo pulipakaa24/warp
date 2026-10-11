@@ -1,0 +1,1 @@
+Add ``warp.config.metal_eager_conditionals`` (opt-in): eager ``capture_while`` / ``capture_if`` on Metal record their bodies once and gate them on the device, reading the condition once per batch of iterations (or not at all).

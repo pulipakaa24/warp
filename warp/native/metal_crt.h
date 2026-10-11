@@ -162,7 +162,14 @@ inline float log10f(float x) { return metal::log10(x); }
 inline float expf(float x) { return metal::exp(x); }
 inline float exp2f(float x) { return metal::exp2(x); }
 inline float ldexpf(float x, int e) { return metal::ldexp(x, e); }
-inline float sqrtf(float x) { return metal::sqrt(x); }
+// fast_math (WP_FAST_MATH, builtin.h): approximate square root, as NVRTC's --prec-sqrt=false; other functions keep
+// their precise forms (Metal's fast sin / cos / log are less accurate than CUDA's __sinf / __cosf / __logf)
+#if defined(WP_FAST_MATH) && WP_FAST_MATH
+#define WP_METAL_SQRTF metal::fast::sqrt
+#else
+#define WP_METAL_SQRTF metal::sqrt
+#endif
+inline float sqrtf(float x) { return WP_METAL_SQRTF(x); }
 inline float cbrtf(float x) { return metal::copysign(metal::pow(metal::abs(x), 1.0f / 3.0f), x); }
 // exact results for small integer exponents (x*x etc.); metal::pow(6, 2) is 36.000004 even in precise mode
 inline float wp_metal_pow(float x, float y)
@@ -268,7 +275,7 @@ inline float erfcinvf(float x) { return erfinvf(1.0f - x); }
 
 // Unsuffixed C names used with wide_float (float on Metal).
 inline float fabs(float x) { return metal::abs(x); }
-inline float sqrt(float x) { return metal::sqrt(x); }
+inline float sqrt(float x) { return WP_METAL_SQRTF(x); }
 inline float floor(float x) { return metal::floor(x); }
 inline float ceil(float x) { return metal::ceil(x); }
 inline float round(float x) { return metal::round(x); }

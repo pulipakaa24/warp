@@ -88,6 +88,39 @@ def mat44_products_inverse(a: wp.array[wp.mat44], b: wp.array[wp.mat44], out: wp
             out[16 + i * 4 + j] = 3.0 * d[i, j]
 
 
+@wp.kernel
+def countdown_step(counter: wp.array[wp.int32], trace: wp.array[float]):
+    # one loop iteration: append to the trace, then count down (the loop condition)
+    i = wp.tid()
+    n = counter[0]
+    trace[i] = trace[i] * 1.5 + float(n)
+    if i == 0:
+        counter[0] = n - 1
+
+
+@wp.kernel
+def add_value(a: wp.array[float], v: float):
+    a[wp.tid()] += v
+
+
+def _countdown_body(counter, trace):
+    wp.launch(countdown_step, dim=trace.shape[0], inputs=[counter, trace], device=trace.device)
+
+
+def _true_body(out):
+    wp.launch(add_value, dim=out.shape[0], inputs=[out, 1.0], device=out.device)
+
+
+def _false_body(out):
+    wp.launch(add_value, dim=out.shape[0], inputs=[out, 100.0], device=out.device)
+
+
+def _reading_body(counter, trace):
+    # reads the device back: cannot be recorded, so the eager loop must fall back to reading the condition
+    _countdown_body(counter, trace)
+    trace.numpy()
+
+
 def _make_cholesky_kernel(n: int):
     """Factor and solve one ``n x n`` system per thread block with the tile Cholesky builtins."""
 
@@ -988,6 +1021,117 @@ class TestMetal(unittest.TestCase):
             wp.launch(madd, n, inputs=[wp.array(a, device=self.device), wp.array(b, device=self.device),
                                        wp.array(c, device=self.device), out], device=self.device)
             np.testing.assert_array_equal(out.numpy(), expected, err_msg=f"fuse_fp={fuse_fp}")
+
+    def _counters(self):
+        import ctypes  # noqa: PLC0415
+
+        from warp._src.context import runtime  # noqa: PLC0415
+
+        core = runtime.core
+        core.wp_metal_counters.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_int]
+        out = (ctypes.c_uint64 * 4)()
+        core.wp_metal_counters(wp.get_device(self.device).metal_ordinal, out, 4)
+        return list(out)
+
+    def test_eager_capture_while_matches_host_loop(self):
+        """Eager capture_while on Metal runs exactly the host loop's iterations, without a read per iteration.
+
+        The body is recorded once and replayed behind a device-side gate; iteration counts from 0 (body never runs)
+        to more than the first batch of replays, and a body that reads back (falls back to the host loop), all give
+        the host loop's result bit for bit.
+        """
+        n = 64
+        for start in (0, 1, 7, 23, 7):
+            results = []
+            for eager in (False, True):
+                wp.config.metal_eager_conditionals = eager
+                try:
+                    counter = wp.array([start], dtype=wp.int32, device=self.device)
+                    trace = wp.array(np.linspace(0.0, 1.0, n, dtype=np.float32), device=self.device)
+                    wp.synchronize_device(self.device)
+                    c0 = self._counters()
+                    wp.capture_while(counter, _countdown_body, counter=counter, trace=trace)
+                    wp.synchronize_device(self.device)
+                    waits = self._counters()[0] - c0[0]
+                    results.append((counter.numpy().copy(), trace.numpy().copy(), waits))
+                finally:
+                    wp.config.metal_eager_conditionals = False
+            (c_host, t_host, w_host), (c_eager, t_eager, w_eager) = results
+            np.testing.assert_array_equal(c_eager, c_host, err_msg=f"start={start}")
+            np.testing.assert_array_equal(t_eager, t_host, err_msg=f"start={start}")
+            self.assertLessEqual(w_eager, 3 if start <= 1 else w_host, msg=f"start={start}")
+        # a body that reads back cannot be recorded: the host loop runs it, with the same result
+        counter = wp.array([5], dtype=wp.int32, device=self.device)
+        trace = wp.zeros(n, dtype=float, device=self.device)
+        wp.config.metal_eager_conditionals = True
+        try:
+            wp.capture_while(counter, _reading_body, counter=counter, trace=trace)
+        finally:
+            wp.config.metal_eager_conditionals = False
+        ref = np.zeros(n, dtype=np.float32)
+        for k in range(5, 0, -1):
+            ref = ref * np.float32(1.5) + np.float32(k)
+        np.testing.assert_array_equal(trace.numpy(), ref)
+        self.assertEqual(int(counter.numpy()[0]), 0)
+
+    def test_eager_capture_if_selects_on_device(self):
+        """Eager capture_if on Metal selects the branch on the device (no read back) with the host branch's result."""
+        wp.config.metal_eager_conditionals = True
+        self.addCleanup(setattr, wp.config, "metal_eager_conditionals", False)
+        for value in (0, 1, 2, 0):
+            cond = wp.array([value], dtype=wp.int32, device=self.device)
+            out = wp.zeros(8, dtype=float, device=self.device)
+            wp.synchronize_device(self.device)
+            c0 = self._counters()
+            wp.capture_if(cond, on_true=_true_body, on_false=_false_body, out=out)
+            wp.capture_if(cond, on_true=_true_body, out=out)
+            waits = self._counters()[0] - c0[0]
+            expected = 2.0 if value else 100.0
+            np.testing.assert_array_equal(out.numpy(), np.full(8, expected, dtype=np.float32), err_msg=f"{value}")
+            self.assertEqual(waits, 0)
+
+    def test_fast_math_approximates_division_and_sqrt_only(self):
+        """The fast_math module option makes float32 division and sqrt approximate, as --use_fast_math does on CUDA.
+
+        CUDA's --use_fast_math is --prec-div=false --prec-sqrt=false --ftz=true --fmad=true: division becomes
+        x * rcp(y) (__fdividef, within 2 ulp) and sqrt is approximate, without reassociation. Without the option both
+        are correctly rounded. Neither mode may reassociate (x + 2^24) - 2^24 into x.
+        """
+        rng = np.random.default_rng(0)
+        n = 1 << 14
+        a = rng.uniform(-2.0, 2.0, n).astype(np.float32)
+        x = rng.uniform(1.0e-3, 10.0, n).astype(np.float32)
+        div_ref = a.astype(np.float64) / x
+        sqrt_ref = np.sqrt(x.astype(np.float64))
+
+        def ulp_error(r, ref):
+            rr = ref.astype(np.float32)
+            return np.abs(r.astype(np.float64) - ref) / (np.spacing(np.abs(rr)).astype(np.float64))
+
+        for fast in (False, True):
+
+            @wp.kernel(module="unique", module_options={"fast_math": fast})
+            def ops(a: wp.array[float], x: wp.array[float], q: wp.array[float], s: wp.array[float],
+                    r: wp.array[float]):
+                i = wp.tid()
+                q[i] = a[i] / x[i]
+                s[i] = wp.sqrt(x[i])
+                r[i] = (x[i] + 16777216.0) - 16777216.0
+
+            arrays = [wp.zeros(n, dtype=float, device=self.device) for _ in range(3)]
+            wp.launch(ops, n, inputs=[wp.array(a, device=self.device), wp.array(x, device=self.device), *arrays],
+                      device=self.device)
+            q, s, r = (arr.numpy() for arr in arrays)
+            reassociated = (x + np.float32(16777216.0)) - np.float32(16777216.0)
+            np.testing.assert_array_equal(r, reassociated, err_msg=f"fast_math={fast} reassociated")
+            if not fast:
+                np.testing.assert_array_equal(q, div_ref.astype(np.float32))
+                np.testing.assert_array_equal(s, sqrt_ref.astype(np.float32))
+            else:
+                self.assertLess(np.mean(q == div_ref.astype(np.float32)), 0.95)
+                self.assertLess(np.mean(s == sqrt_ref.astype(np.float32)), 0.95)
+                self.assertLessEqual(ulp_error(q, div_ref).max(), 2.5)
+                self.assertLessEqual(ulp_error(s, sqrt_ref).max(), 2.5)
 
 
 class TestMetalInlineBudget(unittest.TestCase):

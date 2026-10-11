@@ -119,6 +119,7 @@ WP_API int wp_metal_capture_range_end(int ordinal);
 // Records a host function call (up to 8 integer/pointer args) to replay with the graph; 0 when not capturing.
 WP_API int wp_metal_capture_host_call(int ordinal, void* fn, const unsigned long long* args, int nargs);
 WP_API void wp_metal_graph_destroy(int ordinal, void* graph);
+WP_API int wp_metal_graph_ranges_honoured(void* graph);
 // Commits pending work without waiting. Returns 0 on success.
 WP_API int wp_metal_flush(int ordinal);
 // Per-kernel GPU times collected since the last call (WP_METAL_PROFILE=1), sorted, one line each.

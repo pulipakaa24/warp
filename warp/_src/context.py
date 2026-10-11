@@ -3817,6 +3817,10 @@ class ModuleBuilder:
         if device == "metal":
             # fuse_fp selects FMA contraction in builtin.h, as --fmad does for NVRTC
             source = f"#define WP_FUSE_FP {int(bool(self.options.get('fuse_fp', True)))}\n" + source
+            # fast_math selects approximate float32 division and square root in builtin.h / metal_crt.h, as NVRTC's
+            # --use_fast_math (--prec-div=false --prec-sqrt=false) does on CUDA
+            if self.options.get("fast_math"):
+                source = "#define WP_FAST_MATH 1\n" + source
             # Metal compiles from an in-memory string without include paths
             source = warp._src.build.expand_includes(source)
             source = warp._src.build.metal_rewrite_printf(source)  # shader logging has no %s
@@ -7027,6 +7031,8 @@ class Runtime:
             self.core.wp_metal_graph_launch.restype = ctypes.c_int
             self.core.wp_metal_graph_destroy.argtypes = [ctypes.c_int, ctypes.c_void_p]
             self.core.wp_metal_graph_destroy.restype = None
+            self.core.wp_metal_graph_ranges_honoured.argtypes = [ctypes.c_void_p]
+            self.core.wp_metal_graph_ranges_honoured.restype = ctypes.c_int
             self.core.wp_metal_profile_report.argtypes = []
             self.core.wp_metal_profile_report.restype = ctypes.c_char_p
             self.core.wp_metal_load_library.argtypes = [ctypes.c_int, ctypes.c_char_p]
@@ -14376,6 +14382,15 @@ def capture_if(
     if device.is_metal and device.is_capturing:
         _metal_capture_conditional(device, False, condition, on_true, on_false, kwargs)
         return
+    if (
+        device.is_metal
+        and warp.config.metal_eager_conditionals
+        and all(b is None or (isinstance(b, Callable) and not isinstance(b, Graph)) for b in (on_true, on_false))
+    ):
+        from warp._src import metal_conditionals  # noqa: PLC0415
+
+        if metal_conditionals.eager_if(device, condition, on_true, on_false, kwargs):
+            return
     if graph is None:
         # if no graph is active, just execute the correct branch directly
         condition_value = _read_condition(condition, device, stream)
@@ -14595,6 +14610,12 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
     if device.is_metal and device.is_capturing:
         _metal_capture_conditional(device, True, condition, while_body, None, kwargs)
         return
+    if device.is_metal and warp.config.metal_eager_conditionals and isinstance(while_body, Callable) \
+            and not isinstance(while_body, Graph):
+        from warp._src import metal_conditionals  # noqa: PLC0415
+
+        if metal_conditionals.eager_while(device, condition, while_body, kwargs):
+            return
     if graph is None:
         # since no graph is active, just execute the kernels directly
         while True:

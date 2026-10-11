@@ -658,7 +658,8 @@ void wp_volume_destroy_device(uint64_t id)
     if (!volume_get_descriptor(id, volume))
         return;
     const int ordinal = wp::metal_context_ordinal(volume->context);
-    wp_metal_synchronize(ordinal);
+    // No device drain: kernels address the grid by its GPU address (the id), not through the descriptor, and
+    // wp_free_metal defers the buffer's release until no submitted GPU work can still read it.
     wp::ScopedMetalHostAlloc scope(ordinal);
     if (volume->owner)
         wp_free_host(volume->buffer);

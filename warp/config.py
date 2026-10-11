@@ -384,6 +384,15 @@ on Metal devices (the key-based builder of ``volume_builder.cpp``; the grid buff
 builder's). Rebuilds then need no host synchronization. False drains the GPU and runs the host builder on unified
 memory, as before. Rebuildable allocation always uses the host builder. Read at each call."""
 
+metal_eager_conditionals: bool = _os.environ.get("WP_METAL_EAGER_CONDITIONALS", "0") == "1"
+"""Whether :func:`warp.capture_while` and :func:`warp.capture_if` outside a graph capture on Metal record their
+bodies once as a graph gated on the device (indirect execution ranges a kernel closes once the condition is 0), so
+the host reads the condition once per batch of loop iterations (``capture_while``) or not at all (``capture_if``)
+instead of before every iteration. Same kernels in the same order (bitwise the host loop). Bodies that record host
+operations keep the host loop. Off by default: the body's Python code then runs once per call (as under a CUDA
+graph capture), not once per iteration, and the measured gain is small (MuJoCo Warp's solver loop in Newton's
+example_mpm_anymal: host waits per frame 17 -> 10, frame 41.3 -> 40.7 ms). Read at each call."""
+
 metal_gpu_utilities: bool = _os.environ.get("WP_METAL_GPU_UTILITIES", "1") != "0"
 
 metal_bounded_launch: bool = _os.environ.get("WP_METAL_BOUNDED_LAUNCH", "1") != "0"
