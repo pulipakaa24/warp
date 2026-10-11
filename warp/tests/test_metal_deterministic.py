@@ -114,6 +114,45 @@ class TestMetalDeterministic(unittest.TestCase):
             wp.launch(det_scatter, dim=n, inputs=[x, idx, out], device=self.device)
             np.testing.assert_array_equal(out.numpy(), expected)
 
+    def test_one_threadgroup_launch_finalizes_in_kernel(self):
+        """Launches that are one threadgroup finalize their exact sums inside the kernel (one dispatch per target
+        less): bitwise the separate finalize pass, for scalars and vectors, alone and after counter phases, and
+        the bins are re-armed for the next launch."""
+        from warp._src import metal_deterministic as md  # noqa: PLC0415
+
+        rng = np.random.default_rng(3)
+        hooks = _hooks(det_scatter, self.device)
+        self.assertTrue(hooks.metal_det_tg_finalize)
+        self.assertTrue(md._single_threadgroup(hooks, 200, 256))
+        self.assertFalse(md._single_threadgroup(hooks, 300, 256))
+        saved = md._TG_FINALIZE
+        results = []
+        try:
+            for in_kernel in (True, False):
+                md._TG_FINALIZE = in_kernel
+                outs = []
+                for n in (1, 37, 200, 256, 257, 5000):  # the last two are several threadgroups (separate pass)
+                    x_np = (rng.standard_normal(n) * 10.0 ** rng.integers(-6, 6, n)).astype(np.float32)
+                    idx_np = rng.integers(0, 9, n).astype(np.int32)
+                    x, idx = wp.array(x_np, device=self.device), wp.array(idx_np, device=self.device)
+                    out = wp.array(rng.standard_normal(9).astype(np.float32), device=self.device)
+                    for _ in range(2):  # the second launch sees bins left by the first
+                        wp.launch(det_scatter, dim=n, inputs=[x, idx, out], device=self.device)
+                    xv = wp.array(rng.standard_normal((n, 3)).astype(np.float32), dtype=wp.vec3, device=self.device)
+                    outv = wp.zeros((2, 9), dtype=wp.vec3, device=self.device)
+                    wp.launch(det_scatter_vec, dim=n, inputs=[xv, idx, outv], device=self.device)
+                    xm = wp.array(rng.standard_normal(n).astype(np.float32), device=self.device)
+                    outm = wp.zeros(2, dtype=float, device=self.device)
+                    wp.launch(det_mixed_max_add, dim=n, inputs=[xm, outm], device=self.device)
+                    outs.append((out.numpy(), outv.numpy(), outm.numpy()))
+                rng = np.random.default_rng(3)
+                results.append(outs)
+        finally:
+            md._TG_FINALIZE = saved
+        for a, b in zip(*results):
+            for u, v in zip(a, b):
+                np.testing.assert_array_equal(u, v)
+
     def test_float_sum_adds_to_destination(self):
         """Add the rounded sum to the destination's value, and leave untouched elements alone."""
         x = wp.array(np.array([1.0, 2.0, 3.0], dtype=np.float32), device=self.device)

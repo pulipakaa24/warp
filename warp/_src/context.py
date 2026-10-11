@@ -1095,8 +1095,11 @@ class KernelHooks:
         metal_unsupported: str | None = None,
         metal_fixed_bytes: int = 0,
         metal_forward_ordered=None,
+        metal_det_tg_finalize=False,
     ):
         self.forward = forward
+        # deterministic Metal kernel that finalizes its exact sums itself in one-threadgroup launches (phase 2)
+        self.metal_det_tg_finalize = metal_det_tg_finalize
         self.backward = backward
         # Metal entry point that runs every task of the launch on one SIMD-group, in task order (kernels with
         # atomics in deterministic modules; see codegen.metal_module_template_forward_ordered)
@@ -3882,6 +3885,8 @@ class ModuleExec:
         self.metal_ordered: set[str] = set()  # kernels with an ordered entry point (deterministic atomics on Metal)
         # kernels whose forward entry points read device-memory arguments (constant twins "<entry>_cargs")
         self.metal_device_args: set[str] = set()
+        # deterministic kernels that finalize exact sums in one-threadgroup launches (wp_metal_det_tg_finalize)
+        self.metal_det_tg_finalize: set[str] = set()
         self.metal_backward_error: str | None = None  # compile error that forced a forward-only build
         # Compute capability the loaded binary was actually compiled for (None for
         # CPU). Cluster classification must use this frozen target, not the current
@@ -4093,6 +4098,7 @@ class ModuleExec:
                 metal_unsupported=unsupported,
                 metal_fixed_bytes=self.meta.get(warp._src.codegen.cuda_kernel_forward_name(kernel) + "_fixed_bytes", 0),
                 metal_forward_ordered=forward_ordered,
+                metal_det_tg_finalize=name in self.metal_det_tg_finalize,
             )
 
         else:
@@ -5227,6 +5233,7 @@ class Module:
                 metal_backward_unsupported = set(re.findall(r"^// wp_metal_backward_unsupported (\S+)$", source, re.M))
                 metal_ordered = set(re.findall(r"^// wp_metal_ordered (\S+)$", source, re.M))
                 metal_device_args = set(re.findall(r"^// wp_metal_device_args (\S+)$", source, re.M))
+                metal_det_tg_finalize = set(re.findall(r"^// wp_metal_det_tg_finalize (\S+)$", source, re.M))
                 if backward_error is not None:
                     warp._src.logger.log_warning(
                         f"Backward kernels of module '{self.name}' are not available on Metal (forward-only build used):\n"
@@ -5249,6 +5256,7 @@ class Module:
                 module_exec.metal_backward_unsupported = metal_backward_unsupported
                 module_exec.metal_ordered = metal_ordered
                 module_exec.metal_device_args = metal_device_args
+                module_exec.metal_det_tg_finalize = metal_det_tg_finalize
                 module_exec.metal_backward_error = backward_error  # set when the adjoints failed to compile
                 self.execs[(device.context, active_block_dim)] = module_exec
 
@@ -7069,6 +7077,8 @@ class Runtime:
             self.core.wp_metal_unload_library.argtypes = [ctypes.c_void_p]
             self.core.wp_metal_unload_library.restype = None
             self.core.wp_metal_get_kernel.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.core.wp_metal_get_kernel_max_threads_per_threadgroup.argtypes = [ctypes.c_void_p]
+            self.core.wp_metal_get_kernel_max_threads_per_threadgroup.restype = ctypes.c_int
             self.core.wp_metal_capture_push.argtypes = [ctypes.c_int]
             self.core.wp_metal_capture_push.restype = ctypes.c_int
             self.core.wp_metal_capture_pop.argtypes = [ctypes.c_int]

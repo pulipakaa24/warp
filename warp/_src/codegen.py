@@ -7771,6 +7771,31 @@ metal_module_template_forward = """
 
 """
 
+# Metal entry point of a deterministic kernel with exact accumulation targets: threads past the launch skip the body
+# instead of returning, so that a launch that is one threadgroup can finalize its exact sums after a threadgroup
+# barrier (phase 2, see warp._src.metal_deterministic.launch); otherwise as metal_module_template_forward.
+metal_module_template_forward_det_tg = """
+
+{fixed_struct_forward}kernel void {name}_metal_forward{entry_suffix}(
+    {args_space} wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
+    {args_space} {forward_args_struct}* _wp_args [[buffer(1)]],
+    threadgroup char* _wp_arena [[threadgroup(0)]],
+    uint task_index [[thread_position_in_grid]],
+    uint _wp_lid [[thread_index_in_threadgroup]],
+    uint _wp_tg_size [[threads_per_threadgroup]])
+{{
+    if (task_index < dim.size) {{
+        wp::tile_shared_storage_t::init(_wp_arena);  // shared-tile arena (see tile.h)
+        {name}_cpu_kernel_forward(_wp_arena, {fixed_scratch}, dim, task_index, {forward_args_ref});
+    }}
+    if (({forward_args_ref})->_wp_det.phase == 2) {{
+        metal::threadgroup_barrier(metal::mem_flags::mem_device);
+        const uint _wp_stride = metal::min(_wp_tg_size, uint(dim.size));
+{det_finalize}    }}
+}}
+
+"""
+
 cpu_kernel_template_backward = """
 
 WP_FORCE_INLINE void {name}_cpu_kernel_backward(
@@ -9080,6 +9105,27 @@ def codegen_kernel(kernel, device, options, metal_func_costs=None):
     return args_struct + s
 
 
+def metal_det_tg_finalize_source(kernel, options, args_ref: str) -> str:
+    """Statements finalizing a deterministic kernel's exact accumulation targets inside a one-threadgroup launch, or
+    "" when the kernel has none, or any of them is not float32, or the module uses fast_math or GPU_TO_GPU records."""
+    meta = kernel.adj.det_meta
+    if meta is None or not meta.needs_deterministic:
+        return ""
+    options = options | kernel.options
+    if options.get("fast_math") or meta.determinism_mode == warp.config.DeterministicMode.GPU_TO_GPU:
+        return ""
+    from warp._src.deterministic import REDUCE_OP_ADD  # noqa: PLC0415
+
+    targets = [t for t in meta.scatter_targets if t.reduce_op == REDUCE_OP_ADD and t.use_forward]
+    if not targets or any(t.scalar_dtype is not float32 for t in targets):
+        return ""
+    return "".join(
+        f"        {{ wp::det_scatter_buf_t<{t.value_ctype}> _b = ({args_ref})->_wp_det.{t.helper_name}; "
+        "wp::deterministic::finalize_tg(_b, _wp_lid, _wp_stride); }\n"
+        for t in targets
+    )
+
+
 def codegen_module(kernel, device, options):
     """Generate the per-kernel entry points that wrap the per-thread kernel body (CPU and Metal only)."""
     template_fmt_args = {
@@ -9116,14 +9162,23 @@ def codegen_module(kernel, device, options):
             )
         device_args = getattr(kernel.adj, "metal_device_args", False)
         template_fmt_args.update(args_space="device const" if device_args else "constant", entry_suffix="")
-        source = metal_module_template_forward.format(**template_fmt_args)
+        # deterministic kernels whose exact accumulation targets are all float32 can finalize them in the kernel
+        # when the launch is one threadgroup (Module.load reads the marker back)
+        det_finalize = metal_det_tg_finalize_source(kernel, options, template_fmt_args["forward_args_ref"])
+        forward_template = metal_module_template_forward
+        if det_finalize:
+            forward_template = metal_module_template_forward_det_tg
+            template_fmt_args["det_finalize"] = det_finalize
+        source = forward_template.format(**template_fmt_args)
+        if det_finalize:
+            source = f"// wp_metal_det_tg_finalize {name}\n" + source
         # constant-argument twin of a device-argument entry point: Module.load falls back to it when the Metal
         # compiler cannot build the device form (the compiler service fails on some kernels built that way)
         twin = template_fmt_args | {"fixed_struct_forward": "", "args_space": "constant", "entry_suffix": "_cargs"}
         if device_args:
             # Module.load reads this marker back (fallback entry point names)
             source = f"// wp_metal_device_args {name}\n" + source
-            source += metal_module_template_forward.format(**twin)
+            source += forward_template.format(**twin)
         # opt-in (module option "metal_ordered_atomics"): run atomics in task order on one SIMD-group, the
         # order CUDA warps issue them in small launches (deterministic modules otherwise get deterministic lowering)
         ordered = (options | kernel.options).get("metal_ordered_atomics", False)

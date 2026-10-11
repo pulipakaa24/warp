@@ -40,6 +40,8 @@ template <typename T> struct det_scatter_buf_t {
     WP_DEVICE int* rec_cursors;  // [dim]
     int dest_size;
     int rec_per_thread;
+    // element 0 of the destination (float scalars): read by the in-kernel finalize of single-threadgroup launches
+    WP_DEVICE char* dest;
 };
 
 // One consumed-return counter target.
@@ -297,6 +299,90 @@ template <typename P, typename V> inline void slot_store_if_active(thread det_ct
 {
     if (store_allowed(ctx, ptr))
         wp::store(ptr, value);
+}
+
+// The exact sum held by one destination component's bins, rounded to float once (det_scatter_finalize's
+// bins_to_float in warp/_src/metal_deterministic.py, the same operations).
+inline float bins_to_float(WP_DEVICE uint* w, uint flag)
+{
+    if ((flag & 1u) || (flag & 6u) == 6u)
+        return NAN;
+    if (flag & 2u)
+        return INFINITY;
+    if (flag & 4u)
+        return -INFINITY;
+    uint limb[WP_DET_NBINS + 2];
+    long carry = 0;
+    for (uint b = 0; b < WP_DET_NBINS; ++b) {
+        const long v = long((ulong(w[2 * b + 1]) << 32) | ulong(w[2 * b]));
+        const long s = v + carry;
+        limb[b] = uint(ulong(s));
+        carry = s >> 32;
+    }
+    limb[WP_DET_NBINS] = uint(ulong(carry));
+    limb[WP_DET_NBINS + 1] = uint(ulong(carry) >> 32);
+    const bool negative = carry < 0;
+    if (negative) {
+        uint borrow = 1u;
+        for (uint b = 0; b < WP_DET_NBINS + 2; ++b) {
+            const uint t = ~limb[b] + borrow;
+            borrow = (borrow != 0u && t == 0u) ? 1u : 0u;
+            limb[b] = t;
+        }
+    }
+    int top = WP_DET_NBINS + 1;
+    while (top >= 0 && limb[top] == 0u)
+        --top;
+    if (top < 0)
+        return 0.0f;
+    ulong window;
+    int lsb;
+    if (top == 0) {
+        window = ulong(limb[0]);
+        lsb = -149;
+    } else {
+        window = (ulong(limb[top]) << 32) | ulong(limb[top - 1]);
+        lsb = 32 * (top - 1) - 149;
+        bool sticky = false;
+        for (int b = 0; b < top - 1; ++b)
+            sticky = sticky || limb[b] != 0u;
+        if (sticky)
+            window |= 1ul;
+    }
+    const float r = metal::ldexp(float(window), lsb);
+    return negative ? -r : r;
+}
+
+// det_scatter_finalize inside the kernel, for a launch that is one threadgroup: after a device-memory barrier, the
+// threadgroup's first `stride` threads round each touched destination's sum once, add it to the destination and
+// clear the bins, then the touched count is re-armed. Every thread of the threadgroup must call it (barriers).
+template <typename T> inline void finalize_tg(thread const det_scatter_buf_t<T>& buf, uint lid, uint stride)
+{
+    typedef typename det_scalar<T>::type S;
+    constexpr int C = int(sizeof(T) / sizeof(S));
+    if (buf.touched_count == nullptr || buf.bins == nullptr)
+        return;  // target not accumulated exactly in this launch (uniform)
+    const int n = metal::atomic_load_explicit(buf.touched_count, metal::memory_order_relaxed);
+    if (lid < stride) {
+        for (int i = int(lid); i < n; i += int(stride)) {
+            const int d = buf.touched_list[i];
+            for (int c = 0; c < C; ++c) {
+                const size_t slot = size_t(d) * C + c;
+                WP_DEVICE uint* w = reinterpret_cast<WP_DEVICE uint*>(buf.bins + slot * (2 * WP_DET_NBINS));
+                WP_DEVICE uint* flag = reinterpret_cast<WP_DEVICE uint*>(buf.flags + slot);
+                const float r = bins_to_float(w, *flag);
+                for (uint k = 0; k < 2 * WP_DET_NBINS; ++k)
+                    w[k] = 0u;
+                *flag = 0u;
+                WP_DEVICE float* f = reinterpret_cast<WP_DEVICE float*>(buf.dest) + slot;
+                *f = *f + r;
+            }
+            reinterpret_cast<WP_DEVICE uint*>(buf.touched)[d] = 0u;
+        }
+    }
+    metal::threadgroup_barrier(metal::mem_flags::mem_device);  // every thread has read the count
+    if (lid == 0)
+        metal::atomic_store_explicit(buf.touched_count, 0, metal::memory_order_relaxed);
 }
 
 }  // namespace deterministic

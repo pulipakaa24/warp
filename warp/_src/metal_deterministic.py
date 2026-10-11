@@ -44,6 +44,12 @@ _TILE = _TG * _IPT
 _MAX_COUNTER_TARGETS = 8
 _NBINS = 9
 _FINALIZE_GRID = int(os.environ.get("WP_METAL_DET_FINALIZE_GRID", "16384"))
+# counter launches with at most this many records resolve their slots in one threadgroup (det_counter_resolve_small)
+# instead of the build / sort / scan passes: the same slots with 1 dispatch instead of 5 + 3 per sort pass, which is
+# what small launches (one world: 12-624 records) spend their time on. 0 disables.
+_SMALL_RECORDS = int(os.environ.get("WP_METAL_DET_SMALL_RECORDS", str(_TILE)))
+# launches that are one threadgroup finalize exact sums inside the kernel (see launch); 0 disables
+_TG_FINALIZE = os.environ.get("WP_METAL_DET_TG_FINALIZE", "1") != "0"
 _BUILD_GRID = int(os.environ.get("WP_METAL_DET_BUILD_GRID", str(320 * _TG)))
 
 _SCALAR_CODES = {"float16": 0, "float32": 1, "bfloat16": 7}
@@ -374,6 +380,66 @@ kernel void det_seg_down(
     }
 }
 
+// Small launches (at most SMALL_RECORDS records): one threadgroup replaces det_counter_build, the sort and the three
+// scan passes. It walks the records in record order, TG at a time; a record's slot is the counter's value before the
+// launch plus the counts of the earlier records with the same destination (the running total of the earlier chunks,
+// kept in totals / touched as by det_seg_down, plus the earlier records of its chunk). That is the slot the sorted
+// path computes (a stable sort keeps record order within a destination); the integers are the same.
+kernel void det_counter_resolve_small(
+    constant wp_det_bounds_t& bounds [[buffer(0)]],
+    constant det_counter_args_t& a [[buffer(1)]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint skey[TG];
+    threadgroup int sval[TG];
+    for (uint start = 0; start < a.n; start += TG) {
+        const uint r = start + lid;
+        uint key = a.num_keys;
+        int value = 0;
+        int t = 0;
+        uint local = 0;
+        if (r < a.n) {
+            t = target_of_record(a, r);
+            local = r - uint(a.t[t].record_base);
+            const uint rpt = uint(a.t[t].records_per_thread);
+            const uint thread_index = local / rpt;
+            const uint call = local - thread_index * rpt;
+            if (int(call) < a.t[t].cursors[thread_index]) {
+                const int d = a.t[t].dest_of[local];
+                if (d >= 0 && d < a.t[t].target_size) {
+                    key = uint(a.t[t].key_base + d);
+                    value = a.t[t].values[local];
+                } else {
+                    a.t[t].prefixes[local] = 0;
+                }
+            }
+        }
+        skey[lid] = key;
+        sval[lid] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int total = 0;
+        bool last = false;
+        if (key < a.num_keys) {
+            int before = 0;
+            for (uint j = 0; j < lid; ++j)
+                before += skey[j] == key ? sval[j] : 0;
+            last = true;
+            for (uint j = lid + 1; j < TG; ++j)
+                last = last && skey[j] != key;
+            const int run = a.touched[key] != 0u ? a.totals[key] : a.t[t].counter[int(key) - a.t[t].key_base];
+            a.t[t].prefixes[local] = run + before;
+            total = run + before + value;
+        }
+        // every read of totals / touched of this chunk precedes the updates below
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        if (last) {
+            a.totals[key] = total;
+            a.touched[key] = 1u;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // GPU_TO_GPU accumulation targets: records sorted by destination, summed in thread order
 
@@ -517,9 +583,10 @@ class DetScatterBuf(ctypes.Structure):
         ("rec_cursors", ctypes.c_uint64),
         ("dest_size", ctypes.c_int32),
         ("rec_per_thread", ctypes.c_int32),
+        ("dest", ctypes.c_uint64),
     ]
     _wp_pointer_fields = (
-        "bins", "flags", "touched", "touched_list", "touched_count", "rec_dest", "rec_vals", "rec_cursors"
+        "bins", "flags", "touched", "touched_list", "touched_count", "rec_dest", "rec_vals", "rec_cursors", "dest"
     )
 
 
@@ -986,6 +1053,7 @@ class _Plan:
                 )
                 continue
             buf.bins = zb + r["bins"]
+            buf.dest = dest.ptr
             buf.flags = zb + r["flags"]
             buf.touched = zb + r["touched"]
             buf.touched_list = sb + r["list"]
@@ -1037,6 +1105,9 @@ class _Plan:
 
     def run_counter_passes(self):
         st = self.state
+        if self.counter_args.n <= _SMALL_RECORDS:
+            st.launch("det_counter_resolve_small", _TG, self.counter_args, _COUNTER_OFFSETS)
+            return
         st.launch("det_counter_build", self.build_threads, self.build_args, _COUNTER_OFFSETS)
         self.counter_sort.run(st)
         st.launch("det_seg_reduce", self.num_tiles * _TG, self.counter_args, _COUNTER_OFFSETS)
@@ -1046,9 +1117,9 @@ class _Plan:
     def run_writeback(self):
         self.state.launch("det_counter_writeback", self.writeback_threads, self.counter_args, _COUNTER_OFFSETS)
 
-    def run_finalize(self):
+    def run_finalize(self, in_kernel=False):
         st = self.state
-        for fin, threads in self.finalize:
+        for fin, threads in [] if in_kernel else self.finalize:
             st.launch("det_scatter_finalize", threads, fin, _FINALIZE_OFFSETS)
         for build, reduce, sort, threads, reset_threads in self.records:
             st.launch("det_records_build", threads, build, _RECORDS_OFFSETS)
@@ -1191,17 +1262,28 @@ def launch(
     # counter arrays are read through the plan's args (their host pointers are fixed by the key); the
     # destination array descriptors inside the det struct do not change either
 
+    # A launch that is one threadgroup finalizes its exact sums inside the kernel (phase 2: phase 1 plus the finalize
+    # after a threadgroup barrier) instead of in det_scatter_finalize dispatches: the same operations, one dispatch
+    # per accumulation target less (one-world scenes are made of such launches).
+    in_kernel = (
+        _TG_FINALIZE
+        and not adjoint
+        and bool(plan.finalize)
+        and getattr(hooks, "metal_det_tg_finalize", False)
+        and _single_threadgroup(hooks, dim, block_dim)
+    )
+    final_phase = 2 if in_kernel else 1
     if plan.counter_args is not None:
         plan.det.phase = 0
         invoke_metal(kernel, hooks, params, device, block_dim, adjoint, dim_limit=dim_limit, det_args=plan.det)
         plan.run_counter_passes()
-        plan.det.phase = 1
+        plan.det.phase = final_phase
         invoke_metal(kernel, hooks, params, device, block_dim, adjoint, dim_limit=dim_limit, det_args=plan.det)
         plan.run_writeback()
     else:
-        plan.det.phase = 1
+        plan.det.phase = final_phase
         invoke_metal(kernel, hooks, params, device, block_dim, adjoint, dim_limit=dim_limit, det_args=plan.det)
-    plan.run_finalize()
+    plan.run_finalize(in_kernel)
 
     if device.is_capturing:
         from warp._src.context import runtime  # noqa: PLC0415
@@ -1216,6 +1298,19 @@ def launch(
             )
     else:
         _check_overflow(state, kernel)
+
+
+def _single_threadgroup(hooks, dim, block_dim) -> bool:
+    """Whether a forward launch of ``dim`` threads runs as one threadgroup (see wp_metal_launch_kernel)."""
+    if dim <= 0 or hooks.forward is None:
+        return False
+    max_threads = getattr(hooks, "_metal_max_threads", None)
+    if max_threads is None:
+        from warp._src.context import runtime  # noqa: PLC0415
+
+        max_threads = int(runtime.core.wp_metal_get_kernel_max_threads_per_threadgroup(hooks.forward))
+        hooks._metal_max_threads = max_threads
+    return dim <= min(max(int(block_dim), 1), max_threads)
 
 
 def _check_overflow(state, kernel):
