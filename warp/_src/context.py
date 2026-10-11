@@ -3111,8 +3111,10 @@ class ModuleHasher:
             ch.update(bytes(f"metal_rolled_cholesky:{int(warp.config.metal_rolled_cholesky)}", "utf-8"))
         if warp.config.metal_chol_split:
             ch.update(b"metal_chol_split:1")
-        if warp.config.metal_device_args:
+        if warp.config.metal_device_args is True:
             ch.update(b"metal_device_args:1")
+        elif warp.config.metal_device_args == "auto":
+            ch.update(bytes(f"metal_device_args:auto:{int(warp.config.metal_device_args_max_cost)}", "utf-8"))
 
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output
@@ -3778,8 +3780,12 @@ class ModuleBuilder:
         # These must come after pass 2 because they call adjoint functions
         source += self._codegen_functions(grad_functions, device, forward_only=True)
 
+        # statement counts of the generated user functions (per-kernel argument space on Metal)
+        metal_func_costs = warp._src.codegen.metal_function_costs(source) if device == "metal" else None
         for kernel in self.kernels:
-            kernel_source = warp._src.codegen.codegen_kernel(kernel, device=device, options=self.options)
+            kernel_source = warp._src.codegen.codegen_kernel(
+                kernel, device=device, options=self.options, metal_func_costs=metal_func_costs
+            )
             kernel_source += warp._src.codegen.codegen_module(kernel, device=device, options=self.options)
             if device == "metal":
                 reason = self._metal_unsupported_reason(kernel_source)
@@ -3823,8 +3829,9 @@ class ModuleBuilder:
             # --use_fast_math (--prec-div=false --prec-sqrt=false) does on CUDA
             if self.options.get("fast_math"):
                 source = "#define WP_FAST_MATH 1\n" + source
-            # kernel arguments from device instead of constant memory (builtin.h, WP_ARGS)
-            if warp.config.metal_device_args:
+            # every kernel's arguments from device instead of constant memory (builtin.h, WP_ARGS: the backward
+            # entry points; forward entry points name their address space, see metal_kernel_device_args)
+            if warp.config.metal_device_args is True:
                 source = "#define WP_METAL_DEVICE_ARGS 1\n" + source
             # Metal compiles from an in-memory string without include paths
             source = warp._src.build.expand_includes(source)
@@ -3873,6 +3880,8 @@ class ModuleExec:
         self.metal_unsupported: dict[str, str] = {}
         self.metal_backward_unsupported: set[str] = set()  # kernels whose adjoint cannot run on Metal (tiles)
         self.metal_ordered: set[str] = set()  # kernels with an ordered entry point (deterministic atomics on Metal)
+        # kernels whose forward entry points read device-memory arguments (constant twins "<entry>_cargs")
+        self.metal_device_args: set[str] = set()
         self.metal_backward_error: str | None = None  # compile error that forced a forward-only build
         # Compute capability the loaded binary was actually compiled for (None for
         # CPU). Cluster classification must use this frozen target, not the current
@@ -4042,11 +4051,24 @@ class ModuleExec:
 
         elif self.device.is_metal:
             unsupported = self.metal_unsupported.get(name)
-            forward = (
-                None
-                if unsupported
-                else runtime.core.wp_metal_get_kernel(self.handle, (name + "_metal_forward").encode("utf-8"))
-            )
+            device_args = name in self.metal_device_args
+
+            def get_entry(entry):
+                handle = runtime.core.wp_metal_get_kernel(self.handle, entry.encode("utf-8"))
+                if not handle and device_args:
+                    # the Metal compiler could not build the device-argument form (its compiler service fails on
+                    # some kernels built that way): use the constant-argument twin, the same computation
+                    error = runtime.get_error_string()
+                    handle = runtime.core.wp_metal_get_kernel(self.handle, (entry + "_cargs").encode("utf-8"))
+                    if handle:
+                        log_warning(
+                            f"Kernel '{kernel.key}': the Metal compiler failed on its device-memory argument form, "
+                            f"constant-memory arguments are used instead ({error[:300]})",
+                            once=True,
+                        )
+                return handle
+
+            forward = None if unsupported else get_entry(name + "_metal_forward")
             if not forward and not unsupported:
                 raise RuntimeError(
                     f"Failed to load kernel '{kernel.key}' on device '{self.device}': {runtime.get_error_string()}"
@@ -4057,9 +4079,7 @@ class ModuleExec:
                 backward = runtime.core.wp_metal_get_kernel(self.handle, (name + "_metal_backward").encode("utf-8"))
             forward_ordered = None
             if not unsupported and name in self.metal_ordered:
-                forward_ordered = runtime.core.wp_metal_get_kernel(
-                    self.handle, (name + "_metal_forward_ordered").encode("utf-8")
-                )
+                forward_ordered = get_entry(name + "_metal_forward_ordered")
                 if not forward_ordered:
                     raise RuntimeError(
                         f"Failed to load kernel '{kernel.key}' on device '{self.device}': {runtime.get_error_string()}"
@@ -4204,6 +4224,9 @@ class Module:
             "deterministic_max_records": warp.config.deterministic_max_records,
             # Metal: launch kernels that use atomics as one SIMD-group in task order instead of deterministic lowering
             "metal_ordered_atomics": False,
+            # Metal: kernel arguments from device (True) or constant (False) memory; None follows
+            # warp.config.metal_device_args (see warp._src.codegen.metal_kernel_device_args)
+            "metal_device_args": None,
             "default_grid_stride": None,  # None means inherit warp.config.default_grid_stride
         }
 
@@ -5203,6 +5226,7 @@ class Module:
                 metal_unsupported = dict(re.findall(r"^// wp_metal_unsupported (\S+): (.*)$", source, re.M))
                 metal_backward_unsupported = set(re.findall(r"^// wp_metal_backward_unsupported (\S+)$", source, re.M))
                 metal_ordered = set(re.findall(r"^// wp_metal_ordered (\S+)$", source, re.M))
+                metal_device_args = set(re.findall(r"^// wp_metal_device_args (\S+)$", source, re.M))
                 if backward_error is not None:
                     warp._src.logger.log_warning(
                         f"Backward kernels of module '{self.name}' are not available on Metal (forward-only build used):\n"
@@ -5224,6 +5248,7 @@ class Module:
                 module_exec.metal_unsupported = metal_unsupported
                 module_exec.metal_backward_unsupported = metal_backward_unsupported
                 module_exec.metal_ordered = metal_ordered
+                module_exec.metal_device_args = metal_device_args
                 module_exec.metal_backward_error = backward_error  # set when the adjoints failed to compile
                 self.execs[(device.context, active_block_dim)] = module_exec
 

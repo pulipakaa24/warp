@@ -7741,12 +7741,25 @@ WP_FORCE_INLINE void {name}_cpu_kernel_forward(
 
 """
 
-# Metal entry point: one GPU thread per task, arguments read from a constant buffer.
+# Metal per-thread kernel body: a template on the argument pointer, so one body serves entry points that read the
+# arguments from constant or from device memory (see metal_kernel_device_args).
+metal_kernel_template_forward = """
+
+template <typename WpArgsPtr>
+WP_FORCE_INLINE void {name}_cpu_kernel_forward(
+    WP_FUNC_PARAM {forward_args},
+    WpArgsPtr _wp_args)
+{{
+{forward_body}}}
+
+"""
+
+# Metal entry point: one GPU thread per task, arguments read from constant or device memory ({args_space}).
 metal_module_template_forward = """
 
-{fixed_struct_forward}kernel void {name}_metal_forward(
-    WP_ARGS wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
-    WP_ARGS {forward_args_struct}* _wp_args [[buffer(1)]],
+{fixed_struct_forward}kernel void {name}_metal_forward{entry_suffix}(
+    {args_space} wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
+    {args_space} {forward_args_struct}* _wp_args [[buffer(1)]],
     threadgroup char* _wp_arena [[threadgroup(0)]],
     uint task_index [[thread_position_in_grid]])
 {{
@@ -7774,9 +7787,9 @@ WP_FORCE_INLINE void {name}_cpu_kernel_backward(
 # Atomics then reach memory in the order CUDA's warps reach them when they issue in launch order.
 metal_module_template_forward_ordered = """
 
-kernel void {name}_metal_forward_ordered(
-    WP_ARGS wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
-    WP_ARGS {forward_args_struct}* _wp_args [[buffer(1)]],
+kernel void {name}_metal_forward_ordered{entry_suffix}(
+    {args_space} wp::launch_bounds_t<{launch_ndim}>& dim [[buffer(0)]],
+    {args_space} {forward_args_struct}* _wp_args [[buffer(1)]],
     threadgroup char* _wp_arena [[threadgroup(0)]],
     uint task_start [[thread_position_in_grid]],
     uint task_stride [[threads_per_grid]])
@@ -8792,7 +8805,68 @@ def resolve_grid_stride(kernel_options: dict, default_grid_stride: builtins.bool
     return builtins.bool(default_grid_stride if explicit is None else explicit)
 
 
-def codegen_kernel(kernel, device, options):
+# Kernel-argument address space on Metal (warp.config.metal_device_args, module option "metal_device_args").
+#
+# Constant-space arguments are preloaded by Apple GPUs at every dispatch (a fixed cost growing with the argument fields
+# the kernel reads, ~0.25 us per array descriptor), then held in uniform registers. Device-space arguments skip the
+# preload but are loaded per thread: kernels that keep many arguments live through long bodies or tiles get much
+# slower (MuJoCo Warp G1 at 4,096 worlds, isolated GPU time per dispatch, device / constant: fused constraint
+# gradient 176 / 60 us, collision driver 255 / 44 us; physics step 54.4 / 47.5 ms), while short kernels dispatched
+# many times gain (Newton MPM granular: 39.5 -> 34.1 ms per frame, almost all from the Gauss-Seidel color pass). The
+# "auto" policy gives device arguments only to kernels without tiles whose generated statement count (body plus the
+# user functions it calls, inlined) is at most warp.config.metal_device_args_max_cost; modules and kernels can
+# override it with the module option "metal_device_args" (True / False).
+
+_METAL_STMT_DECL = re.compile(r"\s*(const )?[\w:<>, ]+[\*&]? var_\w+;$")
+_METAL_CALL = re.compile(r"\b(\w+_\d+)\(WP_FUNC_ARG")
+_METAL_FUNC = re.compile(r"^(?:static )?WP_FORCE_INLINE [^\n(]*?\b(\w+)\(\n?.*?\)\n\{\n(.*?)\n\}\n", re.M | re.S)
+
+
+def _metal_statement_count(body: str) -> int:
+    return sum(
+        1
+        for line in body.split("\n")
+        if line.strip() and not line.strip().startswith("//") and not _METAL_STMT_DECL.match(line)
+    )
+
+
+def metal_function_costs(source: str) -> dict:
+    """Statement counts of the user functions in a generated Metal module source (name -> (own count, callees))."""
+    return {
+        m.group(1): (_metal_statement_count(m.group(2)), tuple(set(_METAL_CALL.findall(m.group(2)))))
+        for m in _METAL_FUNC.finditer(source)
+    }
+
+
+def _metal_inlined_cost(body: str, func_costs: dict) -> int:
+    memo = {}
+
+    def cost(name, depth):
+        if name in memo:
+            return memo[name]
+        memo[name] = 0  # recursion guard
+        own, callees = func_costs.get(name, (0, ()))
+        total = own + (sum(cost(c, depth + 1) for c in callees) if depth < 32 else 0)
+        memo[name] = total
+        return total
+
+    return _metal_statement_count(body) + sum(cost(c, 0) for c in set(_METAL_CALL.findall(body)))
+
+
+def metal_kernel_device_args(kernel, options, forward_body: str, func_costs: dict | None) -> bool:
+    """Whether a Metal kernel's entry point reads its arguments from device memory (see the comment above)."""
+    choice = (options | kernel.options).get("metal_device_args")
+    if choice is None:
+        choice = warp.config.metal_device_args
+    if choice != "auto":
+        return bool(choice)
+    adj = kernel.adj
+    if any(is_tile(v.type) for v in adj.variables) or adj.get_total_required_shared() or "tile_" in forward_body:
+        return False
+    return _metal_inlined_cost(forward_body, func_costs or {}) <= int(warp.config.metal_device_args_max_cost)
+
+
+def codegen_kernel(kernel, device, options, metal_func_costs=None):
     # Update the module's options with the ones defined on the kernel, if any.
     options = options | kernel.options
 
@@ -8855,7 +8929,7 @@ def codegen_kernel(kernel, device, options):
         template_forward = cpu_kernel_template_forward
         template_backward = cpu_kernel_template_backward
     elif device == "metal":
-        template_forward = cpu_kernel_template_forward
+        template_forward = metal_kernel_template_forward
         # tile adjoints cannot run on Metal yet (null shared arena); codegen_module marks the kernel
         template_backward = "" if any(is_tile(v.type) for v in adj.variables) else cpu_kernel_template_backward
     elif is_external_constant_params_entry:
@@ -8950,6 +9024,8 @@ def codegen_kernel(kernel, device, options):
         device=device,
         grid_stride=kernel.grid_stride and not is_external_constant_params_entry,
     )
+    if device == "metal":
+        kernel.adj.metal_device_args = metal_kernel_device_args(kernel, options, forward_body, metal_func_costs)
     template_fmt_args.update(
         {
             "forward_args": indent(forward_args),
@@ -9038,7 +9114,16 @@ def codegen_module(kernel, device, options):
                 backward_args_ref="_wp_bwd",
                 fixed_scratch_bwd="(device char*)nullptr",
             )
+        device_args = getattr(kernel.adj, "metal_device_args", False)
+        template_fmt_args.update(args_space="device const" if device_args else "constant", entry_suffix="")
         source = metal_module_template_forward.format(**template_fmt_args)
+        # constant-argument twin of a device-argument entry point: Module.load falls back to it when the Metal
+        # compiler cannot build the device form (the compiler service fails on some kernels built that way)
+        twin = template_fmt_args | {"fixed_struct_forward": "", "args_space": "constant", "entry_suffix": "_cargs"}
+        if device_args:
+            # Module.load reads this marker back (fallback entry point names)
+            source = f"// wp_metal_device_args {name}\n" + source
+            source += metal_module_template_forward.format(**twin)
         # opt-in (module option "metal_ordered_atomics"): run atomics in task order on one SIMD-group, the
         # order CUDA warps issue them in small launches (deterministic modules otherwise get deterministic lowering)
         ordered = (options | kernel.options).get("metal_ordered_atomics", False)
@@ -9051,6 +9136,8 @@ def codegen_module(kernel, device, options):
             # Module.load reads this marker back to select the ordered entry point at launch
             source = f"// wp_metal_ordered {name}\n" + source
             source += metal_module_template_forward_ordered.format(**template_fmt_args)
+            if device_args:
+                source += metal_module_template_forward_ordered.format(**twin)
         # a Metal forward-only rebuild (see Module.load) drops every adjoint, including per-kernel opt-ins
         if (options | kernel.options)["enable_backward"] and not options.get("metal_forward_only"):
             if any(is_tile(v.type) for v in kernel.adj.variables):

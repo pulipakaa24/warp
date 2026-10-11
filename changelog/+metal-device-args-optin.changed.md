@@ -1,1 +1,1 @@
-Read Metal kernel arguments from constant memory again by default; `warp.config.metal_device_args` (`WP_METAL_DEVICE_ARGS=1`) selects device-memory arguments.
+Choose the Metal kernel-argument address space per kernel by default (`warp.config.metal_device_args = "auto"`): short kernels without tiles read their arguments from device memory, the others from constant memory; the module option `"metal_device_args"` overrides it, and a kernel whose device-argument form the Metal compiler cannot build falls back to constant arguments with a warning.

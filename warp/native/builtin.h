@@ -58,12 +58,12 @@
 #define WP_THREADGROUP threadgroup
 #define WP_CONSTANT constant
 #define WP_TILE_SHARED threadgroup  // address space of shared tile storage
-// Address space kernel argument structs and launch bounds are read from. Constant by default. With
-// warp.config.metal_device_args (WP_METAL_DEVICE_ARGS) they are read through device pointers: Apple GPUs preload the
-// constant-space data a kernel reads into uniform registers at every dispatch, a fixed cost that grows with the size
-// of the fields the kernel uses (Warp array descriptors are 56 bytes each), paid even when no thread does any work;
-// but kernels that read their arguments many times are slower from device memory, and the Metal compiler service
-// crashes on some kernels compiled that way (MuJoCo Warp's _tendon_dot).
+// Address space backward entry points read their argument structs and launch bounds from: constant, or device with
+// warp.config.metal_device_args = True (WP_METAL_DEVICE_ARGS). Forward entry points name theirs per kernel (codegen
+// metal_kernel_device_args): Apple GPUs preload the constant-space data a kernel reads into uniform registers at every
+// dispatch, a fixed cost that grows with the size of the fields the kernel uses (Warp array descriptors are 56 bytes
+// each), paid even when no thread does any work; but kernels that keep many arguments live are slower from device
+// memory, and the Metal compiler service crashes on some kernels compiled that way (MuJoCo Warp's _tendon_dot).
 #if defined(WP_METAL_DEVICE_ARGS) && WP_METAL_DEVICE_ARGS
 #define WP_ARGS device const
 #else

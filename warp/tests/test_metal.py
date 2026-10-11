@@ -1189,6 +1189,98 @@ class TestMetal(unittest.TestCase):
         np.testing.assert_array_equal(outs[0], outs[1])
         np.testing.assert_array_equal(outs[0], 1.5 * np.arange(n, dtype=np.float32) + 1.0)
 
+    @staticmethod
+    def _metal_source(kernel):
+        exec_ = next(iter(kernel.module.execs.values()))
+        return exec_, kernel.get_mangled_name()
+
+    def test_device_args_auto_policy(self):
+        """metal_device_args = "auto": short tile-free kernels read device-memory arguments (with a constant twin),
+        tile kernels and long kernels constant ones; the module option overrides; results are the same."""
+        saved = wp.config.metal_device_args, wp.config.metal_device_args_max_cost
+        n = 256
+        x = wp.array(np.arange(n, dtype=np.float32), device=self.device)
+        try:
+            results = {}
+            for mode, max_cost, option in (("auto", 200, None), ("auto", 0, None), ("auto", 0, True), (False, 200, None),
+                                           (True, 200, None), (True, 200, False)):
+                wp.config.metal_device_args, wp.config.metal_device_args_max_cost = mode, max_cost
+
+                @wp.kernel(module="unique", module_options={} if option is None else {"metal_device_args": option})
+                def scale(x: wp.array[float], out: wp.array[float]):
+                    i = wp.tid()
+                    out[i] = 2.0 * x[i]
+
+                @wp.kernel(module="unique")
+                def tile_sum(x: wp.array[float], out: wp.array[float]):
+                    t = wp.tile_load(x, shape=256)
+                    wp.tile_store(out, wp.tile_sum(t))
+
+                out = wp.zeros(n, dtype=float, device=self.device)
+                total = wp.zeros(1, dtype=float, device=self.device)
+                wp.launch(scale, n, inputs=[x, out], device=self.device)
+                wp.launch_tiled(tile_sum, dim=1, inputs=[x, total], block_dim=256, device=self.device)
+                exec_s, name_s = self._metal_source(scale)
+                exec_t, name_t = self._metal_source(tile_sum)
+                results[(mode, max_cost, option)] = (
+                    name_s in exec_s.metal_device_args,
+                    name_t in exec_t.metal_device_args,
+                    out.numpy(),
+                    total.numpy(),
+                )
+        finally:
+            wp.config.metal_device_args, wp.config.metal_device_args_max_cost = saved
+        expect = {
+            ("auto", 200, None): (True, False),
+            ("auto", 0, None): (False, False),
+            ("auto", 0, True): (True, False),
+            (False, 200, None): (False, False),
+            (True, 200, None): (True, True),
+            (True, 200, False): (False, True),
+        }
+        for key, (dev_s, dev_t) in expect.items():
+            self.assertEqual(results[key][:2], (dev_s, dev_t), key)
+            np.testing.assert_array_equal(results[key][2], 2.0 * np.arange(n, dtype=np.float32))
+            np.testing.assert_array_equal(results[key][3], results[("auto", 200, None)][3])
+
+    def test_device_args_compile_failure_falls_back_to_constant(self):
+        """A kernel whose device-argument entry point fails to build is loaded from its constant twin, with a warning."""
+        import warp._src.context as context  # noqa: PLC0415
+        from warp._src.context import runtime  # noqa: PLC0415
+
+        saved = wp.config.metal_device_args
+        real_get = runtime.core.wp_metal_get_kernel
+        real_log_warning = context.log_warning
+        failed = []
+        messages = []
+
+        def flaky_get(handle, name):
+            if name.endswith(b"_metal_forward") and b"fallback_axpy" in name:
+                failed.append(name)
+                return None  # as when the Metal compiler service fails on the device form
+            return real_get(handle, name)
+
+        try:
+            wp.config.metal_device_args = True
+
+            @wp.kernel(module="unique")
+            def fallback_axpy(x: wp.array[float], out: wp.array[float]):
+                i = wp.tid()
+                out[i] = 3.0 * x[i] + 1.0
+
+            runtime.core.wp_metal_get_kernel = flaky_get
+            context.log_warning = lambda message, *args, **kwargs: messages.append(message)
+            x = wp.array(np.arange(64, dtype=np.float32), device=self.device)
+            out = wp.zeros(64, dtype=float, device=self.device)
+            wp.launch(fallback_axpy, 64, inputs=[x, out], device=self.device)
+        finally:
+            runtime.core.wp_metal_get_kernel = real_get
+            context.log_warning = real_log_warning
+            wp.config.metal_device_args = saved
+        self.assertTrue(failed)
+        self.assertTrue(any("constant-memory arguments are used instead" in m for m in messages))
+        np.testing.assert_array_equal(out.numpy(), 3.0 * np.arange(64, dtype=np.float32) + 1.0)
+
     def test_shared_tile_int64_accumulation_is_exact(self):
         """Lanes adding into one int64 element of a shared tile (threadgroup memory) carry across the 32-bit halves."""
         block_dim = 128

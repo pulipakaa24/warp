@@ -384,14 +384,25 @@ on Metal devices (the key-based builder of ``volume_builder.cpp``; the grid buff
 builder's). Rebuilds then need no host synchronization. False drains the GPU and runs the host builder on unified
 memory, as before. Rebuildable allocation always uses the host builder. Read at each call."""
 
-metal_device_args: bool = _os.environ.get("WP_METAL_DEVICE_ARGS", "0") == "1"
-"""Whether Metal kernels read their argument structs and launch bounds through ``device const`` pointers instead of
-``constant`` ones (the default). Device arguments cut the fixed cost of a dispatch (Apple GPUs preload the constant
-data a kernel reads at every dispatch: MPM Gauss-Seidel color pass 12.6 -> 10.1 us, Newton MPM examples 3-6 ms per
-frame), but kernels that read their arguments repeatedly are slower (MuJoCo Warp G1 physics step at 4,096 worlds:
-47.5 ms with constant, 54.4 ms with device), and the Metal compiler service fails on some kernels built this way
-(MuJoCo Warp's ``_tendon_dot``: XPC_ERROR_CONNECTION_INTERRUPTED). Bitwise the same results either way. Read when a
-module is built (part of the module hash when ``True``); ``WP_METAL_DEVICE_ARGS=1`` selects device arguments."""
+metal_device_args: bool | str = {"1": True, "0": False}.get(_os.environ.get("WP_METAL_DEVICE_ARGS", "auto"), "auto")
+"""Address space Metal kernels read their argument structs and launch bounds from: ``"auto"`` (default) decides per
+kernel, ``True`` uses ``device const`` pointers for every kernel, ``False`` ``constant`` ones for every kernel. The
+module option ``"metal_device_args"`` (``True`` / ``False``) overrides it for a module or a kernel.
+
+Apple GPUs preload the constant data a kernel reads at every dispatch, a fixed cost growing with the argument fields
+it uses (~0.25 us per array descriptor), and then keep it in uniform registers; device arguments skip the preload but
+are loaded per thread. Short kernels dispatched many times are faster with device arguments (Newton MPM granular:
+39.5 -> 34.1 ms per frame, from the Gauss-Seidel color pass), kernels that keep many arguments live through long
+bodies or tiles are much slower (MuJoCo Warp G1 physics step at 4,096 worlds: 47.5 ms constant, 54.4 ms device).
+``"auto"`` gives device arguments to kernels without tiles whose generated statement count (the kernel body plus
+the user functions it calls, inlined) is at most :data:`metal_device_args_max_cost`. A kernel whose device form the
+Metal compiler cannot build (its compiler service fails on MuJoCo Warp's ``_tendon_dot`` that way) falls back to
+constant arguments when it is loaded, with a warning. Results are bitwise the same in every mode. Read when a module
+is built (part of the module hash unless ``False``); ``WP_METAL_DEVICE_ARGS=1`` / ``0`` / ``auto``."""
+
+metal_device_args_max_cost: int = int(_os.environ.get("WP_METAL_DEVICE_ARGS_MAX_COST", "200"))
+"""Largest generated statement count (kernel body plus inlined user functions) of a kernel that gets device-memory
+arguments under ``metal_device_args = "auto"``. Read when a module is built."""
 
 metal_eager_conditionals: bool = _os.environ.get("WP_METAL_EAGER_CONDITIONALS", "0") == "1"
 """Whether :func:`warp.capture_while` and :func:`warp.capture_if` outside a graph capture on Metal record their
