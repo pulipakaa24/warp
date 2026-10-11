@@ -3111,6 +3111,8 @@ class ModuleHasher:
             ch.update(bytes(f"metal_rolled_cholesky:{int(warp.config.metal_rolled_cholesky)}", "utf-8"))
         if warp.config.metal_chol_split:
             ch.update(b"metal_chol_split:1")
+        if not warp.config.metal_device_args:
+            ch.update(b"metal_device_args:0")
 
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output
@@ -3821,6 +3823,9 @@ class ModuleBuilder:
             # --use_fast_math (--prec-div=false --prec-sqrt=false) does on CUDA
             if self.options.get("fast_math"):
                 source = "#define WP_FAST_MATH 1\n" + source
+            # kernel arguments from constant instead of device memory (builtin.h, WP_ARGS)
+            if not warp.config.metal_device_args:
+                source = "#define WP_METAL_CONSTANT_ARGS 1\n" + source
             # Metal compiles from an in-memory string without include paths
             source = warp._src.build.expand_includes(source)
             source = warp._src.build.metal_rewrite_printf(source)  # shader logging has no %s

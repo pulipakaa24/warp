@@ -1165,6 +1165,30 @@ class TestMetal(unittest.TestCase):
             np.testing.assert_array_equal(acc_and.numpy().view(np.uint64), ref_and)
             np.testing.assert_array_equal(acc_xor.numpy().view(np.uint64), ref_xor)
 
+    def test_constant_args_switch_matches_device_args(self):
+        """warp.config.metal_device_args = False builds kernels that read arguments from constant space; same results."""
+        n = 1000
+        x = wp.array(np.arange(n, dtype=np.float32), device=self.device)
+        y = wp.array(np.ones(n, dtype=np.float32), device=self.device)
+        outs = []
+        saved = wp.config.metal_device_args
+        try:
+            for device_args in (True, False):
+                wp.config.metal_device_args = device_args
+
+                @wp.kernel(module="unique")
+                def axpy(x: wp.array[float], y: wp.array[float], s: float, out: wp.array[float]):
+                    i = wp.tid()
+                    out[i] = s * x[i] + y[i]
+
+                out = wp.zeros(n, dtype=float, device=self.device)
+                wp.launch(axpy, n, inputs=[x, y, 1.5, out], device=self.device)
+                outs.append(out.numpy())
+        finally:
+            wp.config.metal_device_args = saved
+        np.testing.assert_array_equal(outs[0], outs[1])
+        np.testing.assert_array_equal(outs[0], 1.5 * np.arange(n, dtype=np.float32) + 1.0)
+
     def test_shared_tile_int64_accumulation_is_exact(self):
         """Lanes adding into one int64 element of a shared tile (threadgroup memory) carry across the 32-bit halves."""
         block_dim = 128

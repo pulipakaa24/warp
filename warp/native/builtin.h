@@ -60,8 +60,14 @@
 #define WP_TILE_SHARED threadgroup  // address space of shared tile storage
 // Kernel argument structs are read through device (not constant) pointers: Apple GPUs preload the constant-space
 // data a kernel reads into uniform registers at every dispatch, a fixed cost that grows with the size of the fields
-// the kernel uses (Warp array descriptors are 56 bytes each), paid even when no thread does any work.
+// the kernel uses (Warp array descriptors are 56 bytes each), paid even when no thread does any work. Kernels that
+// read their arguments many times can be faster from constant space (warp.config.metal_device_args = False defines
+// WP_METAL_CONSTANT_ARGS).
+#if defined(WP_METAL_CONSTANT_ARGS) && WP_METAL_CONSTANT_ARGS
+#define WP_ARGS constant
+#else
 #define WP_ARGS device const
+#endif
 #else
 #define WP_METAL 0
 #define WP_THREAD

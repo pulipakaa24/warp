@@ -384,6 +384,14 @@ on Metal devices (the key-based builder of ``volume_builder.cpp``; the grid buff
 builder's). Rebuilds then need no host synchronization. False drains the GPU and runs the host builder on unified
 memory, as before. Rebuildable allocation always uses the host builder. Read at each call."""
 
+metal_device_args: bool = _os.environ.get("WP_METAL_DEVICE_ARGS", "1") != "0"
+"""Whether Metal kernels read their argument structs and launch bounds through ``device const`` pointers (default)
+instead of ``constant`` ones. Device arguments cut the fixed cost of a dispatch (Apple GPUs preload the constant data
+a kernel reads at every dispatch: MPM Gauss-Seidel color pass 12.6 -> 10.1 us), but kernels that read their arguments
+repeatedly can be slower (MuJoCo Warp G1 physics step at 4,096 worlds: 47.5 ms with constant, 54.4 ms with device).
+Bitwise the same results either way. Read when a module is built (part of the module hash when ``False``);
+``WP_METAL_DEVICE_ARGS=0`` selects constant arguments."""
+
 metal_eager_conditionals: bool = _os.environ.get("WP_METAL_EAGER_CONDITIONALS", "0") == "1"
 """Whether :func:`warp.capture_while` and :func:`warp.capture_if` outside a graph capture on Metal record their
 bodies once as a graph gated on the device (indirect execution ranges a kernel closes once the condition is 0), so
