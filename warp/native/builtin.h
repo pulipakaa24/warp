@@ -2835,11 +2835,12 @@ template <> inline CUDA_CALLABLE double atomic_cas(double WP_DEVICE* address, do
 }
 #endif  // !WP_NO_FLOAT64
 
+// Not on Metal: a full specialization is compiled into every module, and Metal has no 64-bit compare-and-swap
+// (metal_atomics.h rejects it at compile time); there the generic template above instantiates it only on use.
+#if !defined(__METAL_VERSION__)
 template <> inline CUDA_CALLABLE int64 atomic_cas(int64 WP_DEVICE* address, int64 compare, int64 val)
 {
-#if defined(__METAL_VERSION__)
-    return wp_metal_atomic_cas(address, compare, val);
-#elif defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__)
     auto result = atomicCAS(
         reinterpret_cast<unsigned long long int*>(address), static_cast<unsigned long long int>(compare),
         static_cast<unsigned long long int>(val)
@@ -2853,6 +2854,7 @@ template <> inline CUDA_CALLABLE int64 atomic_cas(int64 WP_DEVICE* address, int6
     return old;
 #endif
 }
+#endif  // !__METAL_VERSION__
 
 template <typename T> inline CUDA_CALLABLE T atomic_exch(T WP_DEVICE* address, T val)
 {
@@ -2882,11 +2884,10 @@ template <> inline CUDA_CALLABLE double atomic_exch(double WP_DEVICE* address, d
 }
 #endif  // !WP_NO_FLOAT64
 
+#if !defined(__METAL_VERSION__)  // see atomic_cas above
 template <> inline CUDA_CALLABLE int64 atomic_exch(int64 WP_DEVICE* address, int64 val)
 {
-#if defined(__METAL_VERSION__)
-    return wp_metal_atomic_exch(address, val);
-#elif defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__)
     auto result
         = atomicExch(reinterpret_cast<unsigned long long int*>(address), static_cast<unsigned long long int>(val));
     return static_cast<int64>(result);
@@ -2896,6 +2897,7 @@ template <> inline CUDA_CALLABLE int64 atomic_exch(int64 WP_DEVICE* address, int
     return old;
 #endif
 }
+#endif  // !__METAL_VERSION__
 
 
 template <typename T>

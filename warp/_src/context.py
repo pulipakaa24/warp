@@ -11463,8 +11463,16 @@ def invoke_metal(
     (``warp._src.metal_deterministic``).
     """
     if hooks.metal_unsupported:
+        detail = ""
+        if "int64)" in hooks.metal_unsupported:
+            detail = (
+                ". Apple GPUs have no 64-bit compare-and-swap (only unsigned 64-bit atomic min/max), so 64-bit "
+                "atomic_cas / atomic_exch and signed 64-bit atomic_min / atomic_max cannot be atomic on Metal; "
+                "use 32-bit atomics (e.g. on one half of the value) instead"
+            )
         raise RuntimeError(
             f"Kernel '{kernel.key}' uses builtins that are not supported on Metal yet: {hooks.metal_unsupported}"
+            + detail
         )
     bounds = params[0]
     host_arrays = device.__dict__.pop("_metal_host_memory_pending", False)

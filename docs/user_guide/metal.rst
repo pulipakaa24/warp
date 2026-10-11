@@ -86,14 +86,20 @@ Limitations
   (M3, A17) on, unsigned 64-bit minimum and maximum. All operations on 32-bit integers and floats are atomic, and
   so is ``wp.atomic_add()`` on 16-bit types, including ``wp.float16`` and ``wp.bfloat16``. The rest is as follows:
 
-  * ``wp.atomic_add()`` on 64-bit integers adds the two halves separately. The final value is exact, but a kernel
-    that reads the element while others add to it can see a half-updated value.
+  * ``wp.atomic_add()`` and the bitwise operations (``wp.atomic_and()``, ``wp.atomic_or()``, ``wp.atomic_xor()``)
+    on 64-bit integers update the two 32-bit halves with separate atomics. The final value is exact, but a kernel
+    that reads the element while others update it, or uses the returned previous value, can see a half-updated
+    (torn) value.
   * ``wp.atomic_min()`` and ``wp.atomic_max()`` on ``wp.uint64`` are atomic on Apple9 and later, where the returned
-    previous value can be stale under contention. On older GPUs they are plain read-modify-write.
+    previous value is read before the update and can be stale under contention. On older GPUs they do not compile.
+  * Not available: Apple GPUs have no 64-bit compare-and-swap, so ``wp.atomic_cas()`` and ``wp.atomic_exch()`` on
+    ``wp.int64`` / ``wp.uint64`` and ``wp.atomic_min()`` / ``wp.atomic_max()`` on ``wp.int64`` (also as vector or
+    matrix components) cannot be made atomic. A kernel that uses one raises at launch on Metal (the other kernels of
+    its module are unaffected); native code (``wp.func_native``) that reaches one fails to compile. Build such
+    operations from 32-bit atomics instead, e.g. claim a slot with a 32-bit compare-and-swap on one half.
   * Plain read-modify-write, correct only without concurrent writers to the same element: every atomic operation
     on 8-bit integers; minimum, maximum, exchange, compare-and-swap and the bitwise operations (``&=``, ``|=``,
-    ``^=``) on 16-bit types; minimum and maximum on ``wp.int64``; exchange, compare-and-swap and the bitwise
-    operations on 64-bit integers.
+    ``^=``) on 16-bit types.
 * Spinlocks built from ``wp.atomic_cas()`` can hang: Apple GPUs do not guarantee forward progress between
   SIMD lanes.
 * ``wp.fixedarray``, fabric arrays and saveable (APIC) captures are not supported.

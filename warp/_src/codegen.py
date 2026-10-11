@@ -1899,6 +1899,33 @@ def _store_shared_source(code, entry):
 # and launching a kernel that reaches one raises (see context.invoke_metal).
 METAL_UNSUPPORTED_BUILTIN_PREFIXES = ()
 
+# 64-bit atomics that Metal cannot provide: Apple GPUs have 32-bit atomics and, from Apple9 on, unsigned 64-bit
+# min/max, but no 64-bit compare-and-swap to build the others from. 64-bit add, and, or and xor are exact (two
+# 32-bit atomics, see metal_atomics.h); these would be a plain read-modify-write, so they are refused instead.
+METAL_UNSUPPORTED_ATOMICS_64 = {
+    "atomic_cas": ("int64", "uint64"),
+    "atomic_exch": ("int64", "uint64"),
+    "atomic_min": ("int64",),
+    "atomic_max": ("int64",),
+}
+
+
+def metal_atomic_unsupported(func_key: str, bound_args: Mapping[str, Any]) -> str | None:
+    """Label of a builtin atomic call that has no atomic implementation on Metal (``atomic_cas(uint64)``), or None.
+
+    The kernel then compiles with a stand-in and raises at launch on Metal, while the other kernels of the module
+    keep working. Native code that reaches one of these operations fails to compile instead (metal_atomics.h).
+    """
+    scalars = METAL_UNSUPPORTED_ATOMICS_64.get(func_key)
+    if scalars is None:
+        return None
+    arr = bound_args.get("arr")
+    arr_type = strip_reference(getattr(arr, "type", None))
+    dtype = getattr(arr_type, "dtype", None)
+    scalar = getattr(dtype, "_wp_scalar_type_", dtype)
+    name = getattr(scalar, "__name__", None)
+    return f"{func_key}({name})" if name in scalars else None
+
 
 def metal_tile_scratch_bytes(key: str, args: Mapping[str, Any], block_dim: int) -> int:
     """Shared-memory scratch the portable (non-LTO) tile implementations allocate for a builtin.
@@ -3146,8 +3173,13 @@ class Adjoint:
                 func_name = compute_type_str(native, (fixed_type.size, fixed_type.dtype, offset))
                 fixed_scratch_arg = True
         if adj.metal:
+            metal_unsupported = None
             if func.is_builtin() and func.key.startswith(METAL_UNSUPPORTED_BUILTIN_PREFIXES):
-                adj.metal_unsupported_builtins.add(func.key)
+                metal_unsupported = func.key
+            elif func.is_builtin() and func.key in METAL_UNSUPPORTED_ATOMICS_64:
+                metal_unsupported = metal_atomic_unsupported(func.key, bound_args)
+            if metal_unsupported:
+                adj.metal_unsupported_builtins.add(metal_unsupported)
                 func_name = (
                     f"metal_unsupported<{output.ctype()}>" if isinstance(output, Var) else "metal_unsupported_void"
                 )

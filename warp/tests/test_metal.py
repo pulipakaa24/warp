@@ -1134,6 +1134,93 @@ class TestMetal(unittest.TestCase):
                 self.assertLessEqual(ulp_error(s, sqrt_ref).max(), 2.5)
 
 
+    def test_64bit_bitwise_atomics_are_exact(self):
+        """64-bit atomic and / or / xor update each 32-bit half atomically: the final value is exact under contention."""
+        n = 1 << 16
+        for dtype, np_dtype in ((wp.uint64, np.uint64), (wp.int64, np.int64)):
+
+            @wp.kernel(module="unique")
+            def bits(acc_or: wp.array[dtype], acc_and: wp.array[dtype], acc_xor: wp.array[dtype]):
+                i = wp.tid()
+                bit = dtype(1) << dtype(i % 64)
+                wp.atomic_or(acc_or, i % 7, bit)
+                wp.atomic_and(acc_and, i % 7, ~bit)
+                wp.atomic_xor(acc_xor, i % 7, bit | (dtype(i) << dtype(20)))
+
+            acc_or = wp.zeros(7, dtype=dtype, device=self.device)
+            acc_and = wp.array(np.full(7, -1).astype(np_dtype), dtype=dtype, device=self.device)
+            acc_xor = wp.zeros(7, dtype=dtype, device=self.device)
+            wp.launch(bits, n, inputs=[acc_or, acc_and, acc_xor], device=self.device)
+            i = np.arange(n, dtype=np.uint64)
+            bit = np.uint64(1) << (i % np.uint64(64))
+            ref_or = np.zeros(7, np.uint64)
+            ref_and = np.full(7, np.iinfo(np.uint64).max, np.uint64)
+            ref_xor = np.zeros(7, np.uint64)
+            for k in range(7):
+                sel = (i % np.uint64(7)) == np.uint64(k)
+                ref_or[k] = np.bitwise_or.reduce(bit[sel])
+                ref_and[k] = np.bitwise_and.reduce(~bit[sel])
+                ref_xor[k] = np.bitwise_xor.reduce(bit[sel] | (i[sel] << np.uint64(20)))
+            np.testing.assert_array_equal(acc_or.numpy().view(np.uint64), ref_or)
+            np.testing.assert_array_equal(acc_and.numpy().view(np.uint64), ref_and)
+            np.testing.assert_array_equal(acc_xor.numpy().view(np.uint64), ref_xor)
+
+    def test_64bit_cas_exch_minmax_raise_at_launch(self):
+        """64-bit compare-and-swap / exchange and signed 64-bit min / max have no atomic form on Metal: the kernel
+        raises at launch (instead of running a plain read-modify-write), and the other kernels of the module run."""
+        ops = {}
+
+        @wp.kernel(module="unique")
+        def cas64(a: wp.array[wp.uint64]):
+            wp.atomic_cas(a, 0, wp.uint64(0), wp.uint64(wp.tid()))
+
+        @wp.kernel(module="unique")
+        def exch64(a: wp.array[wp.int64]):
+            wp.atomic_exch(a, 0, wp.int64(wp.tid()))
+
+        @wp.kernel(module="unique")
+        def min64(a: wp.array[wp.int64]):
+            wp.atomic_min(a, 0, wp.int64(-wp.tid()))
+
+        @wp.kernel(module="unique")
+        def max64v(a: wp.array[wp.vec3l]):
+            wp.atomic_max(a, 0, wp.vec3l(wp.int64(wp.tid())))
+
+        ops.update(cas64=(cas64, wp.uint64), exch64=(exch64, wp.int64), min64=(min64, wp.int64),
+                   max64v=(max64v, wp.vec3l))
+        for name, (kernel, dtype) in ops.items():
+            a = wp.zeros(1, dtype=dtype, device=self.device)
+            with self.assertRaisesRegex(RuntimeError, r"not supported on Metal.*64-bit compare-and-swap", msg=name):
+                wp.launch(kernel, 64, inputs=[a], device=self.device)
+
+        # same module: a kernel with an unsupported 64-bit atomic does not stop its neighbours
+        @wp.func
+        def claim(a: wp.array[wp.uint64], i: int):
+            return wp.atomic_cas(a, i, wp.uint64(0), wp.uint64(1))
+
+        shared = wp.get_module(f"test_metal_atomics64_{id(self)}")
+
+        @wp.kernel(module=shared)
+        def uses_claim(a: wp.array[wp.uint64]):
+            claim(a, wp.tid())
+
+        # unsigned 64-bit max is a hardware atomic on Apple9 GPUs and later
+        @wp.kernel(module=shared)
+        def umax64(a: wp.array[wp.uint64], b: wp.array[wp.uint64]):
+            i = wp.tid()
+            wp.atomic_max(a, 0, wp.uint64(i) << wp.uint64(33))
+            wp.atomic_or(b, 0, wp.uint64(1) << wp.uint64(i % 64))
+
+        a = wp.zeros(4, dtype=wp.uint64, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, r"atomic_cas\(uint64\)"):
+            wp.launch(uses_claim, 4, inputs=[a], device=self.device)
+        m = wp.zeros(1, dtype=wp.uint64, device=self.device)
+        b = wp.zeros(1, dtype=wp.uint64, device=self.device)
+        wp.launch(umax64, 1000, inputs=[m, b], device=self.device)
+        self.assertEqual(int(m.numpy()[0]), 999 << 33)
+        self.assertEqual(int(b.numpy()[0]), 2**64 - 1)
+
+
 class TestMetalInlineBudget(unittest.TestCase):
     """Forced inlining is bounded by the fully inlined size (pure codegen logic, no device needed)."""
 
