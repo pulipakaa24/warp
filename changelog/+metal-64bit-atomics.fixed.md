@@ -1,0 +1,1 @@
+Raise at launch on Metal for 64-bit `wp.atomic_cas()` / `wp.atomic_exch()` and signed 64-bit `wp.atomic_min()` / `wp.atomic_max()`, which Apple GPUs cannot perform atomically, instead of running them as a plain read-modify-write; make 64-bit `wp.atomic_and()` / `wp.atomic_or()` / `wp.atomic_xor()` and shared-tile int64 additions exact on Metal.

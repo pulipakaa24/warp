@@ -1166,7 +1166,7 @@ class TestMetal(unittest.TestCase):
             np.testing.assert_array_equal(acc_xor.numpy().view(np.uint64), ref_xor)
 
     def test_constant_args_switch_matches_device_args(self):
-        """warp.config.metal_device_args = False builds kernels that read arguments from constant space; same results."""
+        """warp.config.metal_device_args = True builds kernels that read arguments from device memory; same results."""
         n = 1000
         x = wp.array(np.arange(n, dtype=np.float32), device=self.device)
         y = wp.array(np.ones(n, dtype=np.float32), device=self.device)
