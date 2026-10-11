@@ -17,6 +17,7 @@ from warp.tests.deterministic.common import (
     assert_equal_repeated,
     bfloat16_cuda_devices,
     cuda_devices,
+    gpu_devices,
 )
 from warp.tests.unittest_utils import add_function_test
 
@@ -1064,7 +1065,7 @@ class TestDeterministicScatter(DeterministicTestBase):
     """Test deterministic scatter/reduce atomic lowering."""
 
 
-def _add(name, devices=cuda_devices, **kwargs):
+def _add(name, devices=gpu_devices, **kwargs):
     add_function_test(TestDeterministicScatter, name, globals()[name], devices=devices, **kwargs)
 
 
@@ -1083,15 +1084,12 @@ for _name in (
     "test_column_slice_atomic_add",
     "test_transposed_2d_atomic_add",
     "test_atomic_half_deterministic",
-    "test_atomic_double_deterministic",
     "test_vec3_atomic_add_deterministic",
     "test_vec3_atomic_minmax_deterministic",
     "test_mat33_atomic_add_deterministic",
     "test_triple_scatter_capacity_estimate",
     "test_loop_scatter_max_records_override",
-    "test_scatter_overflow_reports_error",
     "test_scatter_large_launch_rejected",
-    "test_mixed_reduce_ops_same_array",
     "test_helper_name_collision",
     "test_deterministic_closure_kernel",
     "test_deterministic_func_kernels",
@@ -1100,6 +1098,11 @@ for _name in (
 
 _add("test_scatter_add_correctness", devices=all_devices)
 _add("test_atomic_bfloat16_deterministic", devices=bfloat16_cuda_devices, check_output=False)
+
+# CUDA only: Metal accumulates without record buffers (no overflow), allows mixed reductions on one array (test_metal_deterministic.py), and has no float64
+_add("test_scatter_overflow_reports_error", devices=cuda_devices)
+_add("test_mixed_reduce_ops_same_array", devices=cuda_devices)
+_add("test_atomic_double_deterministic", devices=cuda_devices)
 
 
 if __name__ == "__main__":

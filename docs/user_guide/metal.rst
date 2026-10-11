@@ -97,14 +97,26 @@ Limitations
 * Spinlocks built from ``wp.atomic_cas()`` can hang: Apple GPUs do not guarantee forward progress between
   SIMD lanes.
 * ``wp.fixedarray``, fabric arrays and saveable (APIC) captures are not supported.
-* Deterministic mode (``wp.config.deterministic`` or the ``"deterministic"`` module option) does not use CUDA's
-  record, sort and replay machinery. Instead, every kernel of a deterministic module that reaches an atomic
-  operation is launched as one SIMD-group that strides over the launch's tasks, so atomics are issued in task order
-  (lane order within each stride of 32 tasks, the order in which one CUDA warp issues them). Counter slots are then
-  handed out in task order and floating-point accumulations add in task order, the same on every run. The launch
-  runs on 32 threads, so it suits small launches (a single simulated world); kernels without atomics, tile kernels
-  and backward launches keep their parallel launch. A kernel that waits on a later task (a spinlock or a flag
-  written by another thread) can hang under this mode.
+* Deterministic mode (``wp.config.deterministic`` or the ``"deterministic"`` module option) lowers atomics as on
+  CUDA and gives the same guarantee: results do not depend on thread scheduling. Two parts differ from CUDA:
+
+  * Floating-point accumulation atomics (``wp.atomic_add()``/``wp.atomic_sub()`` or ``+=`` whose result is unused)
+    add into an exact per-element integer accumulator, built from 32-bit atomics, instead of writing records that
+    are sorted after the kernel. One pass after the kernel rounds each element's exact sum to float once and adds it
+    to the element, so the result is the correctly rounded sum of the contributions (it can differ in the last bit
+    from CUDA's sort-based reduction). The accumulator takes 72 bytes per destination scalar while the kernel runs.
+    ``wp.atomic_min()``/``wp.atomic_max()`` stay native: on floats they order ``-0.0`` below ``+0.0``, so they do not
+    depend on order either, and different reductions may target the same array.
+  * Consumed-return counters (``slot = wp.atomic_add(counter, i, n)`` on ``int32``) run in two phases as on CUDA and
+    hand out slots in thread order for each counter element. Records are sized by the number of call sites per
+    thread; a call inside a dynamic loop takes the ``"deterministic_max_records"`` bound. A thread that makes more
+    calls than its bound raises an error at a later deterministic launch (the overflow flag is read without
+    waiting for the GPU).
+
+  No pass reads data back on the host, so deterministic launches can be captured. The module option
+  ``"metal_ordered_atomics"`` instead launches every kernel of the module that uses atomics as one SIMD-group
+  striding over the tasks, which reproduces the order one CUDA warp issues atomics in (suits single small launches;
+  a kernel that waits on a later task can hang under it).
 * Host-side utilities that are not recorded into a graph, such as building or changing the topology of a
   :class:`warp.sparse.BsrMatrix`, raise when called during a graph capture on Metal. Call them outside the
   capture.

@@ -3092,12 +3092,12 @@ class ModuleHasher:
         # the native headers the kernels compile against (see native_headers_digest())
         ch.update(native_headers_digest())
 
-        # deterministic modules carry ordered Metal entry points (codegen_module); salted so that binaries
-        # built before those entry points existed are not reused (non-deterministic modules keep their hashes)
+        # deterministic modules carry Metal deterministic lowering (metal_deterministic.h); salted so that Metal
+        # binaries built by earlier schemes (ordered entry points) are not reused (other modules keep their hashes)
         if options.get("deterministic", warp.config.DeterministicMode.NOT_GUARANTEED) != (
             warp.config.DeterministicMode.NOT_GUARANTEED
         ):
-            ch.update(b"metal_ordered_atomics:1")
+            ch.update(b"metal_deterministic:2")
 
         # Metal codegen settings read from warp.config at build time (only when changed from the
         # default, so default builds keep their hashes)
@@ -4197,6 +4197,8 @@ class Module:
             "extra_build_options": None,
             "deterministic": warp.config.deterministic,
             "deterministic_max_records": warp.config.deterministic_max_records,
+            # Metal: launch kernels that use atomics as one SIMD-group in task order instead of deterministic lowering
+            "metal_ordered_atomics": False,
             "default_grid_stride": None,  # None means inherit warp.config.default_grid_stride
         }
 
@@ -4573,12 +4575,13 @@ class Module:
         return self._tid_extent_limits[cache_key]
 
     def _snapshot_deterministic_metadata(
-        self, block_dim: int, options: dict, rebuild: bool
+        self, block_dim: int, options: dict, rebuild: bool, metal: bool = False
     ) -> dict[str, DeterministicMeta]:
         """Capture per-kernel launch metadata for the module variant being loaded, keyed by mangled name.
 
         ``rebuild`` is False after a fresh compile, which already built the
         adjoints with these options; ``output_arch=None`` avoids firing tile LTO.
+        ``metal`` rebuilds with the Metal lowering rules (see ``DeterministicCodegen.begin_build``).
         """
         if options.get("deterministic") == warp.config.DeterministicMode.NOT_GUARANTEED:
             return {}
@@ -4588,6 +4591,8 @@ class Module:
             return {}
 
         builder_options = options | {"output_arch": None}
+        if metal:
+            builder_options["deterministic_metal"] = True
         snapshot = {}
         with _codegen_lock:
             for kernel_hash, kernel in hasher.unique_kernels.items():
@@ -4728,16 +4733,9 @@ class Module:
         if target is None:
             target = "cpu" if is_cpu else "cuda"  # ``is_cpu`` is the upstream signature
 
-        if target == "metal":
-            # deterministic scatter/counter records (deterministic.h) are not ported to Metal; deterministic modules
-            # instead get an ordered entry point for their atomic kernels (see codegen_module)
-            ordered = options.get("deterministic", warp.config.DeterministicMode.NOT_GUARANTEED) != (
-                warp.config.DeterministicMode.NOT_GUARANTEED
-            )
-            options = options | {
-                "deterministic": warp.config.DeterministicMode.NOT_GUARANTEED,
-                "metal_ordered_atomics": ordered,
-            }
+        if target == "metal" and options.get("metal_ordered_atomics", False):
+            # opt-in ordered entry points (codegen_module) replace the deterministic lowering
+            options = options | {"deterministic": warp.config.DeterministicMode.NOT_GUARANTEED}
         builder = ModuleBuilder(
             self,
             options,
@@ -5127,11 +5125,12 @@ class Module:
 
                 module_load_timer.extra_msg = " (compiled)" if compiled else " (cached)"
 
-            # Metal runs deterministic modules as ordered launches and never reads the record metadata
             det_launch_meta_map = (
                 {}
-                if device.is_metal
-                else self._snapshot_deterministic_metadata(active_block_dim, options, rebuild=not compiled)
+                if device.is_metal and options.get("metal_ordered_atomics", False)
+                else self._snapshot_deterministic_metadata(
+                    active_block_dim, options, rebuild=not compiled, metal=device.is_metal
+                )
             )
 
             # -----------------------------------------------------------
@@ -11394,6 +11393,9 @@ def _metal_pointer_offsets(struct_type, base=0):
         elif issubclass(field_type, warp._src.types.fabricarray_t):
             raise NotImplementedError(f"{field_type.__name__} kernel arguments are not supported on Metal devices")
         elif issubclass(field_type, ctypes.Structure):
+            # raw device pointers of runtime-defined structs (deterministic-mode buffers, metal_deterministic.py)
+            for pointer_field in getattr(field_type, "_wp_pointer_fields", ()):
+                offsets.append(offset + getattr(field_type, pointer_field).offset)
             offsets.extend(_metal_pointer_offsets(field_type, offset))
         elif issubclass(field_type, ctypes.Array) and issubclass(field_type._type_, ctypes.Structure):
             for i in range(field_type._length_):
@@ -11424,6 +11426,24 @@ def _metal_append_fixed_scratch(args, device: Device, nbytes: int):
 METAL_SIMD_WIDTH = 32
 
 
+_metal_det_arg_types: dict = {}
+
+
+def _metal_append_det_args(args, det_args):
+    """Copy a kernel-argument struct into ``{args...; wp_det_args _wp_det}`` (the struct codegen emits for
+    kernels with deterministic lowering, see ``DeterministicCodegen.metal_args_struct``)."""
+    key = (type(args), type(det_args))
+    combined_type = _metal_det_arg_types.get(key)
+    if combined_type is None:
+        fields = list(type(args)._fields_) + [("_wp_det", type(det_args))]
+        combined_type = type(type(args).__name__, (ctypes.Structure,), {"_fields_": fields})
+        _metal_det_arg_types[key] = combined_type
+    combined = combined_type()
+    ctypes.memmove(ctypes.addressof(combined), ctypes.addressof(args), ctypes.sizeof(args))
+    combined._wp_det = det_args
+    return combined
+
+
 def invoke_metal(
     kernel,
     hooks,
@@ -11432,11 +11452,15 @@ def invoke_metal(
     block_dim: int,
     adjoint: bool = False,
     dim_limit: warp.array | None = None,
+    det_args=None,
 ):
     """Dispatch a forward or backward kernel on a Metal device.
 
     With ``dim_limit`` (a forward launch), only the threadgroups holding tasks whose leading index is below
     ``dim_limit[0]`` run (see :func:`warp.launch`).
+
+    ``det_args`` carries the deterministic-mode buffers of kernels with deterministic lowering
+    (``warp._src.metal_deterministic``).
     """
     if hooks.metal_unsupported:
         raise RuntimeError(
@@ -11445,6 +11469,8 @@ def invoke_metal(
     bounds = params[0]
     host_arrays = device.__dict__.pop("_metal_host_memory_pending", False)
     args, adj_args = _build_cpu_args_structs(kernel, hooks, params, adjoint=adjoint)
+    if det_args is not None:
+        args = _metal_append_det_args(args, det_args)
     if adjoint:
         # the backward entry point reads both structs from one buffer (wp_bwd_args_<kernel>)
         combined_type = getattr(kernel, "_metal_bwd_args_type", None)
@@ -12313,7 +12339,9 @@ def launch(
           rely on them running: on Metal only the threadgroups that hold tasks with first index below
           ``min(n, dim[0])`` are dispatched (an indirect dispatch sized on the GPU; captured graphs re-read ``n``
           at every replay), on other devices the full ``dim`` runs. Tasks that do run see the same ``wp.tid()``
-          and ``dim`` as in the full launch. Ignored for adjoint launches and deterministic (ordered) launches.
+          and ``dim`` as in the full launch. Deterministic launches on Metal honor the bound in each of their
+          kernel passes. Ignored for adjoint launches and for ordered launches (module option
+          ``metal_ordered_atomics``).
     """
 
     init()
@@ -12461,6 +12489,43 @@ def launch(
                 adj_args=adj_args,
                 adjoint=adjoint,
                 module_exec=module_exec,
+            )
+
+        elif device.is_metal and det_meta is not None and det_meta.needs_deterministic:
+            from warp._src import metal_deterministic  # noqa: PLC0415
+
+            if adjoint and hooks.backward is None:
+                raise RuntimeError(
+                    f"No backward kernel for '{kernel.key}' on device '{device}': tile adjoints are not supported "
+                    "on Metal yet, and modules built with enable_backward=False have none"
+                )
+            if record_cmd:
+                return metal_deterministic.create_launch(
+                    det_meta=det_meta,
+                    kernel=kernel,
+                    hooks=hooks,
+                    params=params,
+                    params_addr=None,
+                    bounds=bounds,
+                    device=device,
+                    block_dim=block_dim,
+                    adjoint=adjoint,
+                    fwd_args=fwd_args,
+                    adj_args=adj_args,
+                    dim_limit=dim_limit,
+                )
+            metal_deterministic.launch(
+                kernel,
+                hooks,
+                params,
+                bounds,
+                device,
+                det_meta,
+                fwd_args,
+                adj_args,
+                adjoint,
+                block_dim,
+                dim_limit=dim_limit,
             )
 
         elif device.is_metal:

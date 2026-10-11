@@ -314,6 +314,9 @@ class DeterministicMeta:
     scatter_records_per_thread: dict[ScatterTarget, int] = field(default_factory=dict)
     counter_records_per_thread: dict[CounterTarget, int] = field(default_factory=dict)
     counter_replay_targets: set[CounterTarget] = field(default_factory=set)
+    # counters with a call inside a dynamic loop: records per thread are not bounded by the call-site count
+    # (Metal sizes their records with ``max_records``; CUDA sizes every counter that way)
+    counter_dynamic: set[CounterTarget] = field(default_factory=set)
     store_targets_seen: set[ArrayStoreTarget] = field(default_factory=set)
     side_effect_atomic_targets: set[SideEffectAtomicTarget] = field(default_factory=set)
     needs_context: bool = False
@@ -347,6 +350,7 @@ class DeterministicMeta:
             self.add_scatter_target(target, records_per_thread=count)
         for target, count in other.counter_records_per_thread.items():
             self.add_counter_target(target, records_per_thread=count)
+        self.counter_dynamic |= other.counter_dynamic
         self.store_targets_seen |= other.store_targets_seen
         self.side_effect_atomic_targets |= other.side_effect_atomic_targets
 
@@ -395,6 +399,9 @@ class DeterministicRegistry:
     _counter_targets_by_array: dict[tuple[str, tuple[str, ...], bool], CounterTarget] = field(default_factory=dict)
     # Scatter and counter helpers share one namespace in generated C++.
     _next_target_index: int = 0
+    # Metal: each reduction family of an array is its own target (min/max stay native atomics there and add
+    # accumulates exactly, so mixing families on one array needs no shared record order).
+    split_families: bool = False
 
 
 class DeterministicCodegen:
@@ -427,7 +434,10 @@ class DeterministicCodegen:
                 has_side_effect_store=self.adj.is_user_function
                 and _deterministic_has_propagating_side_effect(self.adj.tree),
             )
-            self.adj.det_registry = DeterministicRegistry()
+            self.adj.det_registry = DeterministicRegistry(
+                split_families=bool(builder_options.get("deterministic_metal", False))
+                or getattr(self.adj.builder, "device", None) == "metal"
+            )
         else:
             self.adj.det_meta = None
             self.adj.det_registry = None
@@ -531,6 +541,7 @@ class DeterministicCodegen:
                 mapped_label,
                 mapped_attr_path,
                 adjoint=getattr(target, "adjoint", False),
+                family=target.family if self.adj.det_registry.split_families else None,
             )
             if mapped_target is None and self.adj.det_registry is not None:
                 mapped_target = get_or_create_scatter_target(
@@ -807,10 +818,46 @@ class DeterministicCodegen:
             det_args.append(f"wp::det_scatter_buf_t<{target.value_ctype}> {names['buf']}")
         return det_args
 
+    def metal_args_struct(self, name: str) -> tuple[str, str]:
+        """Metal: the ``wp_det_args_<name>`` struct definition and the member line that adds it to the kernel's
+        argument struct (mirrored by ``warp._src.metal_deterministic.det_args_type``)."""
+        if self.adj.det_meta is None or not self.adj.det_meta.needs_deterministic:
+            return "", ""
+        from warp._src.metal_deterministic import metal_struct_source  # noqa: PLC0415
+
+        source = metal_struct_source(name, self.adj.det_meta, counter_cpp_type, scatter_cpp_type)
+        return source, f"    wp_det_args_{name} _wp_det;\n"
+
     def kernel_locals(self, device):
         """Declare ``det_ctx`` plus helper aliases inside generated kernels."""
         if self.adj.det_meta is None or not self.adj.det_meta.needs_deterministic:
             return ""
+
+        if device == "metal":
+            from warp._src.codegen import fixed_stack_bytes  # noqa: PLC0415
+
+            meta = self.adj.det_meta
+            decls = []
+            n_counter_targets = len(meta.counter_targets)
+            targets_ptr = "nullptr"
+            if n_counter_targets > 0:
+                inits = ", ".join(f"_wp_args->_wp_det.{t.helper_name}.target" for t in meta.counter_targets)
+                decls.append(f"wp::array_t<int> _wp_det_counter_targets[{n_counter_targets}] = {{{inits}}};")
+                targets_ptr = "_wp_det_counter_targets"
+            decls.append(
+                "wp::det_ctx det_ctx{_wp_args->_wp_det.phase, _wp_args->_wp_det.debug, task_index, "
+                f"_wp_args->_wp_det.overflow, {targets_ptr}, {n_counter_targets}, _wp_fixed, "
+                f"_wp_fixed + {fixed_stack_bytes(self.adj)}}};"
+            )
+            for target in meta.counter_targets:
+                decls.append(
+                    f"{counter_cpp_type(target)} {target.helper_name} = _wp_args->_wp_det.{target.helper_name};"
+                )
+            for target in meta.scatter_targets:
+                decls.append(
+                    f"{scatter_cpp_type(target)} {target.helper_name} = _wp_args->_wp_det.{target.helper_name};"
+                )
+            return "".join(f"    {line}\n" for line in decls)
 
         if device == "cuda":
             decls = []
@@ -968,6 +1015,8 @@ def get_or_create_scatter_target(
             f"Deterministic mode does not support using array '{helper_label}' as both a counter target "
             "and a scatter target in the same function or kernel."
         )
+    if registry.split_families:
+        key = (*key, family)
     target = registry._scatter_targets_by_array.get(key)
 
     if target is not None:
@@ -1022,7 +1071,7 @@ def get_or_create_counter_target(
     key = (array_var_label, attr_path, bool(adjoint))
     label = target_label(array_var_label, attr_path)
     helper_label = f"adj_{label}" if adjoint else label
-    if key in registry._scatter_targets_by_array:
+    if any(k[:3] == key for k in registry._scatter_targets_by_array):
         raise ValueError(
             f"Deterministic mode does not support using array '{helper_label}' as both a counter target "
             "and a scatter target in the same function or kernel."
@@ -1459,6 +1508,8 @@ def emit_deterministic_atomic(adj, func, bound_args, return_type, output, output
             raise WarpCodegenError(str(e)) from e
         helper_name = target.helper_name
         adj.det_meta.counter_replay_targets.add(target)
+        if adj.loop_blocks:
+            adj.det_meta.counter_dynamic.add(target)
 
         val_loaded = loaded_args[-1]  # already loaded above
         loaded_prefix = [adj.load(var) for var in view_prefix_vars]
@@ -1712,13 +1763,14 @@ def _deterministic_map_target(target, bound_args):
     return mapped
 
 
-def _deterministic_find_target(targets, array_var_label, attr_path, *, adjoint=False):
+def _deterministic_find_target(targets, array_var_label, attr_path, *, adjoint=False, family=None):
     attr_path = tuple(attr_path)
     for target in targets:
         if (
             target.array_var_label == array_var_label
             and tuple(getattr(target, "attr_path", ())) == attr_path
             and bool(getattr(target, "adjoint", False)) == bool(adjoint)
+            and (family is None or getattr(target, "family", family) == family)
         ):
             return target
     return None
@@ -1781,6 +1833,8 @@ def _include_deterministic_call_meta(adj, meta, bound_args, *, include_replay_ta
         adj.det_meta.counter_records_per_thread[mapped_target] += count - 1
         if include_replay_targets and target in meta.counter_replay_targets:
             adj.det_meta.counter_replay_targets.add(mapped_target)
+        if target in meta.counter_dynamic or getattr(adj, "loop_blocks", None):
+            adj.det_meta.counter_dynamic.add(mapped_target)
 
     for target in meta.side_effect_atomic_targets:
         mapped_label, mapped_attr_path = _deterministic_map_target(target, bound_args)
