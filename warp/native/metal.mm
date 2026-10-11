@@ -61,12 +61,14 @@ int max_dispatches_per_command_buffer()
     return value;
 }
 
-// Graph replays are appended to the open command buffer until it carries WP_METAL_ICB_BATCH dispatches (default
-// 1024; a larger graph is split): a command buffer boundary costs ~26 us of GPU time on an M4 Max (event wait and
-// signal, buffer start), which dominated graphs replayed in quick succession (55-dispatch replays: 103 us each, one
-// command buffer per replay; 77 us batched). The open buffer is committed right away when the GPU has nothing else
-// in flight, so a replay is never held back while the GPU idles. WP_METAL_ICB_BATCH=0 commits every replay on its
-// own (the behaviour before).
+// Graph replays are appended to the open command buffer while it carries at most WP_METAL_ICB_BATCH dispatches
+// (default 1024): a command buffer boundary costs ~26 us of GPU time on an M4 Max (event wait and signal, buffer
+// start), which dominated graphs replayed in quick succession (55-dispatch replays: 103 us each, one command buffer
+// per replay; 77 us batched). A replay is never split: one that does not fit starts a new command buffer, and one
+// larger than the batch fills its command buffer alone (splitting saves nothing and only multiplies the command
+// buffers in flight, which run into the queue's limit sooner). The open buffer is committed right away when the GPU
+// has nothing else in flight, so a replay is never held back while the GPU idles. WP_METAL_ICB_BATCH=0 commits every
+// replay on its own (the behaviour before).
 int icb_batch()
 {
     static const int value = [] {
@@ -1715,8 +1717,14 @@ static int graph_launch(Device& device, Graph* graph)
                 direct += d.prep_offset != SIZE_MAX ? 1 : 0;
             for (const Graph::Segment& seg : graph->segments)
                 direct += seg.gate_args_offset != SIZE_MAX ? 1 : 0;
-            const int batch = icb_batch() > 0 ? icb_batch()
-                                              : int(std::max(count + direct, size_t(1)) + dev->num_dispatches);
+            // A replay is never split across command buffers: with batching on, it is appended to the open command
+            // buffer if it fits under WP_METAL_ICB_BATCH, otherwise the open buffer is committed first and the
+            // replay starts a new one (and fills it alone when it is larger than the batch).
+            const int total = int(std::max(count + direct, size_t(1)));
+            if (icb_batch() > 0 && dev->num_dispatches > 0 && dev->num_dispatches + total > icb_batch()
+                && !flush(*dev))
+                return -1;
+            const int batch = std::max(icb_batch(), total + dev->num_dispatches);
             auto room = [&]() -> int {
                 for (;;) {
                     int r = batch - dev->num_dispatches;
