@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 import warp as wp
-from warp.tests.deterministic.common import DeterministicTestBase, all_devices, assert_equal_repeated, cuda_devices
+from warp.tests.deterministic.common import DeterministicTestBase, all_devices, assert_equal_repeated, cuda_devices, gpu_devices
 from warp.tests.unittest_utils import add_function_test
 
 
@@ -1066,7 +1066,7 @@ class TestDeterministicCounter(DeterministicTestBase):
     """Test deterministic consumed-return counter lowering."""
 
 
-def _add(name, devices=cuda_devices):
+def _add(name, devices=gpu_devices):
     add_function_test(TestDeterministicCounter, name, globals()[name], devices=devices)
 
 

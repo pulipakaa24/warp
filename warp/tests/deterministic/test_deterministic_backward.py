@@ -15,6 +15,7 @@ from warp.tests.deterministic.common import (
     _reference_scatter_add_float32,
     all_devices,
     cuda_devices,
+    gpu_devices,
 )
 from warp.tests.deterministic.test_deterministic_counter import counter_kernel
 from warp.tests.deterministic.test_deterministic_scatter import scatter_add_kernel
@@ -661,7 +662,7 @@ def test_deterministic_sliced_store_backward_is_serial_only(test, device):
             with wp.Tape() as tape:
                 wp.launch(overwrite_sliced_component_then_read_original, n, [values, source, output], device=device)
             np.testing.assert_array_equal(output.numpy(), np.full(n, 7.0))
-            if device.is_cuda and n > 1:
+            if not device.is_cpu and n > 1:
                 with test.assertRaisesRegex(RuntimeError, "Deterministic.*parallel backward.*mutation"):
                     tape.backward(grads={output: wp.ones_like(output)})
             else:
@@ -694,7 +695,7 @@ def test_deterministic_overlapping_arguments_backward_rejected(test, device):
                     outputs=[output],
                     device=device,
                 )
-            if device.is_cuda and alias_kind != "distinct arrays":
+            if not device.is_cpu and alias_kind != "distinct arrays":
                 with test.assertRaisesRegex(RuntimeError, "Deterministic.*parallel backward.*mutation"):
                     tape.backward(grads={output: wp.ones_like(output)})
                 np.testing.assert_array_equal(src.grad.numpy(), np.zeros(n, dtype=np.float32))
@@ -748,8 +749,6 @@ def test_deterministic_backward_missing_adjoint_target(test, device):
 
 def test_deterministic_backward_counter_store_rejected(test, device):
     """Verify generated backward replay of consumed-return counters fails closed."""
-    if device.is_metal:
-        test.skipTest("Deterministic mode is not supported on Metal")
     n = 64
     data_np = np.arange(n, dtype=np.float32)
 
@@ -965,7 +964,7 @@ def test_deterministic_custom_adjoint_component_overwrite_is_serial_only(test, d
                     outputs=[output],
                     device=device,
                 )
-            if device.is_cuda and n > 1:
+            if not device.is_cpu and n > 1:
                 with test.assertRaisesRegex(RuntimeError, "Deterministic.*parallel backward.*mutation"):
                     tape.backward(grads={output: output_grad})
             else:
@@ -1114,8 +1113,6 @@ def test_custom_adjoint_not_guaranteed_mode(test, device):
 
 def test_deterministic_custom_adjoint_consumed_counter_rejected(test, device):
     """Verify consumed-return counters in custom adjoints fail closed."""
-    if device.is_metal:
-        test.skipTest("Deterministic mode is not supported on Metal")
     n = 16
     values = wp.ones(n, dtype=wp.float32, device=device, requires_grad=True)
     counter = wp.zeros(1, dtype=wp.int32, device=device)
@@ -1137,7 +1134,7 @@ class TestDeterministicBackward(DeterministicTestBase):
     deterministic_modules = (_THIS_MODULE, scatter_module, counter_module)
 
 
-def _add(name, devices=cuda_devices):
+def _add(name, devices=gpu_devices):
     add_function_test(TestDeterministicBackward, name, globals()[name], devices=devices)
 
 

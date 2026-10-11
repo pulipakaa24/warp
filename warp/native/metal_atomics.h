@@ -110,12 +110,14 @@ inline float wp_metal_atomic_cas(device float* p, float compare, float v)
 
 // Min/max without a native atomic: CAS loops on the bit pattern, with fmin()/fmax() semantics
 // like CPU and CUDA: a NaN operand never replaces a number, and a number replaces a NaN slot.
-#define WP_METAL_CAS_MINMAX(T, BITS, ATOMIC_T, NAME, OP)                                                  \
+// Zeros are ordered -0 < +0, so the result is the same whatever order the threads arrive in.
+#define WP_METAL_CAS_MINMAX(T, BITS, ATOMIC_T, NAME, OP, ZERO_WINS)                                       \
     inline T wp_metal_atomic_##NAME(device T* p, T v)                                                     \
     {                                                                                                     \
         device ATOMIC_T* a = (device ATOMIC_T*)p;                                                         \
         BITS old_bits = metal::atomic_load_explicit(a, metal::memory_order_relaxed);                      \
-        while (v OP as_type<T>(old_bits) || (metal::isnan(as_type<T>(old_bits)) && !metal::isnan(v))) {  \
+        while (v OP as_type<T>(old_bits) || (metal::isnan(as_type<T>(old_bits)) && !metal::isnan(v))      \
+               || (v == T(0) && as_type<T>(old_bits) == T(0) && ZERO_WINS)) {                             \
             if (metal::atomic_compare_exchange_weak_explicit(                                             \
                     a, &old_bits, as_type<BITS>(v), metal::memory_order_relaxed,                   \
                     metal::memory_order_relaxed                                                           \
@@ -124,8 +126,8 @@ inline float wp_metal_atomic_cas(device float* p, float compare, float v)
         }                                                                                                 \
         return as_type<T>(old_bits);                                                               \
     }
-WP_METAL_CAS_MINMAX(float, unsigned int, metal::atomic_uint, min, <)
-WP_METAL_CAS_MINMAX(float, unsigned int, metal::atomic_uint, max, >)
+WP_METAL_CAS_MINMAX(float, unsigned int, metal::atomic_uint, min, <, (metal::signbit(v) && !metal::signbit(as_type<float>(old_bits))))
+WP_METAL_CAS_MINMAX(float, unsigned int, metal::atomic_uint, max, >, (!metal::signbit(v) && metal::signbit(as_type<float>(old_bits))))
 #undef WP_METAL_CAS_MINMAX
 
 // 64-bit integer add: the two 32-bit halves are added atomically with carry propagation; every add

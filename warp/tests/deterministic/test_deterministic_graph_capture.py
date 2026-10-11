@@ -10,7 +10,7 @@ import numpy as np
 import warp as wp
 import warp.tests.deterministic.test_deterministic_counter as counter_module
 import warp.tests.deterministic.test_deterministic_scatter as scatter_module
-from warp.tests.deterministic.common import DeterministicTestBase, cuda_devices
+from warp.tests.deterministic.common import DeterministicTestBase, cuda_devices, gpu_devices
 from warp.tests.deterministic.test_deterministic_counter import counter_kernel, indexed_counter_kernel
 from warp.tests.deterministic.test_deterministic_scatter import (
     _det_closure_transform_a,
@@ -434,7 +434,7 @@ class TestDeterministicGraph(DeterministicTestBase):
     deterministic_modules = (scatter_module, counter_module)
 
 
-def _add(name, devices=cuda_devices):
+def _add(name, devices=gpu_devices):
     add_function_test(TestDeterministicGraph, name, globals()[name], devices=devices)
 
 
@@ -448,11 +448,13 @@ for _name in (
     "test_graph_capture_consumed_return_counter",
     "test_graph_capture_indexed_counter",
     "test_counter_large_launch_rejected",
-    "test_apic_capture_rejects_deterministic_cuda_kernel",
     "test_capture_while_deterministic_scatter",
     "test_capture_while_deterministic_counter",
 ):
     _add(_name)
+
+# CUDA only: saveable (APIC) captures are not supported on Metal
+_add("test_apic_capture_rejects_deterministic_cuda_kernel", devices=cuda_devices)
 
 
 if __name__ == "__main__":

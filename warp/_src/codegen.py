@@ -7737,9 +7737,9 @@ WP_FORCE_INLINE void {name}_cpu_kernel_backward(
 
 """
 
-# Metal ordered entry point (deterministic modules, kernels that use atomics): the launch runs one SIMD-group that
-# strides over the tasks, so every atomic is issued in task order (lane order within a stride). Atomics then reach
-# memory in the order CUDA's warps reach them when they issue in launch order.
+# Metal ordered entry point (module option "metal_ordered_atomics", kernels that use atomics): the launch runs one
+# SIMD-group that strides over the tasks, so every atomic is issued in task order (lane order within a stride).
+# Atomics then reach memory in the order CUDA's warps reach them when they issue in launch order.
 metal_module_template_forward_ordered = """
 
 kernel void {name}_metal_forward_ordered(
@@ -8771,6 +8771,10 @@ def codegen_kernel(kernel, device, options):
         args_struct = f"struct wp_args_{kernel.get_mangled_name()} {{\n"
         for i in adj.args:
             args_struct += f"    {i.ctype()} {i.label};\n"
+        if device == "metal":
+            # deterministic-mode buffers travel after the arguments (see warp._src.metal_deterministic)
+            det_struct, det_member = adj.deterministic.metal_args_struct(kernel.get_mangled_name())
+            args_struct = det_struct + args_struct + det_member
         args_struct += "};\n"
 
     # Build line directive for function definition (subtract 1 to account for 1-indexing of AST line numbers)
@@ -9003,10 +9007,9 @@ def codegen_module(kernel, device, options):
                 fixed_scratch_bwd="(device char*)nullptr",
             )
         source = metal_module_template_forward.format(**template_fmt_args)
-        kernel_options = options | kernel.options
-        ordered = kernel_options.get("metal_ordered_atomics", False)
-        if "deterministic" in kernel.options:
-            ordered = kernel.options["deterministic"] != warp.config.DeterministicMode.NOT_GUARANTEED
+        # opt-in (module option "metal_ordered_atomics"): run atomics in task order on one SIMD-group, the
+        # order CUDA warps issue them in small launches (deterministic modules otherwise get deterministic lowering)
+        ordered = (options | kernel.options).get("metal_ordered_atomics", False)
         if (
             ordered
             and kernel.adj.metal_has_atomics

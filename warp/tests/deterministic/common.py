@@ -9,7 +9,7 @@ import numpy as np
 
 import warp as wp
 from warp._src.types import _np_bfloat16_bits_to_float32
-from warp.tests.unittest_utils import get_selected_cuda_test_devices, get_test_devices
+from warp.tests.unittest_utils import get_metal_test_devices, get_selected_cuda_test_devices, get_test_devices
 
 
 def _reference_scatter_add_float32(data_np, idx_np, out_size):
@@ -31,6 +31,9 @@ def _bfloat16_numpy_to_float32(values):
 
 
 cuda_devices = get_selected_cuda_test_devices()
+metal_devices = get_metal_test_devices()
+# GPU devices with deterministic lowering (CUDA: record/sort/reduce; Metal: warp/_src/metal_deterministic.py)
+gpu_devices = cuda_devices + metal_devices
 bfloat16_cuda_devices = [device for device in cuda_devices if device.arch >= 80]
 all_devices = get_test_devices()
 cpu_device = wp.get_device("cpu")

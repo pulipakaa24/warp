@@ -3,7 +3,7 @@
 
 #pragma once
 
-// Deterministic reductions are a CUDA feature; the header is not used by Metal kernels.
+// CUDA and CPU implementation; Metal kernels use metal_deterministic.h (see the #else branch at the end).
 #if !defined(__METAL_VERSION__)
 
 // Note: this header is included in NVRTC-compiled code, so we cannot use
@@ -368,5 +368,9 @@ inline CUDA_CALLABLE void array_store_if_active(det_ctx& ctx, const A<T>& buf, i
         __VA_ARGS__ \
     } while (0)
 #endif
+
+#else  // __METAL_VERSION__
+
+#include "metal_deterministic.h"
 
 #endif  // !__METAL_VERSION__
