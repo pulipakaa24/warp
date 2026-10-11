@@ -718,6 +718,49 @@ kernel void rle_lengths(
     ((device int*)a.run_lengths)[j] = end - starts[j];
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// strided / indexed array copy (CUDA: array_copy_{1,2,3,4}d_kernel in warp.cu), one thread per element
+
+struct array_copy_args_t {
+    device uchar* dst;
+    device const uchar* src;
+    device const int* dst_indices[4];
+    device const int* src_indices[4];
+    long dst_strides[4];        // bytes
+    long src_strides[4];        // bytes
+    uint shape[4];
+    uint ndim;
+    uint elem_size;             // bytes
+    ulong n;
+};
+
+kernel void array_copy(
+    constant wp_prim_bounds_t& bounds [[buffer(0)]],
+    constant array_copy_args_t& a [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (ulong(tid) >= a.n)
+        return;
+    long so = 0, do_ = 0;
+    ulong rest = tid;
+    for (int d = int(a.ndim) - 1; d >= 0; --d) {
+        const uint i = uint(rest % a.shape[d]);
+        rest /= a.shape[d];
+        const long si = a.src_indices[d] ? long(a.src_indices[d][i]) : long(i);
+        const long di = a.dst_indices[d] ? long(a.dst_indices[d][i]) : long(i);
+        so += si * a.src_strides[d];
+        do_ += di * a.dst_strides[d];
+    }
+    device const uchar* p = a.src + so;
+    device uchar* q = a.dst + do_;
+    if ((a.elem_size & 3u) == 0u && ((ulong(p) | ulong(q)) & 3ul) == 0ul) {
+        for (uint w = 0; w < a.elem_size / 4u; ++w)
+            ((device uint*)q)[w] = ((device const uint*)p)[w];
+    } else {
+        for (uint b = 0; b < a.elem_size; ++b)
+            q[b] = p[b];
+    }
+}
 """
 
 
@@ -764,6 +807,21 @@ class _ScanArgs(ctypes.Structure):
     ]
 
 
+class _ArrayCopyArgs(ctypes.Structure):
+    _fields_ = [
+        ("dst", ctypes.c_uint64),
+        ("src", ctypes.c_uint64),
+        ("dst_indices", ctypes.c_uint64 * 4),
+        ("src_indices", ctypes.c_uint64 * 4),
+        ("dst_strides", ctypes.c_int64 * 4),
+        ("src_strides", ctypes.c_int64 * 4),
+        ("shape", ctypes.c_uint32 * 4),
+        ("ndim", ctypes.c_uint32),
+        ("elem_size", ctypes.c_uint32),
+        ("n", ctypes.c_uint64),
+    ]
+
+
 def _pointer_offsets(struct_type, count):
     offsets = [getattr(struct_type, name).offset for name, _ in struct_type._fields_[:count]]
     return (ctypes.c_size_t * len(offsets))(*offsets)
@@ -772,6 +830,7 @@ def _pointer_offsets(struct_type, count):
 # the leading pointer fields, plus the device bound (n_dev, last so that positional constructions stay valid)
 _SORT_PTR_OFFSETS = (ctypes.c_size_t * 11)(*(8 * i for i in range(10)), _SortArgs.n_dev.offset)
 _SCAN_PTR_OFFSETS = (ctypes.c_size_t * 8)(*_pointer_offsets(_ScanArgs, 7), _ScanArgs.n_dev.offset)
+_COPY_PTR_OFFSETS = (ctypes.c_size_t * 10)(*(8 * i for i in range(10)))
 _BOUNDS = ctypes.c_uint64(0)
 
 
@@ -1073,3 +1132,53 @@ def runlength_encode(values, run_values, run_lengths, run_count, value_count: in
     state.launch("scan_spine_i4", 1, args, _SCAN_PTR_OFFSETS)
     state.launch_bounded("rle_scatter", num_tiles, args, _SCAN_PTR_OFFSETS, count_limit, _SCAN_TILE)
     state.launch_bounded("rle_lengths", n, args, _SCAN_PTR_OFFSETS, count_limit, 1, per_thread=True)
+
+
+def _copy_operand(a):
+    """(data pointer, byte strides, index pointers) of a Warp array or indexed array, or None if unsupported."""
+    if isinstance(a, wp.array):
+        return a.ptr, list(a.strides), [0] * 4
+    if isinstance(a, wp.indexedarray):
+        if not isinstance(a.data, wp.array):
+            return None
+        indices = [0] * 4
+        for d, idx in enumerate(a.indices):
+            if idx is not None:
+                if idx.device != a.data.device or not idx.is_contiguous or idx.dtype != wp.int32:
+                    return None
+                indices[d] = idx.ptr
+        return a.data.ptr, list(a.data.strides), indices
+    return None
+
+
+def array_copy(dest, src, elem_size: int) -> bool:
+    """GPU copy between strided and / or indexed arrays of one Metal device, element by element (``elem_size``
+    bytes each), with the indexing of CUDA's ``wp_array_copy_device``: ``dest[dst_index(i)] = src[src_index(i)]``
+    over the common shape, where an indexed dimension maps ``i`` through its index array.
+
+    Returns ``False`` (nothing launched) for operands it does not handle (Fabric arrays); the caller then copies on
+    the host. Ordered with kernel launches and recordable into graph captures (no host synchronization).
+    """
+    d = _copy_operand(dest)
+    s = _copy_operand(src)
+    if d is None or s is None or dest.ndim != src.ndim or tuple(dest.shape) != tuple(src.shape):
+        return False
+    n = 1
+    for extent in src.shape:
+        n *= extent
+    if n == 0:
+        return True
+    if n >= 2**32:
+        return False
+    args = _ArrayCopyArgs()
+    args.dst, args.src = d[0], s[0]
+    args.dst_indices[:] = d[2]
+    args.src_indices[:] = s[2]
+    ndim = src.ndim
+    args.dst_strides[:] = d[1] + [0] * (4 - ndim)
+    args.src_strides[:] = s[1] + [0] * (4 - ndim)
+    args.shape[:] = list(src.shape) + [1] * (4 - ndim)
+    args.ndim, args.elem_size, args.n = ndim, elem_size, n
+    state = _state(dest.device)
+    state.launch("array_copy", 0, args, _COPY_PTR_OFFSETS, threads=n)
+    return True

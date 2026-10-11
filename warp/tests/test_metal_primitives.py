@@ -341,6 +341,57 @@ class TestMetalPrimitives(unittest.TestCase):
             np.testing.assert_array_equal(values.numpy()[head:n], np.arange(head, n))
             self.assertEqual(int(rc.numpy()[0]), len(np.unique(k[:head])))
 
+    def test_array_copy_strided_and_indexed(self):
+        """Strided and indexed copies on the GPU equal the host copies, byte for byte, and are recordable."""
+        device = wp.get_device("metal:0")
+        rng = np.random.default_rng(3)
+        base = rng.standard_normal((40, 6, 5, 3)).astype(np.float32)
+        base.reshape(-1)[::37] = np.nan  # payloads travel as raw bytes
+        idx0 = wp.array(rng.permutation(40)[:25].astype(np.int32), device=device)
+        idx2 = wp.array(np.array([4, 0, 3], dtype=np.int32), device=device)
+        cases = []
+        for dtype, data in (
+            (wp.float32, base),
+            (wp.vec3, base.reshape(40, 6, 5, 3)[..., :3].copy()),
+            (wp.uint8, rng.integers(0, 255, (40, 6, 5), dtype=np.uint8)),
+            (wp.float64, rng.standard_normal((40, 7))),
+        ):
+            src = wp.array(data, dtype=dtype, device=device)
+            cases.append(("indexed 1d gather", src[idx0], None))
+            cases.append(("strided", src[1::3], None))
+            if src.ndim >= 3:
+                cases.append(("indexed 2 dims", wp.indexedarray(src, [idx0, None, idx2]), None))
+            # scatter into an indexed destination
+            cases.append(("indexed destination", src[: idx0.shape[0]], wp.indexedarray(wp.zeros_like(src), [idx0])))
+
+        def run(src, dst_template):
+            dst = dst_template if dst_template is not None else wp.zeros(src.shape, dtype=src.dtype, device=device)
+            wp.copy(dst, src)
+            out = dst.data if isinstance(dst, wp.indexedarray) else dst
+            return out.numpy().copy()
+
+        for name, src, dst in cases:
+            with self.subTest(case=name, dtype=src.dtype):
+                with gpu_utilities(True):
+                    g = run(src, dst)
+                with gpu_utilities(False):
+                    if dst is not None:
+                        dst.data.zero_()
+                    h = run(src, dst)
+                self.assertTrue(np.array_equal(g.view(np.uint8), h.view(np.uint8)))
+
+        # recorded into a graph: the gather follows new index values without a host step
+        src = wp.array(base[:, 0, 0, 0], dtype=wp.float32, device=device)
+        dst = wp.zeros(idx0.shape[0], dtype=wp.float32, device=device)
+        with gpu_utilities(True):
+            with wp.ScopedCapture(device=device) as capture:
+                dst.assign(src[idx0])
+            for _ in range(3):
+                perm = rng.permutation(40)[:25].astype(np.int32)
+                idx0.assign(perm)
+                wp.capture_launch(capture.graph)
+                np.testing.assert_array_equal(dst.numpy(), base[perm, 0, 0, 0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

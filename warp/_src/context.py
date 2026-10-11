@@ -15237,6 +15237,9 @@ def copy(
                 stream.wait_stream(src.device.stream)
             else:
                 src = src.contiguous()
+                if src.device.is_metal:
+                    # the staging copy is a GPU kernel on Metal; the transfer below reads it on the host
+                    src.device.metal_synchronize()
 
         # The source is now contiguous.  If the destination is not contiguous,
         # clone a contiguous copy on the destination device.
@@ -15427,9 +15430,18 @@ def copy(
                     "(strided / indexed / fabric); copy the underlying contiguous arrays first or "
                     "move the copy outside the capture."
                 )
-            if dest.device.is_metal:
-                dest.device.metal_synchronize()  # strided copies run on the host
-            result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
+            result = False
+            if dest.device.is_metal and src.device == dest.device:
+                from warp._src import metal_primitives  # noqa: PLC0415
+
+                # strided / indexed copies within a Metal device run as a GPU kernel (as wp_array_copy_device on
+                # CUDA), ordered with kernel launches and recordable into graphs
+                if metal_primitives.enabled(dest.device):
+                    result = metal_primitives.array_copy(dest_nc, src_nc, src_elem_size)
+            if not result:
+                if dest.device.is_metal:
+                    dest.device.metal_synchronize()  # strided copies run on the host
+                result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
 
         if not result:
             raise RuntimeError(f"Warp copy error: {runtime.get_error_string()}")
