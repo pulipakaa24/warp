@@ -68,6 +68,7 @@ void wp_texture_destroy_metal(uint64_t) { }
 int wp_metal_graph_launch(int, void*) { return unavailable(); }
 
 void wp_metal_graph_destroy(int, void*) { }
+int wp_metal_graph_ranges_honoured(void*) { return 0; }
 
 void* wp_metal_load_library(int, const char*) { return unavailable(), nullptr; }
 

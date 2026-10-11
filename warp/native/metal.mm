@@ -1678,6 +1678,15 @@ int wp_metal_capture_host_call(int ordinal, void* fn, const unsigned long long* 
 }
 
 static void graph_destroy(int ordinal, Device* dev, Graph* graph);
+// 1 when replays of the graph honour its indirect execution ranges (they run through the indirect command
+// buffer: no host ops recorded, WP_METAL_ICB not 0), else 0.
+int wp_metal_graph_ranges_honoured(void* handle)
+{
+    WP_METAL_LOCK();
+    const Graph* graph = static_cast<const Graph*>(handle);
+    return graph && graph->host_ops.empty() && graph->children.empty() && icb_replay_enabled() ? 1 : 0;
+}
+
 void wp_metal_graph_destroy(int ordinal, void* handle)
 {
     WP_METAL_LOCK();
