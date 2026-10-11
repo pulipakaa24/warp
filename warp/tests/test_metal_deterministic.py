@@ -179,15 +179,17 @@ class TestMetalDeterministic(unittest.TestCase):
 
     def test_per_element_counters(self):
         """Order each counter element's slots by thread, independently of the other elements."""
-        worlds, n = 37, 500
-        counter = wp.zeros(worlds, dtype=int, device=self.device)
-        out = wp.full((worlds, 2 * n), 999999, dtype=int, device=self.device)
-        wp.launch(det_append_per_world, dim=(worlds, n), inputs=[counter, out], device=self.device)
-        out_np, counter_np = out.numpy(), counter.numpy()
-        for w in range(worlds):
-            ids = [i for i in range(n) if (i * 7 + w) % 3 != 0]
-            self.assertEqual(counter_np[w], 2 * len(ids))
-            np.testing.assert_array_equal(out_np[w, : 2 * len(ids)], np.array([[i, -i] for i in ids]).ravel())
+        # the second size spans more than 256 scan tiles of records
+        for worlds, n in ((37, 500), (64, 20_000)):
+            counter = wp.zeros(worlds, dtype=int, device=self.device)
+            out = wp.full((worlds, 2 * n), 999999, dtype=int, device=self.device)
+            wp.launch(det_append_per_world, dim=(worlds, n), inputs=[counter, out], device=self.device)
+            out_np, counter_np = out.numpy(), counter.numpy()
+            i = np.arange(n)
+            for w in range(worlds):
+                ids = i[(i * 7 + w) % 3 != 0]
+                self.assertEqual(counter_np[w], 2 * ids.size)
+                np.testing.assert_array_equal(out_np[w, : 2 * ids.size], np.stack([ids, -ids], axis=1).ravel())
 
     def test_counter_in_dynamic_loop(self):
         """Size records of a counter called in a dynamic loop with deterministic_max_records."""

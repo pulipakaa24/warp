@@ -313,21 +313,26 @@ kernel void det_seg_reduce(
     }
 }
 
-// One thread turns the tile totals into exclusive carries, in place.
+// One threadgroup turns the tile totals into exclusive carries, in place, 256 tiles at a time.
 kernel void det_seg_spine(
     constant wp_det_bounds_t& bounds [[buffer(0)]],
     constant det_counter_args_t& a [[buffer(1)]],
-    uint tid [[thread_position_in_grid]])
+    uint lid [[thread_index_in_threadgroup]])
 {
-    if (tid != 0)
-        return;
+    threadgroup segp sm[TG];
     segp carry = seg_identity();
-    for (uint t = 0; t < a.num_tiles; ++t) {
-        const segp total = segp{ a.carry_k[t], a.carry_s[t], a.carry_u[t] };
-        a.carry_k[t] = carry.k;
-        a.carry_s[t] = carry.s;
-        a.carry_u[t] = carry.u;
-        carry = seg_combine(carry, total);
+    for (uint start = 0; start < a.num_tiles; start += TG) {
+        const uint t = start + lid;
+        const segp total = t < a.num_tiles ? segp{ a.carry_k[t], a.carry_s[t], a.carry_u[t] } : seg_identity();
+        const segp excl = seg_combine(carry, tg_seg_scan(total, sm, lid));
+        const segp chunk = sm[TG - 1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t < a.num_tiles) {
+            a.carry_k[t] = excl.k;
+            a.carry_s[t] = excl.s;
+            a.carry_u[t] = excl.u;
+        }
+        carry = seg_combine(carry, chunk);
     }
 }
 
@@ -1035,7 +1040,7 @@ class _Plan:
         st.launch("det_counter_build", self.build_threads, self.build_args, _COUNTER_OFFSETS)
         self.counter_sort.run(st)
         st.launch("det_seg_reduce", self.num_tiles * _TG, self.counter_args, _COUNTER_OFFSETS)
-        st.launch("det_seg_spine", 1, self.counter_args, _COUNTER_OFFSETS, group=1)
+        st.launch("det_seg_spine", _TG, self.counter_args, _COUNTER_OFFSETS)
         st.launch("det_seg_down", self.num_tiles * _TG, self.counter_args, _COUNTER_OFFSETS)
 
     def run_writeback(self):
