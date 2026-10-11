@@ -78,6 +78,19 @@ int icb_batch()
     return value;
 }
 
+// Eager dispatches fill a command buffer of WP_METAL_BATCH dispatches before it is committed. A loop whose host waits
+// for the GPU every few dozen dispatches (a solver iteration that reads its stop condition) would then leave the GPU
+// idle until the buffer fills or the host waits; so the open buffer is also committed every WP_METAL_IDLE_FLUSH
+// eager dispatches (default 16) when no committed command buffer is still executing. 0 disables.
+int idle_flush_dispatches()
+{
+    static const int value = [] {
+        const char* env = std::getenv("WP_METAL_IDLE_FLUSH");
+        return env ? std::max(0, atoi(env)) : 16;
+    }();
+    return value;
+}
+
 // WP_METAL_INFLIGHT bounds the committed-but-unfinished command buffers (see flush()).
 int max_command_buffers_in_flight()
 {
@@ -517,6 +530,24 @@ bool flush(Device& dev)
     return retire_completed(dev);
 }
 
+// Counts n eager dispatches into the open command buffer and commits it when it is full, or, every
+// idle_flush_dispatches() dispatches, when the GPU has nothing else to execute. Returns false on GPU errors.
+bool eager_dispatched(Device& dev, int n)
+{
+    const int before = dev.num_dispatches;
+    dev.num_dispatches += n;
+    if (dev.num_dispatches >= max_dispatches_per_command_buffer())
+        return flush(dev);
+    const int k = idle_flush_dispatches();
+    if (k > 0 && dev.num_dispatches / k != before / k) {
+        if (!retire_completed(dev))
+            return false;
+        if (dev.in_flight.empty())
+            return flush(dev);
+    }
+    return true;
+}
+
 // Commits and waits for all work, then recycles the args ring and deferred frees. Returns false on GPU errors.
 bool synchronize(Device& dev)
 {
@@ -905,7 +936,7 @@ bool dispatch_memory_kernel(
     [encoder dispatchThreads:MTLSizeMake((num_bytes + 15) / 16, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     if (profiler().enabled)
         return profile_dispatch(dev, kernel.label.UTF8String);
-    return ++dev.num_dispatches < max_dispatches_per_command_buffer() || flush(dev);
+    return eager_dispatched(dev, 1);
 }
 
 }  // anonymous namespace
@@ -1290,8 +1321,9 @@ int wp_metal_launch_kernel(
         ++dev->n_dispatch;
         if (profiler().enabled)
             return profile_dispatch(*dev, pipeline.label.UTF8String) ? 0 : -1;
-        // Bound latency by committing large batches; the next launch starts a fresh command buffer.
-        if (++dev->num_dispatches >= max_dispatches_per_command_buffer() && !flush(*dev))
+        // Bound latency by committing large batches (or small ones the idle GPU can start on); the next launch
+        // starts a fresh command buffer.
+        if (!eager_dispatched(*dev, 1))
             return -1;
         return 0;
     }
@@ -1473,8 +1505,7 @@ int wp_metal_launch_kernel_bounded(
             return -1;
         if (profiler().enabled)
             return 0;
-        dev->num_dispatches += 2;
-        if (dev->num_dispatches >= max_dispatches_per_command_buffer() && !flush(*dev))
+        if (!eager_dispatched(*dev, 2))
             return -1;
         return 0;
     }
