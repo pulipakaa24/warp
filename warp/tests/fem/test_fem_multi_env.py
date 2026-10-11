@@ -1105,6 +1105,8 @@ def test_single_environment_space_partition_environmentless_tail(test, device):
 
 devices = get_test_devices()
 cuda_devices = get_selected_cuda_test_devices()
+# environment NanoVDB grids are built by the GPU volume builders (CUDA, Metal)
+gpu_volume_devices = cuda_devices + get_metal_test_devices()
 cuda_devices_with_mempool = get_selected_cuda_test_devices_with_mempool()
 
 
@@ -1116,12 +1118,15 @@ add_function_test(TestFemMultiEnv, "test_grid_2d_multi_env", test_grid_2d_multi_
 add_function_test(TestFemMultiEnv, "test_grid_3d_multi_env", test_grid_3d_multi_env, devices=devices)
 add_function_test(TestFemMultiEnv, "test_deformed_grid_3d_multi_env", test_deformed_grid_3d_multi_env, devices=devices)
 add_function_test(TestFemMultiEnv, "test_mesh_multi_env", test_mesh_multi_env, devices=devices)
-add_function_test(TestFemMultiEnv, "test_nanogrid_multi_env", test_nanogrid_multi_env, devices=cuda_devices)
+add_function_test(TestFemMultiEnv, "test_nanogrid_multi_env", test_nanogrid_multi_env, devices=gpu_volume_devices)
 add_function_test(
-    TestFemMultiEnv, "test_nanogrid_multi_env_rebuildable", test_nanogrid_multi_env_rebuildable, devices=cuda_devices
+    TestFemMultiEnv,
+    "test_nanogrid_multi_env_rebuildable",
+    test_nanogrid_multi_env_rebuildable,
+    devices=gpu_volume_devices,
 )
 add_function_test(
-    TestFemMultiEnv, "test_adaptive_nanogrid_multi_env", test_adaptive_nanogrid_multi_env, devices=cuda_devices
+    TestFemMultiEnv, "test_adaptive_nanogrid_multi_env", test_adaptive_nanogrid_multi_env, devices=gpu_volume_devices
 )
 add_function_test(
     TestFemMultiEnv,

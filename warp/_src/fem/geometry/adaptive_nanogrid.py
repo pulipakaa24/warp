@@ -119,7 +119,7 @@ class AdaptiveNanogrid(NanogridBase):
             transform: Linear transform between packed index and world spaces.
             temporary_store: Shared pool from which to allocate temporary arrays.
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``).
-            device: CUDA device on which to build the packed volume.
+            device: CUDA or Metal device on which to build the packed volume.
             cell_ijks: Deprecated keyword alias for the old per-environment ``points`` sequence form.
         """
 
