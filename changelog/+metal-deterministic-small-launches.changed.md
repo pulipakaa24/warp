@@ -1,0 +1,1 @@
+Run the deterministic-mode passes of small Metal launches in fewer dispatches: counter launches with at most 2,048 records resolve their slots in one threadgroup (`WP_METAL_DET_SMALL_RECORDS`), and launches that are one threadgroup finalize exact float32 sums inside the kernel (`WP_METAL_DET_TG_FINALIZE`); results are unchanged.

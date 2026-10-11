@@ -1,0 +1,1 @@
+Never split a Metal graph replay larger than `WP_METAL_ICB_BATCH` across command buffers when batching replays: it gets a command buffer of its own (smaller replays still share and split command buffers).
