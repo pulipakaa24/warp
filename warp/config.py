@@ -395,14 +395,20 @@ are loaded per thread. Short kernels dispatched many times are faster with devic
 39.5 -> 34.1 ms per frame, from the Gauss-Seidel color pass), kernels that keep many arguments live through long
 bodies or tiles are much slower (MuJoCo Warp G1 physics step at 4,096 worlds: 47.5 ms constant, 54.4 ms device).
 ``"auto"`` gives device arguments to kernels without tiles whose generated statement count (the kernel body plus
-the user functions it calls, inlined) is at most :data:`metal_device_args_max_cost`. A kernel whose device form the
+the user functions it calls, inlined) is at most :data:`metal_device_args_max_cost`, and to longer kernels without
+tiles in launches of at most :data:`metal_device_args_max_threads` threads. A kernel whose device form the
 Metal compiler cannot build (its compiler service fails on MuJoCo Warp's ``_tendon_dot`` that way) falls back to
 constant arguments when it is loaded, with a warning. Results are bitwise the same in every mode. Read when a module
 is built (part of the module hash unless ``False``); ``WP_METAL_DEVICE_ARGS=1`` / ``0`` / ``auto``."""
 
 metal_device_args_max_cost: int = int(_os.environ.get("WP_METAL_DEVICE_ARGS_MAX_COST", "200"))
 """Largest generated statement count (kernel body plus inlined user functions) of a kernel that gets device-memory
-arguments under ``metal_device_args = "auto"``. Read when a module is built."""
+arguments in every launch under ``metal_device_args = "auto"``. Read when a module is built."""
+
+metal_device_args_max_threads: int = int(_os.environ.get("WP_METAL_DEVICE_ARGS_MAX_THREADS", "1024"))
+"""Under ``metal_device_args = "auto"``, kernels without tiles that are longer than :data:`metal_device_args_max_cost`
+read device-memory arguments in launches of at most this many threads (dispatch-bound: the preload of constant
+arguments dominates) and constant ones in larger launches. Read at each launch."""
 
 metal_eager_conditionals: bool = _os.environ.get("WP_METAL_EAGER_CONDITIONALS", "0") == "1"
 """Whether :func:`warp.capture_while` and :func:`warp.capture_if` outside a graph capture on Metal record their

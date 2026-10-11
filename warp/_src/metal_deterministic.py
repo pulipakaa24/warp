@@ -1302,14 +1302,16 @@ def launch(
 
 def _single_threadgroup(hooks, dim, block_dim) -> bool:
     """Whether a forward launch of ``dim`` threads runs as one threadgroup (see wp_metal_launch_kernel)."""
-    if dim <= 0 or hooks.forward is None:
-        return False
-    max_threads = getattr(hooks, "_metal_max_threads", None)
-    if max_threads is None:
-        from warp._src.context import runtime  # noqa: PLC0415
+    from warp._src.context import metal_forward_pipeline, runtime  # noqa: PLC0415
 
-        max_threads = int(runtime.core.wp_metal_get_kernel_max_threads_per_threadgroup(hooks.forward))
-        hooks._metal_max_threads = max_threads
+    pipeline = metal_forward_pipeline(hooks, dim) if dim > 0 and hooks.forward is not None else None
+    if not pipeline:
+        return False
+    cache = hooks.__dict__.setdefault("_metal_max_threads", {})
+    max_threads = cache.get(pipeline)
+    if max_threads is None:
+        max_threads = int(runtime.core.wp_metal_get_kernel_max_threads_per_threadgroup(pipeline))
+        cache[pipeline] = max_threads
     return dim <= min(max(int(block_dim), 1), max_threads)
 
 

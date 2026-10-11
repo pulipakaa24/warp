@@ -8838,9 +8838,11 @@ def resolve_grid_stride(kernel_options: dict, default_grid_stride: builtins.bool
 # slower (MuJoCo Warp G1 at 4,096 worlds, isolated GPU time per dispatch, device / constant: fused constraint
 # gradient 176 / 60 us, collision driver 255 / 44 us; physics step 54.4 / 47.5 ms), while short kernels dispatched
 # many times gain (Newton MPM granular: 39.5 -> 34.1 ms per frame, almost all from the Gauss-Seidel color pass). The
-# "auto" policy gives device arguments only to kernels without tiles whose generated statement count (body plus the
-# user functions it calls, inlined) is at most warp.config.metal_device_args_max_cost; modules and kernels can
-# override it with the module option "metal_device_args" (True / False).
+# "auto" policy gives device arguments to kernels without tiles whose generated statement count (body plus the user
+# functions it calls, inlined) is at most warp.config.metal_device_args_max_cost; longer kernels without tiles get
+# both entry points and use the device one only in launches of at most warp.config.metal_device_args_max_threads
+# threads (small launches are dispatch-bound: one-world scenes); tile kernels keep constant arguments. Modules and
+# kernels can override the policy with the module option "metal_device_args" (True / False).
 
 _METAL_STMT_DECL = re.compile(r"\s*(const )?[\w:<>, ]+[\*&]? var_\w+;$")
 _METAL_CALL = re.compile(r"\b(\w+_\d+)\(WP_FUNC_ARG")
@@ -8878,17 +8880,21 @@ def _metal_inlined_cost(body: str, func_costs: dict) -> int:
     return _metal_statement_count(body) + sum(cost(c, 0) for c in set(_METAL_CALL.findall(body)))
 
 
-def metal_kernel_device_args(kernel, options, forward_body: str, func_costs: dict | None) -> bool:
-    """Whether a Metal kernel's entry point reads its arguments from device memory (see the comment above)."""
+def metal_kernel_device_args(kernel, options, forward_body: str, func_costs: dict | None) -> str:
+    """Where a Metal kernel's forward entry point reads its arguments (see the comment above): "device", "constant",
+    or "small" (device-memory arguments in launches of at most warp.config.metal_device_args_max_threads threads,
+    constant ones otherwise)."""
     choice = (options | kernel.options).get("metal_device_args")
     if choice is None:
         choice = warp.config.metal_device_args
     if choice != "auto":
-        return bool(choice)
+        return "device" if choice else "constant"
     adj = kernel.adj
     if any(is_tile(v.type) for v in adj.variables) or adj.get_total_required_shared() or "tile_" in forward_body:
-        return False
-    return _metal_inlined_cost(forward_body, func_costs or {}) <= int(warp.config.metal_device_args_max_cost)
+        return "constant"
+    if _metal_inlined_cost(forward_body, func_costs or {}) <= int(warp.config.metal_device_args_max_cost):
+        return "device"
+    return "small"
 
 
 def codegen_kernel(kernel, device, options, metal_func_costs=None):
@@ -9160,7 +9166,8 @@ def codegen_module(kernel, device, options):
                 backward_args_ref="_wp_bwd",
                 fixed_scratch_bwd="(device char*)nullptr",
             )
-        device_args = getattr(kernel.adj, "metal_device_args", False)
+        arg_space = getattr(kernel.adj, "metal_device_args", "constant")
+        device_args = arg_space in ("device", "small")
         template_fmt_args.update(args_space="device const" if device_args else "constant", entry_suffix="")
         # deterministic kernels whose exact accumulation targets are all float32 can finalize them in the kernel
         # when the launch is one threadgroup (Module.load reads the marker back)
@@ -9176,8 +9183,10 @@ def codegen_module(kernel, device, options):
         # compiler cannot build the device form (the compiler service fails on some kernels built that way)
         twin = template_fmt_args | {"fixed_struct_forward": "", "args_space": "constant", "entry_suffix": "_cargs"}
         if device_args:
-            # Module.load reads this marker back (fallback entry point names)
+            # Module.load reads these markers back (fallback entry point names; small-launch-only device entry)
             source = f"// wp_metal_device_args {name}\n" + source
+            if arg_space == "small":
+                source = f"// wp_metal_device_args_small {name}\n" + source
             source += forward_template.format(**twin)
         # opt-in (module option "metal_ordered_atomics"): run atomics in task order on one SIMD-group, the
         # order CUDA warps issue them in small launches (deterministic modules otherwise get deterministic lowering)

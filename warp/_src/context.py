@@ -1096,8 +1096,12 @@ class KernelHooks:
         metal_fixed_bytes: int = 0,
         metal_forward_ordered=None,
         metal_det_tg_finalize=False,
+        metal_forward_small=None,
     ):
         self.forward = forward
+        # Metal: callable returning the device-memory-argument pipeline of a kernel that uses it in small launches
+        # only (warp.config.metal_device_args_max_threads), created on first use; None otherwise
+        self.metal_forward_small = metal_forward_small
         # deterministic Metal kernel that finalizes its exact sums itself in one-threadgroup launches (phase 2)
         self.metal_det_tg_finalize = metal_det_tg_finalize
         self.backward = backward
@@ -3117,7 +3121,7 @@ class ModuleHasher:
         if warp.config.metal_device_args is True:
             ch.update(b"metal_device_args:1")
         elif warp.config.metal_device_args == "auto":
-            ch.update(bytes(f"metal_device_args:auto:{int(warp.config.metal_device_args_max_cost)}", "utf-8"))
+            ch.update(bytes(f"metal_device_args:auto-small:{int(warp.config.metal_device_args_max_cost)}", "utf-8"))
 
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output
@@ -3885,6 +3889,8 @@ class ModuleExec:
         self.metal_ordered: set[str] = set()  # kernels with an ordered entry point (deterministic atomics on Metal)
         # kernels whose forward entry points read device-memory arguments (constant twins "<entry>_cargs")
         self.metal_device_args: set[str] = set()
+        # ... of which these use the device entry point in small launches only
+        self.metal_device_args_small: set[str] = set()
         # deterministic kernels that finalize exact sums in one-threadgroup launches (wp_metal_det_tg_finalize)
         self.metal_det_tg_finalize: set[str] = set()
         self.metal_backward_error: str | None = None  # compile error that forced a forward-only build
@@ -4073,7 +4079,24 @@ class ModuleExec:
                         )
                 return handle
 
-            forward = None if unsupported else get_entry(name + "_metal_forward")
+            forward_small = None
+            if unsupported:
+                forward = None
+            elif name in self.metal_device_args_small:
+                # constant-argument entry for large launches now; the device one on the first small launch
+                forward = runtime.core.wp_metal_get_kernel(self.handle, (name + "_metal_forward_cargs").encode("utf-8"))
+                handle, entry, cache = self.handle, (name + "_metal_forward").encode("utf-8"), {}
+
+                def forward_small():
+                    pipeline = cache.get("pipeline")
+                    if pipeline is None:
+                        # the constant entry stands in when the compiler cannot build the device form
+                        pipeline = runtime.core.wp_metal_get_kernel(handle, entry) or forward
+                        cache["pipeline"] = pipeline
+                    return pipeline
+
+            else:
+                forward = get_entry(name + "_metal_forward")
             if not forward and not unsupported:
                 raise RuntimeError(
                     f"Failed to load kernel '{kernel.key}' on device '{self.device}': {runtime.get_error_string()}"
@@ -4099,6 +4122,7 @@ class ModuleExec:
                 metal_fixed_bytes=self.meta.get(warp._src.codegen.cuda_kernel_forward_name(kernel) + "_fixed_bytes", 0),
                 metal_forward_ordered=forward_ordered,
                 metal_det_tg_finalize=name in self.metal_det_tg_finalize,
+                metal_forward_small=forward_small,
             )
 
         else:
@@ -5233,6 +5257,7 @@ class Module:
                 metal_backward_unsupported = set(re.findall(r"^// wp_metal_backward_unsupported (\S+)$", source, re.M))
                 metal_ordered = set(re.findall(r"^// wp_metal_ordered (\S+)$", source, re.M))
                 metal_device_args = set(re.findall(r"^// wp_metal_device_args (\S+)$", source, re.M))
+                metal_device_args_small = set(re.findall(r"^// wp_metal_device_args_small (\S+)$", source, re.M))
                 metal_det_tg_finalize = set(re.findall(r"^// wp_metal_det_tg_finalize (\S+)$", source, re.M))
                 if backward_error is not None:
                     warp._src.logger.log_warning(
@@ -5256,6 +5281,7 @@ class Module:
                 module_exec.metal_backward_unsupported = metal_backward_unsupported
                 module_exec.metal_ordered = metal_ordered
                 module_exec.metal_device_args = metal_device_args
+                module_exec.metal_device_args_small = metal_device_args_small
                 module_exec.metal_det_tg_finalize = metal_det_tg_finalize
                 module_exec.metal_backward_error = backward_error  # set when the adjoints failed to compile
                 self.execs[(device.context, active_block_dim)] = module_exec
@@ -11484,6 +11510,13 @@ def _metal_append_det_args(args, det_args):
     return combined
 
 
+def metal_forward_pipeline(hooks, num_threads: int):
+    """The forward pipeline a Metal launch of ``num_threads`` threads uses (see KernelHooks.metal_forward_small)."""
+    if hooks.metal_forward_small is not None and num_threads <= warp.config.metal_device_args_max_threads:
+        return hooks.metal_forward_small()
+    return hooks.forward
+
+
 def invoke_metal(
     kernel,
     hooks,
@@ -11541,7 +11574,7 @@ def invoke_metal(
         offsets = (ctypes.c_size_t * len(pointer_offsets))(*pointer_offsets)
         args_type._metal_pointer_offsets = offsets
 
-    pipeline = hooks.backward if adjoint else hooks.forward
+    pipeline = hooks.backward if adjoint else metal_forward_pipeline(hooks, bounds.size)
     num_threads = bounds.size
     if not adjoint and hooks.metal_forward_ordered:
         # deterministic atomics: one SIMD-group strides over all tasks, so atomics are issued in task order

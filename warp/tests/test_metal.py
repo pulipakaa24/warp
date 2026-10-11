@@ -1196,12 +1196,16 @@ class TestMetal(unittest.TestCase):
 
     def test_device_args_auto_policy(self):
         """metal_device_args = "auto": short tile-free kernels read device-memory arguments (with a constant twin),
-        tile kernels and long kernels constant ones; the module option overrides; results are the same."""
-        saved = wp.config.metal_device_args, wp.config.metal_device_args_max_cost
+        longer tile-free kernels only in small launches, tile kernels never; the module option overrides; results
+        are the same."""
+        from warp._src.context import metal_forward_pipeline  # noqa: PLC0415
+
+        saved = wp.config.metal_device_args, wp.config.metal_device_args_max_cost, wp.config.metal_device_args_max_threads
         n = 256
         x = wp.array(np.arange(n, dtype=np.float32), device=self.device)
         try:
             results = {}
+            wp.config.metal_device_args_max_threads = 100
             for mode, max_cost, option in (("auto", 200, None), ("auto", 0, None), ("auto", 0, True), (False, 200, None),
                                            (True, 200, None), (True, 200, False)):
                 wp.config.metal_device_args, wp.config.metal_device_args_max_cost = mode, max_cost
@@ -1217,31 +1221,40 @@ class TestMetal(unittest.TestCase):
                     wp.tile_store(out, wp.tile_sum(t))
 
                 out = wp.zeros(n, dtype=float, device=self.device)
+                small = wp.zeros(n, dtype=float, device=self.device)
                 total = wp.zeros(1, dtype=float, device=self.device)
-                wp.launch(scale, n, inputs=[x, out], device=self.device)
+                wp.launch(scale, n, inputs=[x, out], device=self.device)  # above metal_device_args_max_threads
+                wp.launch(scale, 64, inputs=[x, small], device=self.device)  # at most metal_device_args_max_threads
                 wp.launch_tiled(tile_sum, dim=1, inputs=[x, total], block_dim=256, device=self.device)
                 exec_s, name_s = self._metal_source(scale)
                 exec_t, name_t = self._metal_source(tile_sum)
+                hooks = scale.module.get_kernel_hooks(scale, wp.get_device(self.device))
                 results[(mode, max_cost, option)] = (
                     name_s in exec_s.metal_device_args,
+                    name_s in exec_s.metal_device_args_small,
                     name_t in exec_t.metal_device_args,
+                    metal_forward_pipeline(hooks, 64) != metal_forward_pipeline(hooks, n),
                     out.numpy(),
+                    small.numpy(),
                     total.numpy(),
                 )
         finally:
-            wp.config.metal_device_args, wp.config.metal_device_args_max_cost = saved
-        expect = {
-            ("auto", 200, None): (True, False),
-            ("auto", 0, None): (False, False),
-            ("auto", 0, True): (True, False),
-            (False, 200, None): (False, False),
-            (True, 200, None): (True, True),
-            (True, 200, False): (False, True),
+            (wp.config.metal_device_args, wp.config.metal_device_args_max_cost,
+             wp.config.metal_device_args_max_threads) = saved
+        expect = {  # scale device, scale small launches only, tile kernel device, two pipelines
+            ("auto", 200, None): (True, False, False, False),
+            ("auto", 0, None): (True, True, False, True),
+            ("auto", 0, True): (True, False, False, False),
+            (False, 200, None): (False, False, False, False),
+            (True, 200, None): (True, False, True, False),
+            (True, 200, False): (False, False, True, False),
         }
-        for key, (dev_s, dev_t) in expect.items():
-            self.assertEqual(results[key][:2], (dev_s, dev_t), key)
-            np.testing.assert_array_equal(results[key][2], 2.0 * np.arange(n, dtype=np.float32))
-            np.testing.assert_array_equal(results[key][3], results[("auto", 200, None)][3])
+        ref = 2.0 * np.arange(n, dtype=np.float32)
+        for key, flags in expect.items():
+            self.assertEqual(results[key][:4], flags, key)
+            np.testing.assert_array_equal(results[key][4], ref)
+            np.testing.assert_array_equal(results[key][5][:64], ref[:64])
+            np.testing.assert_array_equal(results[key][6], results[("auto", 200, None)][6])
 
     def test_device_args_compile_failure_falls_back_to_constant(self):
         """A kernel whose device-argument entry point fails to build is loaded from its constant twin, with a warning."""
