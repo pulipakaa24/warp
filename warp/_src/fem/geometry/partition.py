@@ -37,6 +37,15 @@ class GeometryPartition:
         """Number of cells that are 'owned' by this partition"""
         raise NotImplementedError()
 
+    def cell_count_bound(self) -> "wp.array | None":
+        """Device-side number of partition cells in use, or ``None``.
+
+        When not ``None``, a 1-element ``int32`` array ``n`` such that the partition cells in use are the prefix
+        ``[0, n)`` of ``[0, cell_count())`` (fixed-capacity partitions); the others map to no geometry cell. Work
+        over the partition cells may then stop at ``n`` (see the ``dim_limit`` argument of :func:`warp.launch`).
+        """
+        return None
+
     def side_count(self) -> int:
         """Number of sides that are 'owned' by this partition"""
         raise NotImplementedError()
@@ -472,6 +481,7 @@ class ExplicitGeometryPartition(CellBasedGeometryPartition):
 
         self._cells: wp.array = None
         self._partition_cells: wp.array = None
+        self._cell_count_bound: wp.array | None = None
 
         self._max_cell_count = max_cell_count
         self._max_side_count = max_side_count
@@ -491,12 +501,15 @@ class ExplicitGeometryPartition(CellBasedGeometryPartition):
         """
         self.cell_arg_value.invalidate(self)
 
+        if self._max_cell_count >= 0 and self._cell_count_bound is None:
+            self._cell_count_bound = wp.empty(1, dtype=int, device=cell_mask.device)
         self._cells, self._partition_cells = masked_indices(
             cell_mask,
             local_to_global=self._cells,
             global_to_local=self._partition_cells,
             max_index_count=self._max_cell_count,
             temporary_store=temporary_store,
+            index_count=self._cell_count_bound,
         )
 
         super().compute_side_indices_from_cells(
@@ -510,6 +523,11 @@ class ExplicitGeometryPartition(CellBasedGeometryPartition):
     def cell_count(self) -> int:
         """Return the number of cells in the partition."""
         return self._cells.shape[0]
+
+    def cell_count_bound(self) -> wp.array | None:
+        """Device-side count of the partition cells in use (with ``max_cell_count``; see
+        :meth:`GeometryPartition.cell_count_bound`)."""
+        return self._cell_count_bound
 
     @wp.struct
     class CellArg:

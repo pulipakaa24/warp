@@ -174,7 +174,7 @@ struct vb_args_t {
     uint lower_size;
     uint leaf_off_table;
     uint leaf_size;
-    uint pad;
+    uint zero_bounded;            // vb_zero: only the node ranges the previous or this build use (see vb_finalize_counts)
 };
 
 inline uint vb_rd32(device const uint* g, ulong off) { return g[off >> 2]; }
@@ -352,8 +352,10 @@ kernel void vb_sort_scatter_keys(
     const bool second = plan[3] != 3;
     device ulong* keys_out2 = (device ulong*)a.keys[second ? plan[3] : plan[2]];
     const ulong mask = (1ul << a.bits) - 1ul;
+    const uint n = sort_count(a);
+    const uint num_tiles = sort_tiles(n);
 
-    for (uint tile = tg; tile < a.num_tiles; tile += ntg) {
+    for (uint tile = tg; tile < num_tiles; tile += ntg) {
     for (uint i = lid; i < NSG * 256; i += TG)
         hist[i] = 0;
     offset[lid] = digit_start + a.tile_hist[lid * a.num_tiles + tile];
@@ -366,7 +368,7 @@ kernel void vb_sort_scatter_keys(
     uchar dig[SORT_KPT];
     for (uint j = 0; j < SORT_KPT; ++j) {
         uint idx = base + j * 32u;
-        bool valid = idx < a.n;
+        bool valid = idx < n;
         key[j] = valid ? keys[idx] : 0ul;
         uint d = valid ? uint((key[j] >> a.shift) & mask) : 0u;
         uint m = match_digit(d, a.bits, valid);
@@ -393,7 +395,7 @@ kernel void vb_sort_scatter_keys(
 
     for (uint j = 0; j < SORT_KPT; ++j) {
         uint idx = base + j * 32u;
-        if (idx < a.n) {
+        if (idx < n) {
             uint pos = row[dig[j]] + rank[j];
             keys_out[pos] = key[j];
             if (second)
@@ -501,6 +503,14 @@ kernel void vb_finalize_counts(
     c[5] = status;
     if (a.status)
         *a.status = status;
+    if (a.zero_bounded && c[4]) {
+        // node counts of the grid as it stands (previous build) and of this build: every node slot past both is
+        // still zero, so vb_zero leaves it alone
+        device const uint* g = a.grid;
+        c[6] = min(max(vb_rd32(g, VB_TREE + 32), c[0]), a.cap_leaf);
+        c[7] = min(max(vb_rd32(g, VB_TREE + 36), c[1]), a.cap_lower);
+        c[8] = min(max(vb_rd32(g, VB_TREE + 40), c[2]), a.cap_upper);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -515,10 +525,34 @@ kernel void vb_zero(
     if (!a.counts[4])
         return;
     device uint4* g = (device uint4*)a.grid;
-    const ulong n = a.grid_size >> 4;
-    for (ulong j = i; j < n; j += grid)
-        g[j] = uint4(0u);
-    for (uint j = i; j < a.cap_leaf; j += grid)
+    if (!a.zero_bounded) {
+        const ulong n = a.grid_size >> 4;
+        for (ulong j = i; j < n; j += grid)
+            g[j] = uint4(0u);
+        for (uint j = i; j < a.cap_leaf; j += grid)
+            a.leaf_counts[j] = 0;
+        return;
+    }
+    // header, tree and root with the root tiles in use, then the upper, lower and leaf nodes in use (16-byte words)
+    const uint nl = a.counts[6], nlo = a.counts[7], nu = a.counts[8];
+    const ulong r0 = (VB_ROOT + a.root_size + ulong(a.root_tile_size) * nu + 15) >> 4;
+    const ulong u0 = a.off_upper >> 4, u1 = (a.off_upper + ulong(a.upper_size) * nu + 15) >> 4;
+    const ulong l0 = a.off_lower >> 4, l1 = (a.off_lower + ulong(a.lower_size) * nlo + 15) >> 4;
+    const ulong f0 = a.off_leaf >> 4, f1 = (a.off_leaf + ulong(a.leaf_size) * nl + 15) >> 4;
+    const ulong n = r0 + (u1 - u0) + (l1 - l0) + (f1 - f0);
+    for (ulong j = i; j < n; j += grid) {
+        ulong w = j;
+        if (w >= r0) {
+            w = w - r0 + u0;
+            if (w >= u1) {
+                w = w - u1 + l0;
+                if (w >= l1)
+                    w = w - l1 + f0;
+            }
+        }
+        g[w] = uint4(0u);
+    }
+    for (uint j = i; j < nl; j += grid)
         a.leaf_counts[j] = 0;
 }
 
@@ -1240,7 +1274,7 @@ class _VbArgs(ctypes.Structure):
         ("lower_size", ctypes.c_uint32),
         ("leaf_off_table", ctypes.c_uint32),
         ("leaf_size", ctypes.c_uint32),
-        ("pad", ctypes.c_uint32),
+        ("zero_bounded", ctypes.c_uint32),
     ]
 
 
@@ -1380,8 +1414,11 @@ def _fill_constants(args, grid_type):
     ) = c
 
 
-def _sort_keys(state, b0, b1, b2, count, hist, misc):
-    """Keys-only radix sort of ``count`` 64-bit keys at ``b0`` (result in ``b0``; ``b1`` / ``b2`` scratch)."""
+def _sort_keys(state, b0, b1, b2, count, hist, misc, count_limit=None):
+    """Keys-only radix sort of ``count`` 64-bit keys at ``b0`` (result in ``b0``; ``b1`` / ``b2`` scratch).
+
+    With ``count_limit`` (device ``int32``), only the first ``min(count_limit[0], count)`` keys are sorted; the keys
+    past it must be the invalid (largest) key, which then stays in place as in the full sort."""
     num_tiles = (count + _SORT_TILE - 1) // _SORT_TILE
     passes = [(s, 8) for s in range(0, 64, 8)]
     args = _prim._SortArgs()
@@ -1393,6 +1430,9 @@ def _sort_keys(state, b0, b1, b2, count, hist, misc):
     args.num_passes, args.m = len(passes), len(passes) - 1
     for i, (shift, bits) in enumerate(passes):
         args.shifts[i], args.widths[i] = shift, bits
+    if count_limit is not None:
+        args.n_dev = count_limit.ptr
+        args.key_words, args.value_words = 2, 0
 
     grid = min(num_tiles, _SORT_GRID)
     state.launch("sort_diff_clear", 0, args, _SORT_PTR_OFFSETS, threads=2)
@@ -1461,7 +1501,7 @@ class _Build:
             base += size
 
 
-def _count(state, build, points_ptr, world, mask_ptr, header_ptr, active_voxels):
+def _count(state, build, points_ptr, world, mask_ptr, header_ptr, active_voxels, count_limit=None):
     """Sorted unique keys of every level and their counts (``counts[0..3]``) on the GPU."""
     p = build.ptr
     n = build.n
@@ -1473,11 +1513,11 @@ def _count(state, build, points_ptr, world, mask_ptr, header_ptr, active_voxels)
 
     groups = _groups(n)
     state.launch("vb_emit_upper_keys", groups, args, _VB_PTR_OFFSETS)
-    _sort_keys(state, p["k0"], p["k1"], p["k2"], n, p["hist"], p["misc"])
+    _sort_keys(state, p["k0"], p["k1"], p["k2"], n, p["hist"], p["misc"], count_limit)
     _unique(state, args, [(0, _SLOT_UPPER)], p["tile_sums"])
 
     state.launch("vb_emit_hierarchy_keys", groups, args, _VB_PTR_OFFSETS)
-    _sort_keys(state, p["k0"], p["k1"], p["k2"], n, p["hist"], p["misc"])
+    _sort_keys(state, p["k0"], p["k1"], p["k2"], n, p["hist"], p["misc"], count_limit)
     outputs = [(9, _SLOT_LEAF), (21, _SLOT_LOWER)]
     if active_voxels:
         outputs.append((0, _SLOT_VOXEL))
@@ -1485,7 +1525,20 @@ def _count(state, build, points_ptr, world, mask_ptr, header_ptr, active_voxels)
     return args
 
 
-def _populate(state, build, args, grid_ptr, layout, grid_type, caps, status_ptr, check_capacity, bg_words, value_size):
+def _populate(
+    state,
+    build,
+    args,
+    grid_ptr,
+    layout,
+    grid_type,
+    caps,
+    status_ptr,
+    check_capacity,
+    bg_words,
+    value_size,
+    zero_bounded=False,
+):
     """Capacity status, then the grid (skipped on the GPU when the counts exceed the capacities)."""
     p = build.ptr
     cap_leaf, cap_lower, cap_upper, cap_voxel = caps
@@ -1497,6 +1550,7 @@ def _populate(state, build, args, grid_ptr, layout, grid_type, caps, status_ptr,
     args.cap_voxel = cap_voxel
     args.cap_leaf, args.cap_lower, args.cap_upper = cap_leaf, cap_lower, cap_upper
     args.check_capacity = int(check_capacity)
+    args.zero_bounded = int(zero_bounded)
     args.grid_type = grid_type
     args.value_size = value_size
     if bg_words is not None:
@@ -1654,8 +1708,12 @@ def rebuild(
     status,
     value_type=None,
     cvalue=None,
+    count_limit=None,
 ):
     """In-place rebuild of a rebuildable volume on the GPU (no host synchronization).
+
+    ``count_limit``: optional 1-element ``int32`` device array; every point at or past ``count_limit[0]`` must be
+    masked out (their keys are the invalid key, sorted last), and the key sorts then stop there.
 
     The status word is written by a kernel; the grid is left untouched when the counts exceed the capacities.
     """
@@ -1711,6 +1769,7 @@ def rebuild(
         point_mask.ptr if point_mask is not None else 0,
         header.ptr,
         active_voxels,
+        count_limit=count_limit,
     )
     bg_words, value_size = _bg_words(cvalue, value_size)
     _populate(
@@ -1725,7 +1784,11 @@ def rebuild(
         True,
         bg_words,
         value_size,
+        # after one full zeroing by this builder, every grid byte past the node counts in the tree header is zero:
+        # later rebuilds zero only up to the larger of the previous and the new counts (same bytes)
+        zero_bounded=bool(getattr(volume, "_metal_gpu_zeroed", False)) and wp.config.metal_bounded_launch,
     )
+    volume._metal_gpu_zeroed = True
 
 
 # ---------------------------------------------------------------------------------------------------------------

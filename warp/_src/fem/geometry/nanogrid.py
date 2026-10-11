@@ -604,7 +604,7 @@ class Nanogrid(NanogridBase):
             transform: Linear transform between packed index and world spaces.
             temporary_store: Shared pool from which to allocate temporary arrays.
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``).
-            device: CUDA device on which to build the packed volume.
+            device: CUDA or Metal device on which to build the packed volume.
             rebuildable: Whether to allocate persistent capacity for rebuilds.
             max_active_voxels: Maximum number of active voxels for rebuilds. Defaults to the packed cell count.
             max_leaf_nodes: Maximum number of NanoVDB leaf nodes for rebuilds. Defaults to ``max_active_voxels``.
@@ -719,6 +719,7 @@ class Nanogrid(NanogridBase):
         self._rebuildable = rebuildable
         self._node_candidates = node_candidates
         self._node_candidate_mask = node_candidate_mask
+        self._node_candidate_limit = None
 
         self._edge_count = 0
         self._edge_grid = None
@@ -1114,7 +1115,24 @@ class Nanogrid(NanogridBase):
         _fill_rebuildable_node_candidates(
             self._cell_grid, self._cell_ijk, self._node_candidates, self._node_candidate_mask
         )
-        self._node_grid.rebuild(self._node_candidates.flatten(), point_mask=self._node_candidate_mask)
+        # the candidates of cells past the cell grid's voxel count are masked out: on Metal the node grid's key sorts
+        # stop at 8 x voxel count (read on the GPU)
+        node_count_limit = None
+        if self._node_candidates.device.is_metal and wp.config.metal_bounded_launch:
+            if self._node_candidate_limit is None:
+                self._node_candidate_limit = wp.empty(1, dtype=int, device=self._node_candidates.device)
+            node_count_limit = self._node_candidate_limit
+            wp.launch(
+                _scaled_volume_voxel_count,
+                dim=1,
+                inputs=[self._cell_grid.id, 8, node_count_limit],
+                device=self._node_candidates.device,
+            )
+        self._node_grid.rebuild(
+            self._node_candidates.flatten(),
+            point_mask=self._node_candidate_mask,
+            _point_count_limit=node_count_limit,
+        )
         self._node_grid.get_voxels(out=self._node_ijk)
 
         if self._edge_grid is not None:
@@ -1212,8 +1230,11 @@ def _normalize_environment_voxels(points: wp.array, point_envs: wp.array, env_co
     else:
         device = wp.get_device(device)
 
-    if not device.is_cuda:
-        raise RuntimeError("NanoVDB environment volumes can only be built on CUDA devices")
+    # The packing kernels are plain Warp kernels; the packed volume is built by Volume.allocate_by_voxels / rebuild,
+    # which run on the GPU on CUDA and Metal (NanoVDB GPU builder) but have no CPU implementation of point masks and
+    # rebuild capacities.
+    if not (device.is_cuda or device.is_metal):
+        raise RuntimeError("NanoVDB environment volumes can only be built on CUDA or Metal devices")
 
     points = _nanogrid_rebuild_points_array(points, device)
     point_envs = _nanogrid_optional_int_array(point_envs, points.shape[0], device, "point_envs")
@@ -1735,6 +1756,11 @@ def _rebuildable_cell_node_indices(
     cell, n = wp.tid()
     node_ijk[cell, n] = cell_ijk[cell] + wp.vec3i((n & 4) >> 2, (n & 2) >> 1, n & 1)
     node_mask[cell * 8 + n] = wp.where(cell < wp.volume_voxel_count(cell_grid), wp.int32(1), wp.int32(0))
+
+
+@wp.kernel
+def _scaled_volume_voxel_count(volume: wp.uint64, factor: int, out: wp.array(dtype=int)):
+    out[0] = int(wp.volume_voxel_count(volume)) * factor
 
 
 @wp.kernel

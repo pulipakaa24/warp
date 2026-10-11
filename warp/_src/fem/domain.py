@@ -63,6 +63,13 @@ class GeometryDomain(Domain):
         """Number of elements in the domain"""
         raise NotImplementedError
 
+    def element_count_bound(self) -> wp.array | None:
+        """Device-side number of domain elements in use (a prefix of ``[0, element_count())``), or ``None``.
+
+        See :meth:`GeometryPartition.cell_count_bound`.
+        """
+        return None
+
     def geometry_element_count(self) -> int:
         """Number of elements in the underlying geometry"""
         return self.geometry.cell_count()
@@ -174,6 +181,10 @@ class Cells(GeometryDomain):
     def element_count(self) -> int:
         """Number of elements in the domain."""
         return self.geometry_partition.cell_count()
+
+    def element_count_bound(self) -> wp.array | None:
+        """Device-side number of domain cells in use, see :meth:`GeometryPartition.cell_count_bound`."""
+        return self.geometry_partition.cell_count_bound()
 
     def geometry_element_count(self) -> int:
         """Number of elements in the underlying geometry."""

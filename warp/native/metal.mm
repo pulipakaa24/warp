@@ -99,6 +99,12 @@ struct Graph {
         size_t threadgroup_bytes;
         size_t bounds_offset, bounds_size;  // bounds_size 0: memory kernel (arguments only)
         size_t args_offset, args_size;
+        // Bounded dispatch (wp_metal_launch_kernel_bounded): the wp_bounded_prep arguments and the
+        // MTLDispatchThreadgroupsIndirectArguments it writes, both in the graph buffer; SIZE_MAX otherwise.
+        // Replayed outside the indirect command buffer (which has no indirect dispatch): prep, then
+        // dispatchThreadgroupsWithIndirectBuffer.
+        size_t prep_offset = SIZE_MAX;
+        size_t indirect_offset = 0;
     };
     struct HostOp {
         size_t before_dispatch;  // runs once the dispatches before this index have completed
@@ -126,6 +132,14 @@ struct Graph {
         void* range_host;
         id<MTLBuffer> buffer;  // resolved at begin: the allocation may be freed (and retained by the graph) later
         size_t offset;
+        // A segment holding bounded dispatches is replayed in pieces: wp_segment_gate first copies whether the
+        // range is open into a snapshot word and writes one {location, length or 0} execution range per run of
+        // plain dispatches, which then execute through executeCommandsInBuffer:indirectBuffer:; the bounded
+        // dispatches' preps read the snapshot. All of it lives in the graph buffer (SIZE_MAX: not split).
+        size_t snapshot_offset = SIZE_MAX;
+        size_t gate_args_offset = SIZE_MAX;
+        size_t ranges_offset = 0;  // 16 bytes per run
+        std::vector<std::pair<size_t, size_t>> runs;  // plain runs (start, count), in order
     };
     std::vector<Segment> segments;
     bool segment_open = false;
@@ -186,6 +200,8 @@ struct Device {
     id<MTLLogState> log_state;  // shader logging (printf) delivered to stdout
     std::string kernel_assertion;  // first error-level kernel log since the last report (see retire_completed)
     id<MTLComputePipelineState> memcpy_kernel;
+    id<MTLComputePipelineState> bounded_prep_kernel;  // threadgroup count of a bounded dispatch from a device count
+    id<MTLComputePipelineState> segment_gate_kernel;  // per-run execution ranges of a split indirect range
 
     id<MTLCommandBuffer> command_buffer;  // open command buffer, if any
     // Buffers are untracked (kernels use raw GPU addresses), so consecutive command buffers would
@@ -752,6 +768,40 @@ kernel void wp_memcpy(constant memcpy_args_t& a [[buffer(0)]], uint i [[thread_p
         for (unsigned long j = begin; j < end; ++j) a.dst[j] = a.src[j];
     }
 }
+// Bounded dispatches (wp_metal_launch_kernel_bounded): the threadgroup count of the dispatch that follows, from
+// the device count: ceil(min(ceil(max(count, 0) / divisor), limit) * inner / group), or 0 when the gate word is 0.
+struct bounded_prep_args_t {
+    device const int* count; device const unsigned int* gate; device unsigned int* out;
+    unsigned int limit; unsigned int inner; unsigned int group; unsigned int divisor;
+};
+kernel void wp_bounded_prep(constant bounded_prep_args_t& a [[buffer(0)]], uint i [[thread_position_in_grid]])
+{
+    if (i != 0) return;
+    int c = *a.count;
+    unsigned long lead = c <= 0 ? 0ul : ((unsigned long)c + a.divisor - 1) / a.divisor;
+    unsigned long n = metal::min(lead, (unsigned long)a.limit);
+    if (a.gate && *a.gate == 0u) n = 0ul;
+    unsigned long threads = n * (unsigned long)a.inner;
+    a.out[0] = (unsigned int)((threads + a.group - 1) / a.group);
+    a.out[1] = 1u;
+    a.out[2] = 1u;
+}
+// Split indirect execution range: snapshot whether the range is open (its length word non-zero), then one
+// execution range {location, length} per run of plain dispatches, length 0 when the range is closed.
+struct segment_gate_args_t {
+    device const unsigned int* range; device unsigned int* snapshot; device const unsigned int* runs;
+    device unsigned int* ranges; unsigned int num_runs; unsigned int pad;
+};
+kernel void wp_segment_gate(constant segment_gate_args_t& a [[buffer(0)]], uint i [[thread_position_in_grid]])
+{
+    if (i != 0) return;
+    unsigned int open = a.range[1] != 0u ? 1u : 0u;
+    a.snapshot[0] = open;
+    for (unsigned int k = 0; k < a.num_runs; ++k) {
+        a.ranges[4 * k] = a.runs[2 * k];
+        a.ranges[4 * k + 1] = open ? a.runs[2 * k + 1] : 0u;
+    }
+}
 // Checks the assumption behind the shared-tile arena (tile.h): the threadgroup buffer bound at
 // index 0 starts at threadgroup address 0. Writes through the constant address, reads through
 // the bound pointer.
@@ -787,8 +837,11 @@ bool load_memory_kernels(Device& dev)
     dev.memset_kernel = pipeline(@"wp_memset");
     dev.memtile_kernel = pipeline(@"wp_memtile");
     dev.memcpy_kernel = pipeline(@"wp_memcpy");
+    dev.bounded_prep_kernel = pipeline(@"wp_bounded_prep");
+    dev.segment_gate_kernel = pipeline(@"wp_segment_gate");
     id<MTLComputePipelineState> check = pipeline(@"wp_check_arena");
-    if (!dev.memset_kernel || !dev.memtile_kernel || !dev.memcpy_kernel || !check) {
+    if (!dev.memset_kernel || !dev.memtile_kernel || !dev.memcpy_kernel || !dev.bounded_prep_kernel
+        || !dev.segment_gate_kernel || !check) {
         wp::set_error_string("Failed to create Metal memory kernel pipelines: %s", error_description(error));
         dev.memcpy_kernel = nil;
         return false;
@@ -1237,6 +1290,189 @@ int wp_metal_launch_kernel(
     }
 }
 
+namespace {
+
+// A buffer binding: setBytes when bytes is set, setBuffer otherwise.
+struct Binding {
+    id<MTLBuffer> buffer;
+    size_t offset;
+    const void* bytes;
+    size_t size;
+};
+
+void bind(id<MTLComputeCommandEncoder> encoder, const Binding& b, NSUInteger index)
+{
+    if (b.bytes)
+        [encoder setBytes:b.bytes length:b.size atIndex:index];
+    else
+        [encoder setBuffer:b.buffer offset:b.offset atIndex:index];
+}
+
+// wp_bounded_prep (one thread) writes the threadgroup count of the kernel dispatch that follows it into
+// indirect + indirect_offset; the kernel then runs only the threadgroups that hold tasks below the device count.
+// Thread-to-task mapping, threadgroup size and threadgroup memory are those of the full launch.
+bool encode_bounded(
+    Device& dev,
+    id<MTLComputePipelineState> pipeline,
+    size_t group_size,
+    size_t threadgroup_bytes,
+    const Binding& prep,
+    const Binding& bounds,
+    const Binding& args,
+    id<MTLBuffer> indirect,
+    size_t indirect_offset
+)
+{
+    id<MTLComputeCommandEncoder> encoder = get_encoder(dev);
+    [encoder setComputePipelineState:dev.bounded_prep_kernel];
+    bind(encoder, prep, 0);
+    [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    ++dev.n_dispatch;
+    if (profiler().enabled && !profile_dispatch(dev, "wp_bounded_prep"))
+        return false;
+    encoder = get_encoder(dev);
+    [encoder setComputePipelineState:pipeline];
+    bind(encoder, bounds, 0);
+    bind(encoder, args, 1);
+    if (threadgroup_bytes > 0)
+        [encoder setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    [encoder dispatchThreadgroupsWithIndirectBuffer:indirect
+                               indirectBufferOffset:indirect_offset
+                              threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
+    ++dev.n_dispatch;
+    if (profiler().enabled)
+        return profile_dispatch(dev, pipeline.label.UTF8String);
+    return true;
+}
+
+struct BoundedPrepArgs {
+    uint64_t count, gate, out;
+    uint32_t limit, inner, group, divisor;
+};
+
+}  // anonymous namespace
+
+int wp_metal_launch_kernel_bounded(
+    int ordinal,
+    void* kernel,
+    size_t num_threads,
+    int threads_per_threadgroup,
+    const void* bounds,
+    size_t bounds_size,
+    const void* args,
+    size_t args_size,
+    const size_t* pointer_offsets,
+    int num_pointer_offsets,
+    size_t threadgroup_memory_bytes,
+    const void* count,
+    size_t limit,
+    size_t inner,
+    size_t divisor
+)
+{
+    WP_METAL_LOCK();
+    @autoreleasepool {
+        Device* dev = get_device(ordinal);
+        if (!dev || !load_memory_kernels(*dev))
+            return -1;
+        if (!kernel || bounds_size == 0) {
+            wp::set_error_string("Invalid Metal kernel handle");
+            return -1;
+        }
+        if (num_threads == 0)
+            return 0;
+        if (limit == 0 || inner == 0 || divisor == 0 || limit * inner != num_threads || limit > UINT32_MAX
+            || inner > UINT32_MAX || divisor > UINT32_MAX) {
+            wp::set_error_string("Invalid bounded launch shape: %zu threads, leading dimension %zu x %zu", num_threads,
+                                 limit, inner);
+            return -1;
+        }
+        const uint64_t count_gpu = find_gpu_address(*dev, uint64_t(count));
+        if (!count_gpu || (uint64_t(count) & 3)) {
+            wp::set_error_string("The launch bound (dim_limit) must be an int32 array allocated on this Metal device");
+            return -1;
+        }
+
+        id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)kernel;
+        size_t max_threads = pipeline.maxTotalThreadsPerThreadgroup;
+        size_t group_size = std::min(std::max(size_t(threads_per_threadgroup), size_t(1)), max_threads);
+        threadgroup_memory_bytes += align_up(group_size * sizeof(unsigned int), kThreadgroupMemoryAlignment);
+        threadgroup_memory_bytes = align_up(threadgroup_memory_bytes, kThreadgroupMemoryAlignment);
+        if (threadgroup_memory_bytes > dev->device.maxThreadgroupMemoryLength) {
+            wp::set_error_string(
+                "Kernel requests %zu bytes of threadgroup memory but device \"%s\" supports at most %zu bytes",
+                threadgroup_memory_bytes, dev->name.c_str(), size_t(dev->device.maxThreadgroupMemoryLength)
+            );
+            return -1;
+        }
+        BoundedPrepArgs prep = {
+            count_gpu, 0, 0, uint32_t(limit), uint32_t(inner), uint32_t(group_size), uint32_t(divisor)
+        };
+        static const uint32_t zeros[4] = { 0, 0, 0, 0 };
+
+        if (dev->capture) {
+            std::vector<char> translated(static_cast<const char*>(args), static_cast<const char*>(args) + args_size);
+            for (int i = 0; i < num_pointer_offsets; ++i) {
+                if (!translate_pointer(*dev, translated.data(), args_size, pointer_offsets[i]))
+                    return -1;
+            }
+            Graph& graph = *dev->capture;
+            graph_record(
+                graph, pipeline, num_threads, group_size, threadgroup_memory_bytes, bounds, bounds_size,
+                translated.data(), args_size
+            );
+            const size_t indirect_offset = graph_append(graph, zeros, sizeof(zeros));
+            size_t snapshot_offset = SIZE_MAX;
+            if (graph.segment_open) {
+                // inside an indirect execution range: the prep reads the range's open/closed snapshot
+                Graph::Segment& seg = graph.segments.back();
+                if (seg.snapshot_offset == SIZE_MAX) {
+                    static const uint32_t open[4] = { 1, 0, 0, 0 };  // replays without the ICB path never gate
+                    seg.snapshot_offset = graph_append(graph, open, sizeof(open));
+                }
+                snapshot_offset = seg.snapshot_offset;
+            }
+            const size_t prep_offset = graph_append(graph, &prep, sizeof(prep));
+            graph.fixups.emplace_back(prep_offset + offsetof(BoundedPrepArgs, out), indirect_offset);
+            if (snapshot_offset != SIZE_MAX)
+                graph.fixups.emplace_back(prep_offset + offsetof(BoundedPrepArgs, gate), snapshot_offset);
+            Graph::Dispatch& d = graph.dispatches.back();
+            d.prep_offset = prep_offset;
+            d.indirect_offset = indirect_offset;
+            return 0;
+        }
+
+        size_t args_offset = stage_args(*dev, args, args_size);
+        if (args_offset == SIZE_MAX)
+            return -1;
+        char* staged_args = static_cast<char*>(dev->args_ring.contents) + args_offset;
+        for (int i = 0; i < num_pointer_offsets; ++i) {
+            if (!translate_pointer(*dev, staged_args, args_size, pointer_offsets[i]))
+                return -1;
+        }
+        const size_t indirect_offset = stage_args(*dev, zeros, sizeof(zeros));
+        if (indirect_offset == SIZE_MAX)
+            return -1;
+        prep.out = dev->args_ring.gpuAddress + indirect_offset;
+
+        if (profiler().enabled && !flush(*dev))
+            return -1;
+        refresh_table(*dev);
+        if (!encode_bounded(
+                *dev, pipeline, group_size, threadgroup_memory_bytes, Binding{ nil, 0, &prep, sizeof(prep) },
+                Binding{ nil, 0, bounds, bounds_size }, Binding{ dev->args_ring, args_offset, nullptr, 0 },
+                dev->args_ring, indirect_offset
+            ))
+            return -1;
+        if (profiler().enabled)
+            return 0;
+        dev->num_dispatches += 2;
+        if (dev->num_dispatches >= max_dispatches_per_command_buffer() && !flush(*dev))
+            return -1;
+        return 0;
+    }
+}
+
 int wp_metal_capture_begin(int ordinal)
 {
     WP_METAL_LOCK();
@@ -1468,8 +1704,14 @@ static int graph_launch(Device& device, Graph* graph)
             // Replayed in chunks so each command buffer carries at most WP_METAL_BATCH dispatches (the
             // same bound as eager launches); command buffers on one queue execute in order.
             const size_t count = graph->dispatches.size();
-            const int batch = icb_batch() > 0 ? icb_batch() : int(std::max(count, size_t(1)) + dev->num_dispatches);
-            size_t offset = 0;
+            // bounded dispatches run outside the ICB as a prep and a kernel dispatch; split ranges add a gate
+            size_t direct = 0;
+            for (const Graph::Dispatch& d : graph->dispatches)
+                direct += d.prep_offset != SIZE_MAX ? 1 : 0;
+            for (const Graph::Segment& seg : graph->segments)
+                direct += seg.gate_args_offset != SIZE_MAX ? 1 : 0;
+            const int batch = icb_batch() > 0 ? icb_batch()
+                                              : int(std::max(count + direct, size_t(1)) + dev->num_dispatches);
             auto room = [&]() -> int {
                 for (;;) {
                     int r = batch - dev->num_dispatches;
@@ -1479,7 +1721,7 @@ static int graph_launch(Device& device, Graph* graph)
                         return -1;
                 }
             };
-            auto exec_plain = [&](size_t end) -> bool {
+            auto exec_plain = [&](size_t offset, size_t end) -> bool {
                 while (offset < end) {
                     int r = room();
                     if (r < 0)
@@ -1496,24 +1738,88 @@ static int graph_launch(Device& device, Graph* graph)
                 }
                 return true;
             };
+            auto exec_bounded = [&](size_t i) -> bool {
+                if (room() < 0)
+                    return false;
+                const Graph::Dispatch& d = graph->dispatches[i];
+                if (!encode_bounded(
+                        *dev, d.pipeline, d.group_size, d.threadgroup_bytes,
+                        Binding{ graph->buffer, d.prep_offset, nullptr, 0 },
+                        Binding{ graph->buffer, d.bounds_offset, nullptr, 0 },
+                        Binding{ graph->buffer, d.args_offset, nullptr, 0 }, graph->buffer, d.indirect_offset
+                    ))
+                    return false;
+                dev->num_dispatches += 2;
+                return dev->num_dispatches < batch || flush(*dev);
+            };
+            // dispatches [begin, end) outside any indirect range: ICB runs between the bounded dispatches
+            auto exec_ungated = [&](size_t begin, size_t end) -> bool {
+                size_t run = begin;
+                for (size_t i = begin; i < end; ++i) {
+                    if (graph->dispatches[i].prep_offset == SIZE_MAX)
+                        continue;
+                    if (!exec_plain(run, i) || !exec_bounded(i))
+                        return false;
+                    run = i + 1;
+                }
+                return exec_plain(run, end);
+            };
+            size_t offset = 0;
             for (const Graph::Segment& seg : graph->segments) {
-                if (!exec_plain(seg.start))
+                if (!exec_ungated(offset, seg.start))
                     return -1;
                 if (room() < 0)
                     return -1;
-                // the range is read by the GPU when this command executes, after the preceding commands of the
-                // (serial) encoder and of the queue completed: a kernel among them may have zeroed the length
-                id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
-                [encoder useResource:graph->buffer usage:MTLResourceUsageRead];
-                [encoder useResource:seg.buffer usage:MTLResourceUsageRead];
-                [encoder executeCommandsInBuffer:graph->icb indirectBuffer:seg.buffer indirectBufferOffset:seg.offset];
-                dev->n_dispatch += seg.count;
-                dev->num_dispatches += int(seg.count);
                 offset = seg.start + seg.count;
-                if (dev->num_dispatches >= batch && !flush(*dev))
-                    return -1;
+                if (seg.gate_args_offset == SIZE_MAX) {
+                    // the range is read by the GPU when this command executes, after the preceding commands of
+                    // the (serial) encoder and of the queue completed: a kernel among them may have zeroed the
+                    // length
+                    id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
+                    [encoder useResource:graph->buffer usage:MTLResourceUsageRead];
+                    [encoder useResource:seg.buffer usage:MTLResourceUsageRead];
+                    [encoder executeCommandsInBuffer:graph->icb
+                                      indirectBuffer:seg.buffer
+                                indirectBufferOffset:seg.offset];
+                    dev->n_dispatch += seg.count;
+                    dev->num_dispatches += int(seg.count);
+                    if (dev->num_dispatches >= batch && !flush(*dev))
+                        return -1;
+                    continue;
+                }
+                // split range: the gate reads the range once (as the single indirect execution would), then the
+                // runs execute through their own execution ranges and the bounded dispatches read the snapshot
+                id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
+                [encoder setComputePipelineState:dev->segment_gate_kernel];
+                [encoder setBuffer:graph->buffer offset:seg.gate_args_offset atIndex:0];
+                [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                ++dev->n_dispatch;
+                ++dev->num_dispatches;
+                size_t k = 0;
+                for (size_t i = seg.start; i < seg.start + seg.count;) {
+                    if (graph->dispatches[i].prep_offset != SIZE_MAX) {
+                        if (!exec_bounded(i))
+                            return -1;
+                        ++i;
+                        continue;
+                    }
+                    const auto& run = seg.runs[k];
+                    if (room() < 0)
+                        return -1;
+                    encoder = get_encoder(*dev);
+                    [encoder useResource:graph->buffer usage:MTLResourceUsageRead];
+                    [encoder executeCommandsInBuffer:graph->icb
+                                      indirectBuffer:graph->buffer
+                                indirectBufferOffset:seg.ranges_offset + 16 * k];
+                    dev->n_dispatch += run.second;
+                    dev->num_dispatches += int(run.second);
+                    if (dev->num_dispatches >= batch && !flush(*dev))
+                        return -1;
+                    i = run.first + run.second;
+                    ++k;
+                }
             }
-            if (!exec_plain(count))
+            if (!exec_ungated(offset, count))
                 return -1;
             return 0;
         }
@@ -1536,6 +1842,19 @@ static int graph_launch(Device& device, Graph* graph)
             if (!run_host_ops(i))
                 return -1;
             const Graph::Dispatch& d = graph->dispatches[i];
+            if (d.prep_offset != SIZE_MAX) {
+                if (!encode_bounded(
+                        *dev, d.pipeline, d.group_size, d.threadgroup_bytes,
+                        Binding{ graph->buffer, d.prep_offset, nullptr, 0 },
+                        Binding{ graph->buffer, d.bounds_offset, nullptr, 0 },
+                        Binding{ graph->buffer, d.args_offset, nullptr, 0 }, graph->buffer, d.indirect_offset
+                    ))
+                    return -1;
+                dev->num_dispatches += 2;
+                if (dev->num_dispatches >= max_dispatches_per_command_buffer() && !flush(*dev))
+                    return -1;
+                continue;
+            }
             id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
             [encoder setComputePipelineState:d.pipeline];
             if (d.bounds_size) {
@@ -1620,6 +1939,36 @@ int wp_metal_capture_range_end(int ordinal)
     range[1] = uint32_t(seg.count);
     range[2] = uint32_t(seg.count);
     range[3] = 0;
+    if (seg.snapshot_offset != SIZE_MAX) {
+        // bounded dispatches inside: split into runs of plain dispatches, each with its own execution range
+        const size_t end = seg.start + seg.count;
+        size_t run = seg.start;
+        for (size_t i = seg.start; i < end; ++i) {
+            if (graph->dispatches[i].prep_offset != SIZE_MAX) {
+                if (i > run)
+                    seg.runs.emplace_back(run, i - run);
+                run = i + 1;
+            }
+        }
+        if (end > run)
+            seg.runs.emplace_back(run, end - run);
+        std::vector<uint32_t> table;
+        for (const auto& r : seg.runs) {
+            table.push_back(uint32_t(r.first));
+            table.push_back(uint32_t(r.second));
+        }
+        const size_t runs_offset = graph_append(*graph, table.data(), table.size() * sizeof(uint32_t));
+        std::vector<uint32_t> ranges(4 * seg.runs.size(), 0);
+        seg.ranges_offset = graph_append(*graph, ranges.data(), ranges.size() * sizeof(uint32_t));
+        struct {
+            uint64_t range, snapshot, runs, ranges;
+            uint32_t num_runs, pad;
+        } gate = { seg.buffer.gpuAddress + seg.offset, 0, 0, 0, uint32_t(seg.runs.size()), 0 };
+        seg.gate_args_offset = graph_append(*graph, &gate, sizeof(gate));
+        graph->fixups.emplace_back(seg.gate_args_offset + offsetof(decltype(gate), snapshot), seg.snapshot_offset);
+        graph->fixups.emplace_back(seg.gate_args_offset + offsetof(decltype(gate), runs), runs_offset);
+        graph->fixups.emplace_back(seg.gate_args_offset + offsetof(decltype(gate), ranges), seg.ranges_offset);
+    }
     return 0;
 }
 

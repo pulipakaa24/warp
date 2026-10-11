@@ -142,7 +142,20 @@ struct sort_args_t {
     int m;                      // the pass after which the host's second half holds its final contents
     uint shifts[8];
     uint widths[8];
+    uint key_words;             // 4-byte words per key / value (sort_copy with a device bound)
+    uint value_words;
+    device const int* n_dev;    // optional device bound: only the first min(*n_dev, n) pairs are sorted
 };
+
+// Pairs sorted: n, or min(*n_dev, n) with a device bound (the pairs past it are left in place).
+inline uint sort_count(constant sort_args_t& a)
+{
+    if (!a.n_dev)
+        return a.n;
+    const int c = *a.n_dev;
+    return c <= 0 ? 0u : min(uint(c), a.n);
+}
+inline uint sort_tiles(uint n) { return (n + SORT_TILE - 1u) / SORT_TILE; }
 
 kernel void sort_diff_clear(
     constant wp_prim_bounds_t& bounds [[buffer(0)]],
@@ -170,8 +183,9 @@ kernel void sort_diff(
     threadgroup uint sm[2 * NSG];
     device const K* keys = (device const K*)a.keys[0];
     const K first = radix_of(keys[0], a.mode);
+    const uint n = sort_count(a);
     K d = K(0);
-    for (uint idx = tg * TG + lid; idx < a.n; idx += ntg * TG)
+    for (uint idx = tg * TG + lid; idx < n; idx += ntg * TG)
         d |= radix_of(keys[idx], a.mode) ^ first;
     ulong x = as_ulong(d);
     uint lo = simd_or(uint(x)), hi = simd_or(uint(x >> 32));
@@ -287,10 +301,16 @@ kernel void sort_copy(
     device uint* kd = (device uint*)a.keys[c[2]];
     device const uint* vs = (device const uint*)a.values[c[1]];
     device uint* vd = (device uint*)a.values[c[2]];
-    for (uint j = i; j < max(a.shift, a.bits); j += grid) {
-        if (j < a.shift)
+    uint kw = a.shift, vw = a.bits;
+    if (a.n_dev) {
+        const uint n = sort_count(a);
+        kw = n * a.key_words;
+        vw = n * a.value_words;
+    }
+    for (uint j = i; j < max(kw, vw); j += grid) {
+        if (j < kw)
             kd[j] = ks[j];
-        if (j < a.bits)
+        if (j < vw)
             vd[j] = vs[j];
     }
 }
@@ -328,8 +348,10 @@ kernel void sort_upsweep(
     threadgroup uint hist[NSG * 256];
     device const K* keys = (device const K*)a.keys[plan[1]];
     const K mask = (K(1) << a.bits) - K(1);
+    const uint n = sort_count(a);
+    const uint num_tiles = sort_tiles(n);
     // a fixed grid loops over the tiles, so that a skipped pass costs few threadgroups
-    for (uint tile = tg; tile < a.num_tiles; tile += ntg) {
+    for (uint tile = tg; tile < num_tiles; tile += ntg) {
     for (uint i = lid; i < NSG * 256; i += TG)
         hist[i] = 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -338,7 +360,7 @@ kernel void sort_upsweep(
     threadgroup uint* row = hist + sg * 256;
     for (uint j = 0; j < SORT_KPT; ++j) {
         uint idx = base + j * 32u;
-        bool valid = idx < a.n;
+        bool valid = idx < n;
         uint d = valid ? uint((radix_of(keys[idx], a.mode) >> a.shift) & mask) : 0u;
         uint m = match_digit(d, a.bits, valid);
         uint lt = popcount(m & ((1u << lane) - 1u));
@@ -371,14 +393,15 @@ kernel void sort_scan_tiles(
     if (!a.plan[4 * a.pass])
         return;
     threadgroup uint sm[NSG + 1];
-    device uint* row = a.tile_hist + digit * a.num_tiles;
+    device uint* row = a.tile_hist + digit * a.num_tiles;  // rows keep the full tile count as stride
+    const uint num_tiles = sort_tiles(sort_count(a));
     uint carry = 0;
-    for (uint start = 0; start < a.num_tiles; start += TG) {
+    for (uint start = 0; start < num_tiles; start += TG) {
         uint i = start + lid;
-        uint v = i < a.num_tiles ? row[i] : 0u;
+        uint v = i < num_tiles ? row[i] : 0u;
         uint total;
         uint e = tg_exclusive_scan(v, sm, lane, sg, total);
-        if (i < a.num_tiles)
+        if (i < num_tiles)
             row[i] = carry + e;
         carry += total;
     }
@@ -416,9 +439,11 @@ kernel void sort_scatter(
     device K* keys_out2 = (device K*)a.keys[second ? plan[3] : plan[2]];
     device V* values_out2 = (device V*)a.values[second ? plan[3] : plan[2]];
     const K mask = (K(1) << a.bits) - K(1);
+    const uint n = sort_count(a);
+    const uint num_tiles = sort_tiles(n);
 
     // a fixed grid loops over the tiles, so that a skipped pass costs few threadgroups
-    for (uint tile = tg; tile < a.num_tiles; tile += ntg) {
+    for (uint tile = tg; tile < num_tiles; tile += ntg) {
     for (uint i = lid; i < NSG * 256; i += TG)
         hist[i] = 0;
     // plus this digit in earlier tiles
@@ -432,7 +457,7 @@ kernel void sort_scatter(
     uchar dig[SORT_KPT];
     for (uint j = 0; j < SORT_KPT; ++j) {
         uint idx = base + j * 32u;
-        bool valid = idx < a.n;
+        bool valid = idx < n;
         key[j] = valid ? keys[idx] : K(0);
         uint d = valid ? uint((radix_of(key[j], a.mode) >> a.shift) & mask) : 0u;
         uint m = match_digit(d, a.bits, valid);
@@ -460,7 +485,7 @@ kernel void sort_scatter(
 
     for (uint j = 0; j < SORT_KPT; ++j) {
         uint idx = base + j * 32u;
-        if (idx < a.n) {
+        if (idx < n) {
             uint pos = row[dig[j]] + rank[j];
             V v = values[idx];
             keys_out[pos] = key[j];
@@ -509,7 +534,17 @@ struct scan_args_t {
     uint num_tiles;
     int inclusive;
     uint pad;
+    device const int* n_dev;    // run-length encoding: optional device bound on the number of values
 };
+
+// Values encoded by the run-length encoding: n, or min(*n_dev, n) with a device bound (scans: n).
+inline uint rle_count_of(constant scan_args_t& a)
+{
+    if (!a.n_dev)
+        return a.n;
+    const int c = *a.n_dev;
+    return c <= 0 ? 0u : min(uint(c), a.n);
+}
 
 template <typename T>
 inline T load_elem(constant scan_args_t& a, uint i) { return *(device const T*)(a.in + long(i) * a.in_stride); }
@@ -548,13 +583,14 @@ kernel void scan_spine(
 {
     threadgroup T sm[NSG + 1];
     device T* sums = (device T*)a.tile_sums;
+    const uint num_tiles = a.n_dev ? (rle_count_of(a) + SCAN_TILE - 1u) / SCAN_TILE : a.num_tiles;
     T carry = T(0);
-    for (uint start = 0; start < a.num_tiles; start += TG) {
+    for (uint start = 0; start < num_tiles; start += TG) {
         uint i = start + lid;
-        T v = i < a.num_tiles ? sums[i] : T(0);
+        T v = i < num_tiles ? sums[i] : T(0);
         T total;
         T e = tg_exclusive_scan(v, sm, lane, sg, total);
-        if (i < a.num_tiles)
+        if (i < num_tiles)
             sums[i] = carry + e;
         carry += total;
     }
@@ -606,9 +642,9 @@ template [[host_name("scan_down_i4")]] kernel void scan_down<int>(
 template [[host_name("scan_down_i8")]] kernel void scan_down<long>(
     constant wp_prim_bounds_t&, constant scan_args_t&, uint, uint, uint, uint);
 
-inline int rle_head(constant scan_args_t& a, device const int* v, uint i)
+inline int rle_head(uint n, device const int* v, uint i)
 {
-    return (i < a.n && (i == 0 || v[i] != v[i - 1])) ? 1 : 0;
+    return (i < n && (i == 0 || v[i] != v[i - 1])) ? 1 : 0;
 }
 
 // Number of run heads in each tile.
@@ -622,9 +658,10 @@ kernel void rle_count(
 {
     threadgroup int sm[NSG + 1];
     device const int* v = (device const int*)a.in;
+    const uint n = rle_count_of(a);
     int s = 0;
     for (uint j = 0; j < SCAN_IPT; ++j)
-        s += rle_head(a, v, tile * SCAN_TILE + j * TG + lid);
+        s += rle_head(n, v, tile * SCAN_TILE + j * TG + lid);
     int total;
     tg_exclusive_scan(s, sm, lane, sg, total);
     if (lid == 0)
@@ -643,11 +680,12 @@ kernel void rle_scatter(
 {
     threadgroup int sm[NSG + 1];
     device const int* v = (device const int*)a.in;
+    const uint n = rle_count_of(a);
     const uint first = tile * SCAN_TILE + lid * SCAN_IPT;
     int h[SCAN_IPT];
     int s = 0;
     for (uint j = 0; j < SCAN_IPT; ++j) {
-        h[j] = rle_head(a, v, first + j);
+        h[j] = rle_head(n, v, first + j);
         s += h[j];
     }
     int total;
@@ -659,9 +697,11 @@ kernel void rle_scatter(
             ((device int*)a.starts)[run] = int(i);
             ++run;
         }
-        if (i == a.n - 1)
+        if (i == n - 1)
             *a.run_count = run;
     }
+    if (n == 0 && tile == 0 && lid == 0)
+        *a.run_count = 0;
 }
 
 // Run lengths from consecutive run starts (thread j < run count).
@@ -674,8 +714,52 @@ kernel void rle_lengths(
     if (int(j) >= count)
         return;
     device const int* starts = (device const int*)a.starts;
-    int end = int(j) + 1 < count ? starts[j + 1] : int(a.n);
+    int end = int(j) + 1 < count ? starts[j + 1] : int(rle_count_of(a));
     ((device int*)a.run_lengths)[j] = end - starts[j];
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// strided / indexed array copy (CUDA: array_copy_{1,2,3,4}d_kernel in warp.cu), one thread per element
+
+struct array_copy_args_t {
+    device uchar* dst;
+    device const uchar* src;
+    device const int* dst_indices[4];
+    device const int* src_indices[4];
+    long dst_strides[4];        // bytes
+    long src_strides[4];        // bytes
+    uint shape[4];
+    uint ndim;
+    uint elem_size;             // bytes
+    ulong n;
+};
+
+kernel void array_copy(
+    constant wp_prim_bounds_t& bounds [[buffer(0)]],
+    constant array_copy_args_t& a [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (ulong(tid) >= a.n)
+        return;
+    long so = 0, do_ = 0;
+    ulong rest = tid;
+    for (int d = int(a.ndim) - 1; d >= 0; --d) {
+        const uint i = uint(rest % a.shape[d]);
+        rest /= a.shape[d];
+        const long si = a.src_indices[d] ? long(a.src_indices[d][i]) : long(i);
+        const long di = a.dst_indices[d] ? long(a.dst_indices[d][i]) : long(i);
+        so += si * a.src_strides[d];
+        do_ += di * a.dst_strides[d];
+    }
+    device const uchar* p = a.src + so;
+    device uchar* q = a.dst + do_;
+    if ((a.elem_size & 3u) == 0u && ((ulong(p) | ulong(q)) & 3ul) == 0ul) {
+        for (uint w = 0; w < a.elem_size / 4u; ++w)
+            ((device uint*)q)[w] = ((device const uint*)p)[w];
+    } else {
+        for (uint b = 0; b < a.elem_size; ++b)
+            q[b] = p[b];
+    }
 }
 """
 
@@ -698,6 +782,9 @@ class _SortArgs(ctypes.Structure):
         ("m", ctypes.c_int32),
         ("shifts", ctypes.c_uint32 * 8),
         ("widths", ctypes.c_uint32 * 8),
+        ("key_words", ctypes.c_uint32),
+        ("value_words", ctypes.c_uint32),
+        ("n_dev", ctypes.c_uint64),
     ]
 
 
@@ -716,6 +803,22 @@ class _ScanArgs(ctypes.Structure):
         ("num_tiles", ctypes.c_uint32),
         ("inclusive", ctypes.c_int32),
         ("pad", ctypes.c_uint32),
+        ("n_dev", ctypes.c_uint64),
+    ]
+
+
+class _ArrayCopyArgs(ctypes.Structure):
+    _fields_ = [
+        ("dst", ctypes.c_uint64),
+        ("src", ctypes.c_uint64),
+        ("dst_indices", ctypes.c_uint64 * 4),
+        ("src_indices", ctypes.c_uint64 * 4),
+        ("dst_strides", ctypes.c_int64 * 4),
+        ("src_strides", ctypes.c_int64 * 4),
+        ("shape", ctypes.c_uint32 * 4),
+        ("ndim", ctypes.c_uint32),
+        ("elem_size", ctypes.c_uint32),
+        ("n", ctypes.c_uint64),
     ]
 
 
@@ -724,8 +827,10 @@ def _pointer_offsets(struct_type, count):
     return (ctypes.c_size_t * len(offsets))(*offsets)
 
 
-_SORT_PTR_OFFSETS = (ctypes.c_size_t * 10)(*(8 * i for i in range(10)))
-_SCAN_PTR_OFFSETS = _pointer_offsets(_ScanArgs, 7)
+# the leading pointer fields, plus the device bound (n_dev, last so that positional constructions stay valid)
+_SORT_PTR_OFFSETS = (ctypes.c_size_t * 11)(*(8 * i for i in range(10)), _SortArgs.n_dev.offset)
+_SCAN_PTR_OFFSETS = (ctypes.c_size_t * 8)(*_pointer_offsets(_ScanArgs, 7), _ScanArgs.n_dev.offset)
+_COPY_PTR_OFFSETS = (ctypes.c_size_t * 10)(*(8 * i for i in range(10)))
 _BOUNDS = ctypes.c_uint64(0)
 
 
@@ -765,6 +870,33 @@ class _DeviceState:
             size = max(nbytes, 2 * self.scratch[-1].size if self.scratch else 0, 1 << 16)
             self.scratch.append(wp.empty(size, dtype=wp.uint8, device=self.device))
         return self.scratch[-1].ptr
+
+    def launch_bounded(self, name, limit, args, pointer_offsets, count, divisor, per_thread=False):
+        """Dispatch of ``limit`` threadgroups (or threads, ``per_thread``) of which only the first
+        ``ceil(count[0] / divisor)`` run, sized on the GPU (``wp_metal_launch_kernel_bounded``)."""
+        from warp._src.context import runtime  # noqa: PLC0415
+
+        if limit <= 0:
+            return
+        inner = 1 if per_thread else _TG
+        if self.core.wp_metal_launch_kernel_bounded(
+            self.device.metal_ordinal,
+            self.kernel(name),
+            limit * inner,
+            _TG,
+            ctypes.byref(_BOUNDS),
+            ctypes.sizeof(_BOUNDS),
+            ctypes.byref(args),
+            ctypes.sizeof(args),
+            pointer_offsets,
+            len(pointer_offsets),
+            0,
+            ctypes.c_void_p(count.ptr),
+            limit,
+            inner,
+            divisor,
+        ):
+            raise RuntimeError(f"Failed to launch Metal utility kernel '{name}': {runtime.get_error_string()}")
 
     def launch(self, name, num_groups, args, pointer_offsets, threads=None):
         from warp._src.context import runtime  # noqa: PLC0415
@@ -809,8 +941,14 @@ _KEY_MODES = {
 }
 
 
-def radix_sort_pairs(keys, values, count: int, begin_bit: int, end_bit: int, value_size: int) -> None:
-    """GPU radix sort of the first ``count`` pairs; same contract and final buffer contents as the host sort."""
+def radix_sort_pairs(keys, values, count: int, begin_bit: int, end_bit: int, value_size: int, count_limit=None) -> None:
+    """GPU radix sort of the first ``count`` pairs; same contract and final buffer contents as the host sort.
+
+    ``count_limit`` (internal, a 1-element ``int32`` device array): sort only the first ``n = min(count_limit[0],
+    count)`` pairs, read on the GPU. When the pairs past ``n`` have keys not less than every key before it and are
+    already in key order (e.g. a sentinel maximum key), the first half of the buffers then ends exactly as with the
+    full sort (those pairs stay in place); the second half is written up to ``n`` only.
+    """
     if keys.dtype not in _KEY_MODES:
         raise RuntimeError(
             f"Unsupported keys and values data types: {type_repr(keys.dtype)}, {type_repr(values.dtype)}"
@@ -857,6 +995,8 @@ def radix_sort_pairs(keys, values, count: int, begin_bit: int, end_bit: int, val
     args.tile_hist, args.digit_total, args.diff, args.plan = tile_hist, digit_total, diff, plan
     args.n, args.num_tiles, args.mode = count, num_tiles, mode
     args.num_passes, args.m = len(passes), m
+    args.n_dev = count_limit.ptr if count_limit is not None else 0
+    args.key_words, args.value_words = key_size // 4, value_size // 4
     for i, (shift, bits) in enumerate(passes):
         args.shifts[i], args.widths[i] = shift, bits
 
@@ -946,8 +1086,12 @@ def array_scan(in_array, out_array, scalar_type, type_length, in_stride, out_str
         )
 
 
-def runlength_encode(values, run_values, run_lengths, run_count, value_count: int) -> None:
-    """GPU run-length encoding of ``value_count`` ``int32`` values; ``run_count`` receives the number of runs."""
+def runlength_encode(values, run_values, run_lengths, run_count, value_count: int, count_limit=None) -> None:
+    """GPU run-length encoding of ``value_count`` ``int32`` values; ``run_count`` receives the number of runs.
+
+    ``count_limit`` (internal, a 1-element ``int32`` device array): encode only the first
+    ``min(count_limit[0], value_count)`` values; the dispatches are sized on the GPU from that count.
+    """
     if value_count >= 2**31:
         raise RuntimeError("runlength_encode() on Metal supports fewer than 2**31 elements")
     state = _state(values.device)
@@ -955,10 +1099,86 @@ def runlength_encode(values, run_values, run_lengths, run_count, value_count: in
     num_tiles = (n + _SCAN_TILE - 1) // _SCAN_TILE
     sums_bytes = _align(num_tiles * 4)
     base = state.scratch_ptr(sums_bytes + _align(n * 4))
+    limit_ptr = count_limit.ptr if count_limit is not None else 0
     args = _ScanArgs(
-        values.ptr, 0, base, base + sums_bytes, run_values.ptr, run_lengths.ptr, run_count.ptr, 4, 4, n, num_tiles, 1, 0
+        values.ptr,
+        0,
+        base,
+        base + sums_bytes,
+        run_values.ptr,
+        run_lengths.ptr,
+        run_count.ptr,
+        4,
+        4,
+        n,
+        num_tiles,
+        1,
+        0,
+        limit_ptr,
     )
-    state.launch("rle_count", num_tiles, args, _SCAN_PTR_OFFSETS)
+    if count_limit is None:  # (callers pass a bound only with warp.config.metal_bounded_launch)
+        state.launch("rle_count", num_tiles, args, _SCAN_PTR_OFFSETS)
+        state.launch("scan_spine_i4", 1, args, _SCAN_PTR_OFFSETS)
+        state.launch("rle_scatter", num_tiles, args, _SCAN_PTR_OFFSETS)
+        state.launch("rle_lengths", 0, args, _SCAN_PTR_OFFSETS, threads=n)
+        return
+    if n == 0:
+        run_count.zero_()
+        return
+    # tile dispatches sized from the device count (one threadgroup per SCAN_TILE values); run_count is cleared
+    # first, as no rle_scatter threadgroup runs when the bounded count is 0
+    run_count[:1].zero_()
+    state.launch_bounded("rle_count", num_tiles, args, _SCAN_PTR_OFFSETS, count_limit, _SCAN_TILE)
     state.launch("scan_spine_i4", 1, args, _SCAN_PTR_OFFSETS)
-    state.launch("rle_scatter", num_tiles, args, _SCAN_PTR_OFFSETS)
-    state.launch("rle_lengths", 0, args, _SCAN_PTR_OFFSETS, threads=n)
+    state.launch_bounded("rle_scatter", num_tiles, args, _SCAN_PTR_OFFSETS, count_limit, _SCAN_TILE)
+    state.launch_bounded("rle_lengths", n, args, _SCAN_PTR_OFFSETS, count_limit, 1, per_thread=True)
+
+
+def _copy_operand(a):
+    """(data pointer, byte strides, index pointers) of a Warp array or indexed array, or None if unsupported."""
+    if isinstance(a, wp.array):
+        return a.ptr, list(a.strides), [0] * 4
+    if isinstance(a, wp.indexedarray):
+        if not isinstance(a.data, wp.array):
+            return None
+        indices = [0] * 4
+        for d, idx in enumerate(a.indices):
+            if idx is not None:
+                if idx.device != a.data.device or not idx.is_contiguous or idx.dtype != wp.int32:
+                    return None
+                indices[d] = idx.ptr
+        return a.data.ptr, list(a.data.strides), indices
+    return None
+
+
+def array_copy(dest, src, elem_size: int) -> bool:
+    """GPU copy between strided and / or indexed arrays of one Metal device, element by element (``elem_size``
+    bytes each), with the indexing of CUDA's ``wp_array_copy_device``: ``dest[dst_index(i)] = src[src_index(i)]``
+    over the common shape, where an indexed dimension maps ``i`` through its index array.
+
+    Returns ``False`` (nothing launched) for operands it does not handle (Fabric arrays); the caller then copies on
+    the host. Ordered with kernel launches and recordable into graph captures (no host synchronization).
+    """
+    d = _copy_operand(dest)
+    s = _copy_operand(src)
+    if d is None or s is None or dest.ndim != src.ndim or tuple(dest.shape) != tuple(src.shape):
+        return False
+    n = 1
+    for extent in src.shape:
+        n *= extent
+    if n == 0:
+        return True
+    if n >= 2**32:
+        return False
+    args = _ArrayCopyArgs()
+    args.dst, args.src = d[0], s[0]
+    args.dst_indices[:] = d[2]
+    args.src_indices[:] = s[2]
+    ndim = src.ndim
+    args.dst_strides[:] = d[1] + [0] * (4 - ndim)
+    args.src_strides[:] = s[1] + [0] * (4 - ndim)
+    args.shape[:] = list(src.shape) + [1] * (4 - ndim)
+    args.ndim, args.elem_size, args.n = ndim, elem_size, n
+    state = _state(dest.device)
+    state.launch("array_copy", 0, args, _COPY_PTR_OFFSETS, threads=n)
+    return True

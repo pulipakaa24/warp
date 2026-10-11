@@ -7,7 +7,7 @@ import warp as wp
 from warp._src.fem import cache
 from warp._src.fem.domain import GeometryDomain
 from warp._src.fem.types import NULL_ELEMENT_INDEX, NULL_NODE_INDEX, NodeElementIndex
-from warp._src.fem.utils import compress_node_indices, host_read_at_index
+from warp._src.fem.utils import _metal_gpu_utilities, compress_node_indices, host_read_at_index
 
 from .partition import SpacePartition
 from .topology import SpaceTopology
@@ -56,6 +56,8 @@ class SpaceRestriction:
         """Concatenation of neighboring elements indices for each partition node"""
         self._dof_indices_in_element: wp.array = None
         """Concatenation of node index in element for each partition node"""
+        self._element_node_bound: wp.array = None
+        """Device-side count of the (element, node) slots in use, when the domain has an element count bound"""
 
         self.rebuild(device=device, temporary_store=temporary_store)
 
@@ -98,6 +100,26 @@ class SpaceRestriction:
             dtype=int,
             device=device,
         )
+
+        # Fixed-capacity domains (active elements are a prefix, see GeometryDomain.element_count_bound): on Metal the
+        # element node table and its compression stop at the active slots (the compression treats the slots past
+        # them as NULL_NODE_INDEX, which is what the full table holds there). Elsewhere both run over the capacity.
+        element_bound = self.domain.element_count_bound()
+        slot_bound = None
+        if element_bound is not None and _metal_gpu_utilities(element_node_indices.device):
+            if self._element_node_bound is None or self._element_node_bound.device != element_node_indices.device:
+                self._element_node_bound = wp.empty(1, dtype=int, device=element_node_indices.device)
+            slot_bound = self._element_node_bound
+            wp.launch(
+                SpaceRestriction._scale_count,
+                dim=1,
+                inputs=[element_bound, max_nodes_per_element, slot_bound],
+                device=element_node_indices.device,
+            )
+            element_bound_kw = {"dim_limit": element_bound}
+        else:
+            element_bound_kw = {}
+
         wp.launch(
             dim=element_node_indices.shape[0],
             kernel=fill_element_node_indices,
@@ -109,6 +131,7 @@ class SpaceRestriction:
                 element_node_indices,
             ],
             device=device,
+            **element_bound_kw,
         )
 
         # Build compressed map from node to element indices
@@ -127,6 +150,7 @@ class SpaceRestriction:
             unique_node_indices=self._dof_partition_indices,
             return_unique_nodes=True,
             temporary_store=temporary_store,
+            index_count_limit=slot_bound,
         )
 
         # Extract element index and index in element
@@ -146,7 +170,7 @@ class SpaceRestriction:
                 self._dof_indices_in_element,
             ],
             device=flattened_node_indices.device,
-        )
+        )  # every slot: dispatched assembly and restricted interpolation read the whole table
 
         node_array_indices.release()
         element_node_indices.release()
@@ -164,6 +188,14 @@ class SpaceRestriction:
     def node_count(self) -> int:
         """Upper bound for the node count, use ``node_count_sync`` to get the actual value."""
         return self._node_count
+
+    def node_count_bound(self) -> wp.array | None:
+        """Device-side number of restriction nodes (a 1-element ``int32`` array), or ``None`` once synchronized.
+
+        Restriction nodes at or past it have no partition node (:meth:`node_partition_index` is
+        ``NULL_NODE_INDEX``), so work over :meth:`node_count` slots may stop there.
+        """
+        return self._node_count_dev
 
     def partition_element_offsets(self):
         """Return offsets into the per-node element index arrays."""
@@ -221,6 +253,10 @@ class SpaceRestriction:
         domain_element_index = args.dof_element_indices[node_element_offset]
         index_in_element = args.dof_indices_in_element[node_element_offset]
         return NodeElementIndex(domain_element_index, index_in_element)
+
+    @wp.kernel
+    def _scale_count(count: wp.array(dtype=int), factor: int, out: wp.array(dtype=int)):
+        out[0] = count[0] * factor
 
     @wp.kernel
     def _split_vertex_element_index(

@@ -67,6 +67,31 @@ WP_API int wp_metal_launch_kernel(
     size_t threadgroup_memory_bytes
 );
 
+// wp_metal_launch_kernel with a launch bound read on the GPU: only the threadgroups holding the tasks whose leading
+// index is below min(ceil(*count / divisor), limit) run (num_threads = limit * inner; tasks are leading-index-major;
+// divisor > 1 sizes tile-granular dispatches from an element count). A one-thread
+// prep kernel turns the int32 at count (a Metal allocation) into the threadgroup count of an indirect dispatch;
+// thread-to-task mapping and threadgroup size are those of the full launch. In a graph capture the prep and the
+// dispatch are recorded and replayed outside the indirect command buffer; inside an indirect execution range they
+// are skipped when the range is skipped.
+WP_API int wp_metal_launch_kernel_bounded(
+    int ordinal,
+    void* kernel,
+    size_t num_threads,
+    int threads_per_threadgroup,
+    const void* bounds,
+    size_t bounds_size,
+    const void* args,
+    size_t args_size,
+    const size_t* pointer_offsets,
+    int num_pointer_offsets,
+    size_t threadgroup_memory_bytes,
+    const void* count,
+    size_t limit,
+    size_t inner,
+    size_t divisor
+);
+
 // Commits pending work and waits for all GPU work on the device. Returns 0 on success, non-zero if any
 // command buffer failed (the error string describes the failure).
 // Asynchronous memory operations on Metal allocations, ordered with kernel launches.

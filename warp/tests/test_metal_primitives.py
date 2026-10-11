@@ -9,6 +9,7 @@ import unittest
 import numpy as np
 
 import warp as wp
+from warp._src import metal_primitives
 
 
 def metal_available() -> bool:
@@ -265,6 +266,131 @@ class TestMetalPrimitives(unittest.TestCase):
                     want = outputs()
                 for g, w in zip(got, want, strict=True):
                     np.testing.assert_array_equal(g, w)
+
+    def test_bounded_sort_and_rle(self):
+        """Check the GPU sort and run-length encoding limited to a prefix by a device count.
+
+        With a sentinel tail the first half of the sort buffers equals the full sort, and the encoding equals the
+        host encoding of the prefix.
+        """
+        mp = metal_primitives
+
+        device = wp.get_device("metal:0")
+        rng = np.random.default_rng(11)
+        for wp_key, np_key, sentinel in ((wp.int32, np.int32, 2**31 - 1), (wp.uint64, np.uint64, 2**40)):
+            for count, head in ((5000, 0), (5000, 1), (5000, 2047), (5000, 2048), (300_000, 123_457), (8, 8)):
+                with self.subTest(key=np_key.__name__, count=count, head=head):
+                    k = np.full(2 * count, sentinel, dtype=np_key)
+                    k[:head] = rng.integers(0, 1000, head).astype(np_key)
+                    k[head // 3 : head // 2] = sentinel  # sentinels inside the prefix too
+                    v = rng.integers(0, 2**31 - 1, 2 * count).astype(np.int32)
+                    v[count:] = -7  # the second half is scratch
+                    limit = wp.array([head], dtype=wp.int32, device=device)
+                    end_bit = int(sentinel).bit_length()
+
+                    full_k = wp.array(k, dtype=wp_key, device=device)
+                    full_v = wp.array(v, dtype=wp.int32, device=device)
+                    with gpu_utilities(True):
+                        wp.utils.radix_sort_pairs(full_k, full_v, count, 0, end_bit)
+                    bk = wp.array(k, dtype=wp_key, device=device)
+                    bv = wp.array(v, dtype=wp.int32, device=device)
+                    mp.radix_sort_pairs(bk, bv, count, 0, end_bit, 4, count_limit=limit)
+                    np.testing.assert_array_equal(bk.numpy()[:count], full_k.numpy()[:count])
+                    np.testing.assert_array_equal(bv.numpy()[:count], full_v.numpy()[:count])
+
+                    if wp_key is wp.int32:
+                        sorted_keys = full_k  # first half sorted
+                        rv = wp.full(count, -5, dtype=wp.int32, device=device)
+                        rl = wp.full(count, -5, dtype=wp.int32, device=device)
+                        rc = wp.full(1, -5, dtype=wp.int32, device=device)
+                        mp.runlength_encode(sorted_keys, rv, rl, rc, count, count_limit=limit)
+                        hk = sorted_keys.numpy()[:head]
+                        if head:
+                            heads = np.flatnonzero(np.r_[True, hk[1:] != hk[:-1]])
+                            want_v = hk[heads]
+                            want_l = np.diff(np.r_[heads, head])
+                        else:
+                            want_v = want_l = np.zeros(0, dtype=np.int32)
+                        n_runs = int(rc.numpy()[0])
+                        self.assertEqual(n_runs, len(want_v))
+                        np.testing.assert_array_equal(rv.numpy()[:n_runs], want_v)
+                        np.testing.assert_array_equal(rl.numpy()[:n_runs], want_l)
+
+        # recorded into a graph: the bound is re-read at every replay
+        n = 50_000
+        keys = wp.zeros(2 * n, dtype=wp.int32, device=device)
+        values = wp.zeros(2 * n, dtype=wp.int32, device=device)
+        limit = wp.zeros(1, dtype=wp.int32, device=device)
+        rv = wp.zeros(n, dtype=wp.int32, device=device)
+        rl = wp.zeros(n, dtype=wp.int32, device=device)
+        rc = wp.zeros(1, dtype=wp.int32, device=device)
+        with wp.ScopedCapture(device=device) as capture:
+            mp.radix_sort_pairs(keys, values, n, 0, 31, 4, count_limit=limit)
+            mp.runlength_encode(keys, rv, rl, rc, n, count_limit=limit)
+        for head in (0, 777, 31_000, n):
+            k = np.full(2 * n, 2**31 - 1, dtype=np.int32)
+            k[:head] = rng.integers(0, 50, head)
+            keys.assign(k)
+            values.assign(np.arange(2 * n, dtype=np.int32))
+            limit.assign(np.array([head], dtype=np.int32))
+            wp.capture_launch(capture.graph)
+            order = np.argsort(k[:head], kind="stable")
+            np.testing.assert_array_equal(keys.numpy()[:head], k[:head][order])
+            np.testing.assert_array_equal(values.numpy()[:head], order)
+            np.testing.assert_array_equal(keys.numpy()[head:n], k[head:n])
+            np.testing.assert_array_equal(values.numpy()[head:n], np.arange(head, n))
+            self.assertEqual(int(rc.numpy()[0]), len(np.unique(k[:head])))
+
+    def test_array_copy_strided_and_indexed(self):
+        """Strided and indexed copies on the GPU equal the host copies, byte for byte, and are recordable."""
+        device = wp.get_device("metal:0")
+        rng = np.random.default_rng(3)
+        base = rng.standard_normal((40, 6, 5, 3)).astype(np.float32)
+        base.reshape(-1)[::37] = np.nan  # payloads travel as raw bytes
+        idx0 = wp.array(rng.permutation(40)[:25].astype(np.int32), device=device)
+        idx2 = wp.array(np.array([4, 0, 3], dtype=np.int32), device=device)
+        cases = []
+        for dtype, data in (
+            (wp.float32, base),
+            (wp.vec3, base.reshape(40, 6, 5, 3)[..., :3].copy()),
+            (wp.uint8, rng.integers(0, 255, (40, 6, 5), dtype=np.uint8)),
+            (wp.float64, rng.standard_normal((40, 7))),
+        ):
+            src = wp.array(data, dtype=dtype, device=device)
+            cases.append(("indexed 1d gather", src[idx0], None))
+            cases.append(("strided", src[1::3], None))
+            if src.ndim >= 3:
+                cases.append(("indexed 2 dims", wp.indexedarray(src, [idx0, None, idx2]), None))
+            # scatter into an indexed destination
+            cases.append(("indexed destination", src[: idx0.shape[0]], wp.indexedarray(wp.zeros_like(src), [idx0])))
+
+        def run(src, dst_template):
+            dst = dst_template if dst_template is not None else wp.zeros(src.shape, dtype=src.dtype, device=device)
+            wp.copy(dst, src)
+            out = dst.data if isinstance(dst, wp.indexedarray) else dst
+            return out.numpy().copy()
+
+        for name, src, dst in cases:
+            with self.subTest(case=name, dtype=src.dtype):
+                with gpu_utilities(True):
+                    g = run(src, dst)
+                with gpu_utilities(False):
+                    if dst is not None:
+                        dst.data.zero_()
+                    h = run(src, dst)
+                self.assertTrue(np.array_equal(g.view(np.uint8), h.view(np.uint8)))
+
+        # recorded into a graph: the gather follows new index values without a host step
+        src = wp.array(base[:, 0, 0, 0], dtype=wp.float32, device=device)
+        dst = wp.zeros(idx0.shape[0], dtype=wp.float32, device=device)
+        with gpu_utilities(True):
+            with wp.ScopedCapture(device=device) as capture:
+                dst.assign(src[idx0])
+            for _ in range(3):
+                perm = rng.permutation(40)[:25].astype(np.int32)
+                idx0.assign(perm)
+                wp.capture_launch(capture.graph)
+                np.testing.assert_array_equal(dst.numpy(), base[perm, 0, 0, 0])
 
 
 if __name__ == "__main__":
