@@ -24,6 +24,16 @@
 #define CUDA_CALLABLE_DEVICE
 // The fuse_fp module option (default on): CUDA compiles with --fmad=true, contracting a * b + c into FMAs across
 // expressions and inlined calls; ask the Metal compiler for the same contraction so kernels round as on CUDA.
+#if defined(WP_FAST_MATH) && WP_FAST_MATH
+// The fast_math module option: NVRTC's --use_fast_math is --prec-div=false --prec-sqrt=false --ftz=true --fmad=true,
+// i.e. every float32 division (and reciprocal) of the module becomes the approximate x * rcp(y) form (__fdividef,
+// 2 ulp), square roots are approximate, denormals are flushed; it does not reassociate. Metal's relaxed math mode
+// allows reciprocals (division lowered exactly as metal::fast::divide, bit for bit), and reassociation is switched
+// back off here; contraction is then set by fuse_fp below. Relaxed mode also ignores the sign of zero (the one
+// license beyond CUDA's). Apple GPUs flush float32 denormals in every math mode. sqrt: metal_crt.h.
+#pragma METAL fp math_mode(relaxed)
+#pragma clang fp reassociate(off)
+#endif
 #if !defined(WP_FUSE_FP) || WP_FUSE_FP
 #pragma clang fp contract(fast)
 #else

@@ -989,6 +989,49 @@ class TestMetal(unittest.TestCase):
                                        wp.array(c, device=self.device), out], device=self.device)
             np.testing.assert_array_equal(out.numpy(), expected, err_msg=f"fuse_fp={fuse_fp}")
 
+    def test_fast_math_approximates_division_and_sqrt_only(self):
+        """The fast_math module option makes float32 division and sqrt approximate, as --use_fast_math does on CUDA.
+
+        CUDA's --use_fast_math is --prec-div=false --prec-sqrt=false --ftz=true --fmad=true: division becomes
+        x * rcp(y) (__fdividef, within 2 ulp) and sqrt is approximate, without reassociation. Without the option both
+        are correctly rounded. Neither mode may reassociate (x + 2^24) - 2^24 into x.
+        """
+        rng = np.random.default_rng(0)
+        n = 1 << 14
+        a = rng.uniform(-2.0, 2.0, n).astype(np.float32)
+        x = rng.uniform(1.0e-3, 10.0, n).astype(np.float32)
+        div_ref = a.astype(np.float64) / x
+        sqrt_ref = np.sqrt(x.astype(np.float64))
+
+        def ulp_error(r, ref):
+            rr = ref.astype(np.float32)
+            return np.abs(r.astype(np.float64) - ref) / (np.spacing(np.abs(rr)).astype(np.float64))
+
+        for fast in (False, True):
+
+            @wp.kernel(module="unique", module_options={"fast_math": fast})
+            def ops(a: wp.array[float], x: wp.array[float], q: wp.array[float], s: wp.array[float],
+                    r: wp.array[float]):
+                i = wp.tid()
+                q[i] = a[i] / x[i]
+                s[i] = wp.sqrt(x[i])
+                r[i] = (x[i] + 16777216.0) - 16777216.0
+
+            arrays = [wp.zeros(n, dtype=float, device=self.device) for _ in range(3)]
+            wp.launch(ops, n, inputs=[wp.array(a, device=self.device), wp.array(x, device=self.device), *arrays],
+                      device=self.device)
+            q, s, r = (arr.numpy() for arr in arrays)
+            reassociated = (x + np.float32(16777216.0)) - np.float32(16777216.0)
+            np.testing.assert_array_equal(r, reassociated, err_msg=f"fast_math={fast} reassociated")
+            if not fast:
+                np.testing.assert_array_equal(q, div_ref.astype(np.float32))
+                np.testing.assert_array_equal(s, sqrt_ref.astype(np.float32))
+            else:
+                self.assertLess(np.mean(q == div_ref.astype(np.float32)), 0.95)
+                self.assertLess(np.mean(s == sqrt_ref.astype(np.float32)), 0.95)
+                self.assertLessEqual(ulp_error(q, div_ref).max(), 2.5)
+                self.assertLessEqual(ulp_error(s, sqrt_ref).max(), 2.5)
+
 
 class TestMetalInlineBudget(unittest.TestCase):
     """Forced inlining is bounded by the fully inlined size (pure codegen logic, no device needed)."""

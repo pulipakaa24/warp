@@ -3817,6 +3817,10 @@ class ModuleBuilder:
         if device == "metal":
             # fuse_fp selects FMA contraction in builtin.h, as --fmad does for NVRTC
             source = f"#define WP_FUSE_FP {int(bool(self.options.get('fuse_fp', True)))}\n" + source
+            # fast_math selects approximate float32 division and square root in builtin.h / metal_crt.h, as NVRTC's
+            # --use_fast_math (--prec-div=false --prec-sqrt=false) does on CUDA
+            if self.options.get("fast_math"):
+                source = "#define WP_FAST_MATH 1\n" + source
             # Metal compiles from an in-memory string without include paths
             source = warp._src.build.expand_includes(source)
             source = warp._src.build.metal_rewrite_printf(source)  # shader logging has no %s
