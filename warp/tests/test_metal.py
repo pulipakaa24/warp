@@ -1165,6 +1165,22 @@ class TestMetal(unittest.TestCase):
             np.testing.assert_array_equal(acc_and.numpy().view(np.uint64), ref_and)
             np.testing.assert_array_equal(acc_xor.numpy().view(np.uint64), ref_xor)
 
+    def test_shared_tile_int64_accumulation_is_exact(self):
+        """Lanes adding into one int64 element of a shared tile (threadgroup memory) carry across the 32-bit halves."""
+        block_dim = 128
+
+        @wp.kernel(module="unique")
+        def acc(out: wp.array2d[wp.int64]):
+            i, lane = wp.tid()
+            s = wp.tile_zeros(shape=(1, 1), dtype=wp.int64, storage="shared")
+            s[0, 0] += wp.int64(3221225472) + wp.int64(lane)  # 0xC0000000 + lane: carries out of the low half
+            wp.tile_store(out, s, offset=(i, 0))
+
+        out = wp.zeros((2, 1), dtype=wp.int64, device=self.device)
+        wp.launch_tiled(acc, dim=2, inputs=[out], block_dim=block_dim, device=self.device)
+        expected = block_dim * 3221225472 + block_dim * (block_dim - 1) // 2
+        np.testing.assert_array_equal(out.numpy()[:, 0], [expected, expected])
+
     def test_64bit_cas_exch_minmax_raise_at_launch(self):
         """64-bit compare-and-swap / exchange and signed 64-bit min / max have no atomic form on Metal: the kernel
         raises at launch (instead of running a plain read-modify-write), and the other kernels of the module run."""

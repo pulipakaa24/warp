@@ -873,6 +873,22 @@ inline mat_t<R, C, T> tile_atomic_add_value(threadgroup mat_t<R, C, T>* ptr, mat
             old.data[i][j] = tile_atomic_add_value(&ptr->data[i][j], value.data[i][j]);
     return old;
 }
+// 64-bit integers: the two 32-bit halves are added atomically with carry propagation (as wp_metal_atomic_add on
+// device memory, metal_atomics.h): the final value is exact, a concurrent reader may see a torn intermediate.
+inline unsigned long tile_atomic_add_value(threadgroup unsigned long* ptr, unsigned long value)
+{
+    threadgroup metal::atomic_uint* lo = (threadgroup metal::atomic_uint*)ptr;
+    threadgroup metal::atomic_uint* hi = lo + 1;  // little-endian
+    const unsigned int old_lo = metal::atomic_fetch_add_explicit(lo, (unsigned int)value, metal::memory_order_relaxed);
+    const unsigned int carry = (old_lo + (unsigned int)value) < old_lo ? 1u : 0u;
+    const unsigned int old_hi
+        = metal::atomic_fetch_add_explicit(hi, (unsigned int)(value >> 32) + carry, metal::memory_order_relaxed);
+    return ((unsigned long)old_hi << 32) | old_lo;
+}
+inline long tile_atomic_add_value(threadgroup long* ptr, long value)
+{
+    return (long)tile_atomic_add_value((threadgroup unsigned long*)ptr, (unsigned long)value);
+}
 template <typename T> inline T tile_atomic_add_value(threadgroup T* ptr, T value)  // no hardware atomic: not atomic
 {
     T old = *ptr;
