@@ -1,0 +1,1 @@
+Replay Metal graphs back to back in one command buffer (up to ``WP_METAL_ICB_BATCH`` dispatches, default 1024) instead of committing every replay on its own; ``WP_METAL_ICB_BATCH=0`` restores the previous behaviour.

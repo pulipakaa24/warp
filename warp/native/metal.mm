@@ -61,12 +61,17 @@ int max_dispatches_per_command_buffer()
     return value;
 }
 
-// WP_METAL_ICB_BATCH > 0 replays graphs in chunks of that many dispatches per command buffer.
+// Graph replays are appended to the open command buffer until it carries WP_METAL_ICB_BATCH dispatches (default
+// 1024; a larger graph is split): a command buffer boundary costs ~26 us of GPU time on an M4 Max (event wait and
+// signal, buffer start), which dominated graphs replayed in quick succession (55-dispatch replays: 103 us each, one
+// command buffer per replay; 77 us batched). The open buffer is committed right away when the GPU has nothing else
+// in flight, so a replay is never held back while the GPU idles. WP_METAL_ICB_BATCH=0 commits every replay on its
+// own (the behaviour before).
 int icb_batch()
 {
     static const int value = [] {
         const char* env = std::getenv("WP_METAL_ICB_BATCH");
-        return env ? std::max(0, atoi(env)) : 0;
+        return env ? std::max(0, atoi(env)) : 1024;
     }();
     return value;
 }
@@ -1515,6 +1520,13 @@ static int graph_launch(Device& device, Graph* graph)
             }
             if (!exec_plain(count))
                 return -1;
+            // batched replays: commit now if the GPU would otherwise idle until the next commit
+            if (icb_batch() > 0 && dev->command_buffer) {
+                if (!retire_completed(*dev))
+                    return -1;
+                if (dev->in_flight.empty() && !flush(*dev))
+                    return -1;
+            }
             return 0;
         }
     }
