@@ -1534,6 +1534,7 @@ def bsr_set_from_triplets(
     )
 
     if values is not None:
+        # blocks at or past offsets[nrow] are skipped by the kernel; on Metal they are not dispatched at all
         wp.launch(
             _bsr_accumulate_triplet_values,
             dim=(nnz, *dest.block_shape),
@@ -1546,6 +1547,7 @@ def bsr_set_from_triplets(
                 dest.offsets,
             ],
             outputs=[dest.scalar_values],
+            dim_limit=dest.offsets[dest.nrow : dest.nrow + 1] if device.is_metal else None,
         )
 
     if not masked:

@@ -1401,6 +1401,20 @@ def _count_integrate_bsr_rows_from_sorted_rows(
     row_counts[row] = row_end - row_beg
 
 
+@wp.kernel(enable_backward=False)
+def _scaled_last_entry(offsets: wp.array(dtype=int), factor: int, out: wp.array(dtype=int)):
+    out[0] = offsets[offsets.shape[0] - 1] * factor
+
+
+def _restriction_node_bound(restriction, domain) -> dict:
+    """``wp.launch`` keyword arguments bounding a launch over a restriction's node slots by its device-side node count,
+    for fixed-capacity domains (elsewhere the slot count is close to the node count and the bound would not pay)."""
+    if domain.element_count_bound() is None:
+        return {}
+    bound = restriction.node_count_bound()
+    return {} if bound is None else {"dim_limit": bound}
+
+
 def _launch_integrate_kernel(
     integrand: Integrand,
     kernel: wp.Kernel,
@@ -1550,6 +1564,8 @@ def _launch_integrate_kernel(
             )
         )
 
+        # restriction nodes past the device-side count have no partition node: the kernels return at once there
+        node_bound = _restriction_node_bound(test.space_restriction, domain)
         if nodal:
             wp.launch(
                 kernel=kernel,
@@ -1563,6 +1579,7 @@ def _launch_integrate_kernel(
                     output_view,
                 ],
                 device=device,
+                **node_bound,
             )
         elif isinstance(test, LocalTestField):
             local_scalar_type = domain.geometry.scalar_type
@@ -1612,6 +1629,7 @@ def _launch_integrate_kernel(
                         output_view,
                     ],
                     device=device,
+                    **node_bound,
                 )
 
             local_result.release()
@@ -1630,6 +1648,7 @@ def _launch_integrate_kernel(
                     output_view,
                 ],
                 device=device,
+                **node_bound,
             )
 
         return output
@@ -1862,9 +1881,39 @@ def _launch_integrate_kernel(
     else:
         if capacity_policy == _BSR_CAPACITY_REUSE and topology == "compact":
             _require_bsr_capacity(bsr_result, nnz, "fem.integrate()")
+        # fixed-capacity domains on Metal: the triplets past the restriction's used slots are all NULL, so the
+        # assembly may stop there (bsr_set_from_triplets' device-side count)
+        triplet_count = None
+        if (
+            device.is_metal
+            and domain.element_count_bound() is not None
+            and (isinstance(test, LocalTestField) or (nodal and test.space_restriction.node_count_bound() is not None))
+            and "count" not in sparse_bsr_options
+        ):
+            triplet_count = cache.borrow_temporary(temporary_store, shape=(1,), dtype=int, device=device)
+            if nodal:
+                wp.copy(triplet_count, test.space_restriction.node_count_bound(), count=1)
+            else:
+                wp.launch(
+                    _scaled_last_entry,
+                    dim=1,
+                    inputs=[
+                        test.space_restriction.partition_element_offsets(),
+                        trial.space.topology.MAX_NODES_PER_ELEMENT,
+                        triplet_count,
+                    ],
+                    device=device,
+                )
         bsr_set_from_triplets(
-            bsr_result, rows=triplet_rows, columns=triplet_cols, values=triplet_values, **sparse_bsr_options
+            bsr_result,
+            rows=triplet_rows,
+            columns=triplet_cols,
+            values=triplet_values,
+            count=triplet_count,
+            **sparse_bsr_options,
         )
+        if triplet_count is not None:
+            triplet_count.release()
         triplet_rows.release()
         triplet_values.release()
         triplet_cols.release()

@@ -7680,7 +7680,14 @@ class Volume:
             )
         return volume
 
-    def rebuild(self, points: array, status: array | None = None, point_mask: array | None = None) -> array | None:
+    def rebuild(
+        self,
+        points: array,
+        status: array | None = None,
+        point_mask: array | None = None,
+        *,
+        _point_count_limit: array | None = None,
+    ) -> array | None:
         """Rebuild this volume's topology in place from ``points``.
 
         The volume must have been created with ``rebuildable=True`` or explicit capacity arguments. The input kind
@@ -7710,7 +7717,9 @@ class Volume:
         if self._rebuild_info.kind == "tiles":
             return self._rebuild_tiles(points, status=status, point_mask=point_mask)
         if self._rebuild_info.kind == "voxels":
-            return self._rebuild_voxels(points, status=status, point_mask=point_mask)
+            return self._rebuild_voxels(
+                points, status=status, point_mask=point_mask, point_count_limit=_point_count_limit
+            )
 
         raise RuntimeError("Volume is not rebuildable")
 
@@ -7799,9 +7808,17 @@ class Volume:
         return status
 
     def _rebuild_voxels(
-        self, voxel_points: array, status: array | None = None, point_mask: array | None = None
+        self,
+        voxel_points: array,
+        status: array | None = None,
+        point_mask: array | None = None,
+        point_count_limit: array | None = None,
     ) -> array | None:
-        """Rebuild this volume's active-voxel topology from ``voxel_points``."""
+        """Rebuild this volume's active-voxel topology from ``voxel_points``.
+
+        ``point_count_limit`` (internal): a 1-element ``int32`` device array ``n`` such that every point at index
+        ``n`` or later is masked out; the Metal GPU builder then sorts only the first ``n`` keys (same result).
+        """
 
         if self._rebuild_info.kind != "voxels":
             raise RuntimeError("Volume was not allocated as a rebuildable active-voxel volume")
@@ -7822,7 +7839,7 @@ class Volume:
         if _metal_volume_enabled(self.device):
             warp._src.metal_volume.rebuild(
                 self, voxel_points, voxel_points.shape[0], point_mask, transform_buf, translation_buf, in_world_space,
-                status,
+                status, count_limit=point_count_limit if warp.config.metal_bounded_launch else None,
             )  # fmt: skip
         elif not self.device.is_cpu:
             self.runtime.core.wp_volume_rebuild_from_active_voxels_device(

@@ -410,11 +410,20 @@ def _sorted_keys(device, n: int, sentinel: int):
     return keys, indices, wide
 
 
-def _sort(keys, indices, n, sentinel):
+def _sort(keys, indices, n, sentinel, count_limit=None):
     from warp._src.utils import radix_sort_pairs  # noqa: PLC0415
 
     # every key is at most the sentinel, so its bits above the sentinel's are zero
-    radix_sort_pairs(keys, indices, n, 0, max(int(sentinel).bit_length(), 1))
+    end_bit = max(int(sentinel).bit_length(), 1)
+    if count_limit is None or not wp.config.metal_bounded_launch:
+        radix_sort_pairs(keys, indices, n, 0, end_bit)
+        return
+    # every key at or past count_limit[0] is the sentinel, the largest key: those pairs keep their place in the full
+    # sort, so sorting the prefix gives the same first half (the second half is scratch here)
+    from warp._src import metal_primitives  # noqa: PLC0415
+
+    if n > 0 and 0 < end_bit:
+        metal_primitives.radix_sort_pairs(keys, indices, n, 0, end_bit, 4, count_limit=count_limit)
 
 
 _ZERO_VIEW_TYPES = {1: wp.uint8, 2: wp.uint16, 4: wp.uint32, 8: wp.uint64}
@@ -478,7 +487,8 @@ def bsr_from_triplets(
             indices,
         ],
     )
-    _sort(keys, indices, n, sentinel)
+    # triplets at or past count[0] got the sentinel key above
+    _sort(keys, indices, n, sentinel, count_limit=count)
 
     from warp._src.utils import array_scan  # noqa: PLC0415
 
@@ -545,7 +555,8 @@ def bsr_transpose(
             device=device,
             inputs=[row_count, bsr_offsets, bsr_row_counts, bsr_columns, wp.int64(sentinel), keys, indices],
         )
-        _sort(keys, indices, n, sentinel)
+        # blocks at or past bsr_offsets[row_count] got the sentinel key above
+        _sort(keys, indices, n, sentinel, count_limit=bsr_offsets[row_count : row_count + 1])
         # the sorted kept blocks first (the padded scatter below then overwrites the destination slots)
         wp.launch(
             _transpose_columns,

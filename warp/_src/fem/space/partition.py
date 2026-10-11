@@ -7,7 +7,7 @@ import warp as wp
 from warp._src.fem import cache
 from warp._src.fem.geometry import GeometryPartition, WholeGeometryPartition
 from warp._src.fem.types import NULL_ELEMENT_INDEX, NULL_NODE_INDEX
-from warp._src.fem.utils import compress_node_indices
+from warp._src.fem.utils import _metal_gpu_utilities, compress_node_indices
 
 from .topology import SpaceTopology
 
@@ -162,6 +162,8 @@ class EnvironmentSpacePartition(SpacePartition):
         """Partition node offsets for each environment, or ``None`` if some nodes are environmentless."""
         self._node_count: int = 0
         """Number of nodes in the environment-major partition."""
+        self._node_index_end: wp.array | None = None
+        """Device-side end of the space node indices touched by the partition cells (fixed-capacity partitions)"""
 
         self.rebuild(device, temporary_store)
 
@@ -246,6 +248,7 @@ class EnvironmentSpacePartition(SpacePartition):
                 geo_partition_arg: self.geo_partition.CellArg,
                 space_arg: self.space_topology.TopologyArg,
                 node_env: wp.array(dtype=int),
+                node_index_end: wp.array(dtype=int),
             ):
                 partition_cell_index = wp.tid()
                 cell_index = self.geo_partition.cell_index(geo_partition_arg, partition_cell_index)
@@ -258,6 +261,8 @@ class EnvironmentSpacePartition(SpacePartition):
                 for n in range(cell_node_count):
                     space_nidx = self.space_topology.element_node_index(geo_arg, space_arg, cell_index, n)
                     wp.atomic_min(node_env, space_nidx, env_index)
+                    if node_index_end:
+                        wp.atomic_max(node_index_end, 0, space_nidx + 1)
 
             cell_count = self.geo_partition.cell_count()
             kernel_inputs = [
@@ -270,14 +275,30 @@ class EnvironmentSpacePartition(SpacePartition):
         node_env.fill_(env_count)
         kernel_inputs.append(node_env)
 
+        # Fixed-capacity cell partitions on Metal: the cells in use are a prefix, and every node they touch lies below
+        # the largest touched index + 1 (node_index_end); the nodes past it keep the unclassified environment, the
+        # largest key, so the compression may stop there (see compress_node_indices).
+        cell_bound = None if include_unclassified_nodes else self.geo_partition.cell_count_bound()
+        node_index_end = None
+        if cell_bound is not None and _metal_gpu_utilities(node_env.device):
+            if self._node_index_end is None or self._node_index_end.device != node_env.device:
+                self._node_index_end = wp.empty(1, dtype=int, device=node_env.device)
+            node_index_end = self._node_index_end
+            node_index_end.zero_()
+        if not include_unclassified_nodes:
+            kernel_inputs.append(node_index_end)
+
         wp.launch(
             dim=cell_count,
             kernel=node_environment_from_cells_kernel,
             inputs=kernel_inputs,
             device=device,
+            **({} if node_index_end is None else {"dim_limit": cell_bound}),
         )
 
-        group_offsets, node_indices = compress_node_indices(env_count + 1, node_env, temporary_store=temporary_store)
+        group_offsets, node_indices = compress_node_indices(
+            env_count + 1, node_env, temporary_store=temporary_store, index_count_limit=node_index_end
+        )
         device = node_env.device
 
         if max_node_count >= 0:
@@ -389,11 +410,13 @@ class EnvironmentSpacePartition(SpacePartition):
                 inputs=[self._node_indices, space_to_partition],
             )
         else:
+            # partition nodes past the active count write nothing
             wp.launch(
                 kernel=EnvironmentSpacePartition._scatter_active_partition_indices,
                 dim=partition_node_count,
                 device=device,
                 inputs=[active_node_offset_index, active_node_offsets, self._node_indices, space_to_partition],
+                dim_limit=active_node_offsets[active_node_offset_index : active_node_offset_index + 1],
             )
 
         return space_to_partition

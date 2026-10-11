@@ -72,6 +72,7 @@ def compress_node_indices(
     unique_node_count: wp.array(dtype=int) = None,
     unique_node_indices: wp.array(dtype=int) = None,
     temporary_store: cache.TemporaryStore = None,
+    index_count_limit: wp.array | None = None,
 ) -> (
     tuple[cache.Temporary, cache.Temporary] | tuple[cache.Temporary, cache.Temporary, cache.Temporary, cache.Temporary]
 ):
@@ -87,6 +88,12 @@ def compress_node_indices(
     ``[0, node_count)``, will be ignored.
 
     If the ``node_offsets``, ``sorted_array_indices``, ``unique_node_count`` and ``unique_node_indices`` arrays are provided and adequately shaped, they will be used to store the results instead of creating new arrays.
+
+    ``index_count_limit`` is an optional 1-element ``int32`` device array ``n``: the indices at flat position ``n`` or
+    later are ignored, as if they were ``NULL_NODE_INDEX`` (for instance the unused part of a fixed-capacity buffer;
+    their ``sorted_array_indices`` entries stay in place, at the end). On Metal the sort and the run-length encoding
+    then process only the first ``n`` indices, with dispatches sized on the GPU; elsewhere they process all of them.
+    The results are the same on every device.
     """
 
     index_count = node_indices.size
@@ -102,11 +109,27 @@ def compress_node_indices(
         wp.launch(
             kernel=_prepare_node_sort_kernel,
             dim=index_count,
-            inputs=[node_count, node_indices.flatten(), sorted_node_indices, sorted_array_indices, indices_per_element],
+            inputs=[
+                node_count,
+                node_indices.flatten(),
+                sorted_node_indices,
+                sorted_array_indices,
+                indices_per_element,
+                index_count_limit,
+            ],
         )
 
+        # Ignored indices sort last (NULL_NODE_INDEX is the largest key) and keep their order, so with a bound the
+        # sort and the run-length encoding may stop at the last index that can be valid
+        bounded = index_count_limit is not None and _metal_gpu_utilities(device)
+
         # Sort indices
-        radix_sort_pairs(sorted_node_indices, sorted_array_indices, count=index_count)
+        if bounded:
+            wp._src.metal_primitives.radix_sort_pairs(
+                sorted_node_indices, sorted_array_indices, index_count, 0, 32, 4, count_limit=index_count_limit
+            )
+        else:
+            radix_sort_pairs(sorted_node_indices, sorted_array_indices, count=index_count)
 
         # Build prefix sum of number of elements per node
         node_element_counts = cache.borrow_temporary(temporary_store, shape=index_count, dtype=int)
@@ -118,13 +141,24 @@ def compress_node_indices(
         if owns_unique_node_count:
             unique_node_count = cache.borrow_temporary(temporary_store, shape=(1,), dtype=int)
 
-        runlength_encode(
-            sorted_node_indices,
-            unique_node_indices,
-            node_element_counts,
-            value_count=index_count,
-            run_count=unique_node_count,
-        )
+        if bounded:
+            # the NULL run (if any) is shorter than without the bound; _scatter_node_counts drops it either way
+            wp._src.metal_primitives.runlength_encode(
+                sorted_node_indices,
+                unique_node_indices,
+                node_element_counts,
+                unique_node_count,
+                index_count,
+                count_limit=index_count_limit,
+            )
+        else:
+            runlength_encode(
+                sorted_node_indices,
+                unique_node_indices,
+                node_element_counts,
+                value_count=index_count,
+                run_count=unique_node_count,
+            )
 
         # Scatter seen run counts to global array of element count per node
         if node_offsets is None or node_offsets.shape != (node_count + 1,):
@@ -151,6 +185,18 @@ def compress_node_indices(
             return node_offsets, sorted_array_indices
 
         return node_offsets, sorted_array_indices, unique_node_count, unique_node_indices
+
+
+def _metal_gpu_utilities(device) -> bool:
+    """Whether the bounded (device-count) GPU utilities run on ``device``: Metal, with ``warp.config.metal_gpu_utilities``
+    and ``warp.config.metal_bounded_launch``."""
+    if not getattr(device, "is_metal", False) or not wp.config.metal_gpu_utilities:
+        return False
+    if not wp.config.metal_bounded_launch:
+        return False
+    import warp._src.metal_primitives  # noqa: F401, PLC0415
+
+    return True
 
 
 def validate_indices_in_range(
@@ -213,6 +259,7 @@ def masked_indices(
     local_to_global: wp.array | None = None,
     global_to_local: wp.array | None = None,
     temporary_store: cache.TemporaryStore = None,
+    index_count: wp.array | None = None,
 ) -> tuple[wp.array, wp.array]:
     """
     From an array of boolean masks (must be either 0 or 1), returns:
@@ -222,6 +269,9 @@ def masked_indices(
     If ``max_index_count`` is provided, it will be used to limit the number of indices returned instead of synchronizing back to the host
 
     If ``local_to_global`` and ``global_to_local`` are provided and adequately sized, they will be used to store the indices instead of creating new arrays.
+
+    If ``index_count`` (a 1-element ``int32`` array) is provided, it receives the number of valid entries of the local
+    to global map, ``min(mask count, max_index_count)``, on the device.
     """
 
     if global_to_local is None or global_to_local.shape != mask.shape:
@@ -231,6 +281,14 @@ def masked_indices(
         offsets = global_to_local
 
     array_scan(mask, offsets, inclusive=True)
+
+    if index_count is not None:
+        wp.launch(
+            _masked_index_count_kernel,
+            dim=1,
+            inputs=[offsets, max_index_count, index_count],
+            device=mask.device,
+        )
 
     # Get back total counts (on host if no estimate is provided)
     local_count = (
@@ -265,9 +323,13 @@ def _prepare_node_sort_kernel(
     sort_keys: wp.array(dtype=int),
     sort_values: wp.array(dtype=int),
     divisor: int,
+    index_count_limit: wp.array(dtype=int),
 ):
     i = wp.tid()
     node = node_indices[i]
+    if index_count_limit:
+        if i >= index_count_limit[0]:
+            node = NULL_NODE_INDEX
     sort_keys[i] = wp.where(node >= 0 and node < node_count, node, NULL_NODE_INDEX)
     sort_values[i] = i // divisor
 
@@ -305,6 +367,16 @@ def _scatter_node_counts(
         return
 
     node_counts[1 + node_index] = unique_counts[i]
+
+
+@wp.kernel
+def _masked_index_count_kernel(offsets: wp.array(dtype=int), max_count: int, index_count: wp.array(dtype=int)):
+    total = int(0)
+    if offsets.shape[0] > 0:
+        total = offsets[offsets.shape[0] - 1]
+    if max_count >= 0:
+        total = wp.min(total, max_count)
+    index_count[0] = total
 
 
 @wp.kernel

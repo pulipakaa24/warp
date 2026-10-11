@@ -239,6 +239,58 @@ class TestVolumeMetal(unittest.TestCase):
         self.assertEqual(gpu_status, wp.Volume.REBUILD_INVALID_INPUT)
         self.assert_same_volume(host, gpu, "rebuild voxels empty")
 
+    def test_rebuild_voxels_point_count_limit(self):
+        """A device-side point count past which every point is masked gives the same grid as the full rebuild."""
+        rng = np.random.default_rng(17)
+        initial = wp.array((rng.standard_normal((4000, 3)) * 0.5).astype(np.float32), dtype=wp.vec3, device=DEVICE)
+        capacities = {"max_active_voxels": 20000, "max_leaf_nodes": 4000, "max_lower_nodes": 64, "max_upper_nodes": 8}
+        pts = (rng.standard_normal((9000, 3)) * 0.6).astype(np.float32)
+        points = wp.array(pts, dtype=wp.vec3, device=DEVICE)
+        for head in (0, 1, 2047, 2048, 5000, 9000):
+            mask_np = (rng.random(9000) < 0.7).astype(np.int32)
+            mask_np[head:] = 0
+            mask = wp.array(mask_np, device=DEVICE)
+            limit = wp.array([head], dtype=wp.int32, device=DEVICE)
+            out = []
+            for bounded in (False, True):
+                volume = wp.Volume.allocate_by_voxels(initial, voxel_size=0.05, rebuildable=True, **capacities)
+                status = wp.zeros(1, dtype=wp.uint32, device=DEVICE)
+                volume.rebuild(points, status=status, point_mask=mask, _point_count_limit=limit if bounded else None)
+                out.append((volume, int(status.numpy()[0])))
+            with self.subTest(head=head):
+                self.assertEqual(out[0][1], out[1][1])
+                np.testing.assert_array_equal(volume_bytes(out[0][0]), volume_bytes(out[1][0]))
+
+    def test_rebuild_sequence_bounded_zeroing(self):
+        """Check that bounded zeroing gives the bytes of full zeroing over rebuilds that grow and shrink the grid.
+
+        The GPU builder zeroes either the whole buffer or only the node ranges in use
+        (``warp.config.metal_bounded_launch``).
+        """
+        rng = np.random.default_rng(23)
+        initial = wp.array((rng.standard_normal((3000, 3)) * 0.5).astype(np.float32), dtype=wp.vec3, device=DEVICE)
+        capacities = {"max_active_voxels": 30000, "max_leaf_nodes": 6000, "max_lower_nodes": 64, "max_upper_nodes": 8}
+        volumes = [
+            wp.Volume.allocate_by_voxels(initial, voxel_size=0.05, rebuildable=True, **capacities) for _ in range(2)
+        ]
+        saved = wp.config.metal_bounded_launch
+        try:
+            for k, scale in enumerate((0.6, 0.05, 1.2, 0.3, 30.0, 0.4, 0.02)):
+                pts = wp.array(
+                    (rng.standard_normal((8000, 3)) * scale).astype(np.float32), dtype=wp.vec3, device=DEVICE
+                )
+                statuses = []
+                for volume, bounded in zip(volumes, (False, True), strict=True):
+                    wp.config.metal_bounded_launch = bounded
+                    status = wp.zeros(1, dtype=wp.uint32, device=DEVICE)
+                    volume.rebuild(pts, status=status)
+                    statuses.append(int(status.numpy()[0]))
+                with self.subTest(rebuild=k, scale=scale):
+                    self.assertEqual(statuses[0], statuses[1])
+                    np.testing.assert_array_equal(volume_bytes(volumes[0]), volume_bytes(volumes[1]))
+        finally:
+            wp.config.metal_bounded_launch = saved
+
     def test_rebuild_tiles_matches_host(self):
         rng = np.random.default_rng(8)
         initial = wp.array(rng.integers(-200, 200, size=(500, 3)).astype(np.int32), dtype=wp.vec3i, device=DEVICE)
