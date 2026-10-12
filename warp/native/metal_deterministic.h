@@ -244,7 +244,10 @@ inline bool is_reachable_counter_element(thread const array_t<int>& target, WP_D
     return remaining == 0;
 }
 
-inline bool is_counter_store_target(thread const det_ctx& ctx, WP_DEVICE const void* ptr)
+// Not inlined: every guarded store of a deterministic kernel calls it, and inlining the loop at each site made the Metal
+// compiler service crash (XPC_ERROR_CONNECTION_INTERRUPTED) on Newton's narrow-phase kernel, 23 guarded stores and
+// 11 counters, under global deterministic mode. Only phase 0 reaches the call.
+__attribute__((noinline)) bool is_counter_store_target(thread const det_ctx& ctx, WP_DEVICE const void* ptr)
 {
     for (int i = 0; i < ctx.counter_target_count; ++i) {
         if (is_reachable_counter_element(ctx.counter_targets[i], ptr))
