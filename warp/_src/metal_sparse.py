@@ -308,6 +308,22 @@ def _transpose_offsets(
 
 
 @wp.kernel(enable_backward=False)
+def _transpose_offsets_counted(
+    count: wp.array[int], row_count: int, sentinel: wp.int64, keys: wp.array[Any], transposed_offsets: wp.array[int]
+):
+    # _transpose_offsets with the search limited to the first count[0] keys (the sorted prefix; every key past it
+    # is the sentinel, which no target exceeds, so the lower bound is the same), and no search for the columns past
+    # the last kept key, whose lower bound is the number of kept keys
+    col = wp.tid()
+    n = count[0]
+    target = wp.min(wp.int64(col) * wp.int64(row_count), sentinel)
+    if n > 0 and wp.int64(keys[n - 1]) < target:
+        transposed_offsets[col] = n
+    else:
+        transposed_offsets[col] = _key_lower_bound(keys, n, target)
+
+
+@wp.kernel(enable_backward=False)
 def _transpose_columns(
     n: int,
     row_count: int,
@@ -325,6 +341,28 @@ def _transpose_columns(
         if write_columns != 0:
             transposed_columns[i] = int(key - (key // wp.int64(row_count)) * wp.int64(row_count))
     elif write_columns != 0:
+        transposed_columns[i] = -1
+
+
+@wp.kernel(enable_backward=False)
+def _transpose_columns_counted(
+    count: wp.array[int],
+    row_count: int,
+    sentinel: wp.int64,
+    keys: wp.array[Any],
+    sorted_indices: wp.array[int],
+    transposed_columns: wp.array[int],
+    block_indices: wp.array[int],
+):
+    # _transpose_columns (compact form) without reading the keys past count[0]: they are all the sentinel
+    i = wp.tid()
+    key = sentinel
+    if i < count[0]:
+        key = wp.int64(keys[i])
+    if key < sentinel:
+        block_indices[i] = sorted_indices[i]
+        transposed_columns[i] = int(key - (key // wp.int64(row_count)) * wp.int64(row_count))
+    else:
         transposed_columns[i] = -1
 
 
@@ -548,6 +586,12 @@ def bsr_transpose(
     sentinel = col_count * row_count
     keys, indices, wide = _sorted_keys(device, n, sentinel)
 
+    # Compact transposes: the destination offsets search only the sorted prefix of the stored source blocks
+    # (bsr_offsets[row_count], on the device; every key past it is the sentinel) and skip the search for the columns
+    # past the last kept key, and the column pass does not read the keys past it. Same offsets, columns (-1 past the
+    # kept blocks) and block map as the full form.
+    stored = bsr_offsets[row_count : row_count + 1]
+    bounded = (not padded) and wp.config.metal_bounded_launch
     if n > 0:
         wp.launch(
             _transpose_keys_u64 if wide else _transpose_keys_u32,
@@ -556,23 +600,31 @@ def bsr_transpose(
             inputs=[row_count, bsr_offsets, bsr_row_counts, bsr_columns, wp.int64(sentinel), keys, indices],
         )
         # blocks at or past bsr_offsets[row_count] got the sentinel key above
-        _sort(keys, indices, n, sentinel, count_limit=bsr_offsets[row_count : row_count + 1])
+        _sort(keys, indices, n, sentinel, count_limit=stored)
         # the sorted kept blocks first (the padded scatter below then overwrites the destination slots)
-        wp.launch(
-            _transpose_columns,
-            dim=n,
-            device=device,
-            inputs=[
-                n,
-                row_count,
-                wp.int64(sentinel),
-                keys,
-                indices,
-                int(not padded),
-                transposed_columns,
-                block_indices,
-            ],
-        )
+        if bounded:
+            wp.launch(
+                _transpose_columns_counted,
+                dim=n,
+                device=device,
+                inputs=[stored, row_count, wp.int64(sentinel), keys, indices, transposed_columns, block_indices],
+            )
+        else:
+            wp.launch(
+                _transpose_columns,
+                dim=n,
+                device=device,
+                inputs=[
+                    n,
+                    row_count,
+                    wp.int64(sentinel),
+                    keys,
+                    indices,
+                    int(not padded),
+                    transposed_columns,
+                    block_indices,
+                ],
+            )
 
     if padded:
         wp.launch(
@@ -592,6 +644,13 @@ def bsr_transpose(
                 block_indices,
                 status,
             ],
+        )
+    elif bounded:
+        wp.launch(
+            _transpose_offsets_counted,
+            dim=col_count + 1,
+            device=device,
+            inputs=[stored, row_count, wp.int64(sentinel), keys, transposed_offsets],
         )
     else:
         wp.launch(

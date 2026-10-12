@@ -2906,10 +2906,17 @@ def bsr_set_transpose(
 
             _bsr_set_compact_row_counts(dest)
 
+    # blocks at or past dest.offsets[src.ncol] return at once: on Metal the launch stops there (device-side bound)
+    values_bound = (
+        {"dim_limit": dest.offsets[src.ncol : src.ncol + 1]}
+        if getattr(dest.device, "is_metal", False) and wp.config.metal_bounded_launch
+        else {}
+    )
     wp.launch(
         _bsr_transpose_values,
         dim=(dest.nnz, *dest.block_shape),
         device=dest.device,
+        **values_bound,
         inputs=[
             src.ncol,
             dest.scalar_type(src_scale),
