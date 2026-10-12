@@ -51,6 +51,10 @@ template <typename Type> inline CUDA_CALLABLE Type recipSqrt(Type x)
 {
 #if defined(__CUDA_ARCH__)
     return ::rsqrt(x);
+#elif defined(__METAL_VERSION__) && defined(WP_METAL_CUDA_LIBM) && WP_METAL_CUDA_LIBM
+    // CUDA's ::rsqrt is rsqrt.approx.f32 (MUFU.RSQ, 78 % correctly rounded); 1 / sqrt rounds differently on a third
+    // of the inputs
+    return wp_cuda_rsqrt(x);
 #else
     return Type(1) / sqrt(x);
 #endif

@@ -426,6 +426,17 @@ metal_device_args_max_threads: int = int(_os.environ.get("WP_METAL_DEVICE_ARGS_M
 read device-memory arguments in launches of at most this many threads (dispatch-bound: the preload of constant
 arguments dominates) and constant ones in larger launches. Read at each launch."""
 
+metal_cuda_libm: bool = _os.environ.get("WP_METAL_CUDA_LIBM", "1") != "0"
+"""Whether float32 :func:`warp.log`, :func:`warp.exp`, :func:`warp.sinh` and the reciprocal square root inside
+:func:`warp.svd3` / :func:`warp.eig3` compute on Metal what they compute on CUDA, bit for bit. On CUDA they are
+libdevice's ``__nv_logf`` / ``__nv_expf`` / ``__nv_sinhf`` (``expf`` and ``sinhf`` go through the approximate
+``ex2.approx`` instruction) and ``rsqrt.approx.f32``; the Metal library's ``log`` / ``exp`` / ``sinh`` and a
+correctly rounded ``1 / sqrt`` round differently on 3-50 % of inputs. ``True`` (the default) uses
+``warp/native/metal_cuda_libm.h`` (the PTX sequences NVRTC emits, with the ``MUFU.EX2`` / ``MUFU.RSQ`` table
+interpolators of Benjamin Carleton's sass-math model), equal to an NVIDIA L4's results on all 2^32 inputs; ``False``
+the Metal library's functions. Read when a module is built and part of the module hash when ``True``;
+``WP_METAL_CUDA_LIBM=0`` turns it off."""
+
 metal_eager_conditionals: bool = _os.environ.get("WP_METAL_EAGER_CONDITIONALS", "0") == "1"
 """Whether :func:`warp.capture_while` and :func:`warp.capture_if` outside a graph capture on Metal record their
 bodies once as a graph gated on the device (indirect execution ranges a kernel closes once the condition is 0), so

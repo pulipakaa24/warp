@@ -193,3 +193,93 @@ inline float wp_cuda_sqrt(float x)
     const uint hi = (c.x << 1) + m18_hi - p_hi - r_hi + 3u - uint(m18_lo < p_lo) - uint(l1 < r_lo) + uint(l3 < l2);
     return as_type<float>((uint(127 + half_e) << 23) | ((hi >> 3) & 0x7FFFFFu));
 }
+
+// MUFU.RSQ coefficients (sass-math's rsqrt table, packed {C0, C1 | C2 << 17}; rows 64..127 for odd exponents).
+// clang-format off
+constant uint2 wp_mufu_rsqrt_packed[128] = {
+    {0x3fffffbu, 0x05e4fffbu}, {0x3f817abu, 0x05aafa18u}, {0x3f05d8du, 0x0574f46fu}, {0x3e8cfe1u, 0x0540eefbu},
+    {0x3e16d06u, 0x0510e9bbu}, {0x3da336bu, 0x04e2e4abu}, {0x3d32197u, 0x04b6dfc9u}, {0x3cc3623u, 0x048cdb13u},
+    {0x3c56fb9u, 0x0464d687u}, {0x3becd10u, 0x043ed222u}, {0x3b84cf2u, 0x041ccde4u}, {0x3b1ee3du, 0x03f8c9c9u},
+    {0x3abafd0u, 0x03d8c5d1u}, {0x3a590a4u, 0x03b8c1fau}, {0x39f8fb1u, 0x039abe42u}, {0x399ac06u, 0x037cbaa8u},
+    {0x393e4b4u, 0x0362b72bu}, {0x38e38e1u, 0x0348b3cau}, {0x388a7aeu, 0x032eb082u}, {0x3833053u, 0x0316ad54u},
+    {0x37dd208u, 0x02feaa3eu}, {0x3788c0fu, 0x02e8a73fu}, {0x3735db3u, 0x02d4a457u}, {0x36e4647u, 0x02c0a184u},
+    {0x3694523u, 0x02ac9ec5u}, {0x36459a9u, 0x02989c1au}, {0x35f8339u, 0x02869982u}, {0x35ac142u, 0x027496fcu},
+    {0x3561334u, 0x02629487u}, {0x3517886u, 0x02549224u}, {0x34cf0b2u, 0x02448fd0u}, {0x3487b3eu, 0x02368d8du},
+    {0x34417acu, 0x02268b58u}, {0x33fc585u, 0x02188932u}, {0x33b8454u, 0x020c871au}, {0x33753b2u, 0x01fe850fu},
+    {0x3333331u, 0x01f08311u}, {0x32f226au, 0x01e48120u}, {0x32b20fcu, 0x01d87f3bu}, {0x3272e83u, 0x01ce7d62u},
+    {0x3234aaau, 0x01c27b94u}, {0x31f7510u, 0x01b879d1u}, {0x31bad65u, 0x01ae7819u}, {0x317f353u, 0x01a4766bu},
+    {0x3144689u, 0x019a74c7u}, {0x310a6b8u, 0x0192732du}, {0x30d1398u, 0x0188719cu}, {0x3098cdau, 0x017e7013u},
+    {0x306123cu, 0x01766e94u}, {0x302a375u, 0x016e6d1du}, {0x2ff4045u, 0x01666baeu}, {0x2fbe86cu, 0x01606a48u},
+    {0x2f89babu, 0x015868e9u}, {0x2f559c3u, 0x01506791u}, {0x2f2227bu, 0x014a6641u}, {0x2eef598u, 0x014464f8u},
+    {0x2ebd2e6u, 0x013c63b5u}, {0x2e8ba2du, 0x01346279u}, {0x2e5ab38u, 0x012e6144u}, {0x2e2a5d3u, 0x01286015u},
+    {0x2dfa9ceu, 0x01225eecu}, {0x2dcb6f6u, 0x011e5dc9u}, {0x2d9cd24u, 0x01185cacu}, {0x2d6ec23u, 0x01125b94u},
+    {0x2d413c7u, 0x042ab501u}, {0x2ce7c60u, 0x0402b0d8u}, {0x2c905a4u, 0x03daacd7u}, {0x2c3ae53u, 0x03b6a8fcu},
+    {0x2be7548u, 0x0396a546u}, {0x2b9596au, 0x0374a1b1u}, {0x2b459afu, 0x03569e3eu}, {0x2af7512u, 0x03389ae9u},
+    {0x2aaaaa8u, 0x031c97b2u}, {0x2a5f985u, 0x03009496u}, {0x2a160d3u, 0x02e69196u}, {0x29cdfbbu, 0x02ce8eafu},
+    {0x298757bu, 0x02b88be1u}, {0x2942150u, 0x02a08929u}, {0x28fe285u, 0x028c8688u}, {0x28bb873u, 0x027883fdu},
+    {0x287a269u, 0x02648185u}, {0x2839fcfu, 0x02527f21u}, {0x27fb00eu, 0x02407cd0u}, {0x27bd28fu, 0x022e7a90u},
+    {0x27806c7u, 0x021e7861u}, {0x2744c35u, 0x020e7643u}, {0x270a255u, 0x02007435u}, {0x26d08adu, 0x01f07235u},
+    {0x2697ec5u, 0x01e27044u}, {0x266042cu, 0x01d66e61u}, {0x2629877u, 0x01ca6c8cu}, {0x25f3b3eu, 0x01bc6ac3u},
+    {0x25bec15u, 0x01b26907u}, {0x258aaa4u, 0x01a46756u}, {0x2557685u, 0x019a65b1u}, {0x2524f65u, 0x018e6417u},
+    {0x24f34e5u, 0x01866288u}, {0x24c26bau, 0x017c6103u}, {0x2492491u, 0x01725f88u}, {0x2462e18u, 0x01685e16u},
+    {0x2434308u, 0x01605caeu}, {0x2406317u, 0x01565b4eu}, {0x23d8e00u, 0x014e59f7u}, {0x23ac380u, 0x014658a9u},
+    {0x2380352u, 0x013e5762u}, {0x2354d3bu, 0x01365623u}, {0x232a0fbu, 0x013054ecu}, {0x22ffe5bu, 0x012853bcu},
+    {0x22d651cu, 0x01225293u}, {0x22ad50cu, 0x011c5171u}, {0x2284df5u, 0x01145055u}, {0x225cf9du, 0x01104f40u},
+    {0x22359d9u, 0x010a4e31u}, {0x220ec77u, 0x01044d28u}, {0x21e8748u, 0x00fc4c24u}, {0x21c2a1bu, 0x00f84b27u},
+    {0x219d4c4u, 0x00f44a2fu}, {0x217871du, 0x00ee493cu}, {0x21540f4u, 0x00ea484eu}, {0x213022au, 0x00e44765u},
+    {0x210ca91u, 0x00e04681u}, {0x20e9a06u, 0x00dc45a2u}, {0x20c7065u, 0x00d644c7u}, {0x20a4d86u, 0x00d243f1u},
+    {0x2083148u, 0x00ce431fu}, {0x2061b87u, 0x00ca4251u}, {0x2040c25u, 0x00c64187u}, {0x2020305u, 0x00c240c2u}
+};
+// clang-format on
+
+// x * x minus the 19 low columns of the antidiagonal and of the first 9 partial-product rows (sass-math squarer).
+inline ulong wp_mufu_square_approx(ulong x)
+{
+    ulong anti = 0;
+    for (int i = 0; i < 16; ++i)
+        anti |= ((x >> i) & 1ul) << (2 * i);
+    ulong err = anti & 0x7FFFFul;
+    for (int i = 0; i < 9; ++i) {
+        const ulong row = ((x << (i + 1)) & 0xFFFFFFFFul) & ~((1ul << (2 * i + 2)) - 1ul);
+        err += ((x >> i) & 1ul) ? (row & 0x7FFFFul) : 0ul;
+    }
+    return x * x - err;
+}
+
+// rsqrt.approx.f32: what CUDA's rsqrtf / rsqrt(float) compile to, with or without fast math (rsqrt.approx is the only
+// float32 rsqrt in PTX). Warp's svd3 / eig3 call ::rsqrt on CUDA and 1 / sqrt elsewhere. For normal inputs this is
+// MUFU.RSQ: C0 2^31 - C1 xl 2^17 + C2 sq(xl) + bias, doubled, fraction = bits 34..56; exact powers of four are
+// returned exactly. Subnormal inputs: ptxas pre-scales by 2^24 and the result by 2^12; MUFU.RSQ is exponent-invariant
+// (measured on sm_89), so that is folded into the exponent here.
+inline float wp_cuda_rsqrt(float x)
+{
+    const uint u = as_type<uint>(x);
+    const uint ex = (u >> 23) & 0xFFu;
+    uint f = u & 0x7FFFFFu;
+    if (ex == 0xFFu)
+        return (f != 0u || (u >> 31) != 0u) ? as_type<float>(0x7FFFFFFFu) : 0.0f;
+    if (ex == 0u && f == 0u)
+        return as_type<float>((u & 0x80000000u) | 0x7F800000u);
+    if ((u >> 31) != 0u)
+        return as_type<float>(0x7FFFFFFFu);
+    int e;
+    if (ex == 0u) {
+        const int msb = 31 - int(metal::clz(f));
+        e = msb - 149;
+        f = (f << (23 - msb)) & 0x7FFFFFu;
+    } else {
+        e = int(ex) - 127;
+    }
+    const int odd = e & 1;
+    const int half_e = (e - odd) >> 1;
+    if (odd == 0 && f == 0u)
+        return as_type<float>(uint(127 - half_e) << 23);
+    const uint2 c = wp_mufu_rsqrt_packed[(f >> 17) + uint(odd << 6)];
+    const ulong c0 = c.x, c1 = c.y & 0x1FFFFu, c2 = c.y >> 17;
+    const ulong xl = f & 0x1FFFFu;
+    ulong s = (c0 << 31) - ((c1 * xl) << 17) + c2 * wp_mufu_square_approx(xl);
+    s += 0x7FFF800000000000ul >> 30;
+    s <<= 1;
+    const uint frac = uint(s >> 34) & 0x7FFFFFu;
+    return as_type<float>((uint(126 - half_e) << 23) | frac);
+}

@@ -15,6 +15,7 @@
 #include <metal_stdlib>
 
 #include "metal_cuda_fast_math.h"
+#include "metal_cuda_libm.h"
 
 #define WP_NO_FLOAT64
 
@@ -155,13 +156,24 @@ inline void free(thread void*) { }
 #endif
 
 /// math.h: builtin.h calls the C names; forward them to the Metal library.
+// log / exp / sinh: CUDA's libdevice results bit for bit (metal_cuda_libm.h) with warp.config.metal_cuda_libm (the
+// default, WP_METAL_CUDA_LIBM), otherwise the Metal library's (they differ from CUDA's on 3-50 % of inputs).
+#if defined(WP_METAL_CUDA_LIBM) && WP_METAL_CUDA_LIBM
+#define WP_METAL_LOGF wp_cuda_logf
+#define WP_METAL_EXPF wp_cuda_expf
+#define WP_METAL_SINHF wp_cuda_sinhf
+#else
+#define WP_METAL_LOGF metal::log
+#define WP_METAL_EXPF metal::exp
+#define WP_METAL_SINHF metal::sinh
+#endif
 inline int abs(int x) { return metal::abs(x); }
 inline long llabs(long x) { return metal::abs(x); }
 inline float fmodf(float x, float y) { return metal::fmod(x, y); }
-inline float logf(float x) { return metal::log(x); }
+inline float logf(float x) { return WP_METAL_LOGF(x); }
 inline float log2f(float x) { return metal::log2(x); }
 inline float log10f(float x) { return metal::log10(x); }
-inline float expf(float x) { return metal::exp(x); }
+inline float expf(float x) { return WP_METAL_EXPF(x); }
 inline float exp2f(float x) { return metal::exp2(x); }
 inline float ldexpf(float x, int e) { return metal::ldexp(x, e); }
 // fast_math (builtin.h): approximate square root, as NVRTC's --prec-sqrt=false: CUDA's MUFU.SQRT bit for bit
@@ -203,7 +215,7 @@ inline float atan2f(float y, float x) { return metal::atan2(y, x); }
 inline float cosf(float x) { return metal::cos(x); }
 inline float sinf(float x) { return metal::sin(x); }
 inline float tanf(float x) { return metal::tan(x); }
-inline float sinhf(float x) { return metal::sinh(x); }
+inline float sinhf(float x) { return WP_METAL_SINHF(x); }
 inline float coshf(float x) { return metal::cosh(x); }
 inline float tanhf(float x) { return metal::tanh(x); }
 inline float fmaf(float x, float y, float z) { return metal::fma(x, y, z); }
@@ -285,8 +297,8 @@ inline float floor(float x) { return metal::floor(x); }
 inline float ceil(float x) { return metal::ceil(x); }
 inline float round(float x) { return metal::round(x); }
 inline float trunc(float x) { return metal::trunc(x); }
-inline float exp(float x) { return metal::exp(x); }
-inline float log(float x) { return metal::log(x); }
+inline float exp(float x) { return WP_METAL_EXPF(x); }
+inline float log(float x) { return WP_METAL_LOGF(x); }
 inline float pow(float x, float y) { return wp_metal_pow(x, y); }
 inline float fmin(float x, float y) { return metal::fmin(x, y); }
 inline float fmax(float x, float y) { return metal::fmax(x, y); }
@@ -299,7 +311,7 @@ inline float asin(float x) { return metal::asin(x); }
 inline float acos(float x) { return metal::acos(x); }
 inline float atan(float x) { return metal::atan(x); }
 inline float atan2(float y, float x) { return metal::atan2(y, x); }
-inline float sinh(float x) { return metal::sinh(x); }
+inline float sinh(float x) { return WP_METAL_SINHF(x); }
 inline float cosh(float x) { return metal::cosh(x); }
 inline float tanh(float x) { return metal::tanh(x); }
 inline float log2(float x) { return metal::log2(x); }

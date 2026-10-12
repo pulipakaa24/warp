@@ -1204,6 +1204,73 @@ class TestMetal(unittest.TestCase):
         for fast_out, ref_out in zip(self._fast_math_ops(True, a, x), self._fast_math_ops(False, a, x)):
             np.testing.assert_array_equal(fast_out.view(np.uint32), ref_out.view(np.uint32))
 
+    def test_cuda_libm_matches_l4(self):
+        """warp.config.metal_cuda_libm: log / exp / sinh and svd3's rsqrt return what an L4 returns (sm_89, Warp 1.16).
+
+        Inputs where the Metal library's function rounds differently from libdevice's, over the whole range
+        (subnormal arguments and results included), with the L4's result bits; the emulation equals the L4 on all
+        2^32 inputs of each function. rsqrt: CUDA's ::rsqrt is rsqrt.approx.f32 (MUFU.RSQ).
+        """
+        vectors = {
+            "log": [(0x08100F37, 0xC299A46D), (0x13A9FADD, 0xC272DA6C), (0x1AF9E546, 0xC24A7EDA),
+                    (0x24BB1CEE, 0xC2143379), (0x2DCC968D, 0xC1C3DFE9), (0x371D731E, 0xC139390B),
+                    (0x40CBA07C, 0x3FECDEF0), (0x49F5085B, 0x41683267), (0x53575E71, 0x41DC6CAC),
+                    (0x5E29FBFE, 0x422A433B), (0x662AF6DB, 0x4256A5A4), (0x6D7EAE81, 0x427F0EB9),
+                    (0x7AF723F8, 0x42A4E60A), (0x03B9EFE5, 0xC2A59BCB), (0x4003B828, 0x3F38C743),
+                    (0x008A8542, 0xC2AE83DE), (0x00000075, 0xC2C50894)],
+            "exp": [(0x34851D72, 0x3F800003), (0xB628ED18, 0x3F7FFFD6), (0xB77C8E51, 0x3F7FFF04),
+                    (0xB8C4B5A3, 0x3F7FF9DB), (0xBA126368, 0x3F7FDB6B), (0xBB5A484D, 0x3F7F2615),
+                    (0x3C768F6B, 0x3F81F0D9), (0xBDB9FA71, 0x3F69C6EB), (0x3F22A53C, 0x3FF19E96),
+                    (0x3FFBDE1B, 0x40E4F026), (0xC0B7A382, 0x3B52F483), (0x416F6C8B, 0x4A407845),
+                    (0xC22311DA, 0x221183E6), (0xC2CFF12C, 0x00000001), (0x35224206, 0x3F800005),
+                    (0xEF521205, 0x00000000)],
+            "sinh": [(0xBA147F65, 0xBA147F66), (0xBA60C513, 0xBA60C515), (0x3B190230, 0x3B190239),
+                     (0xBBDC41E0, 0xBBDC424D), (0x3C9EF6EB, 0x3C9EF979), (0xBD67864C, 0xBD67A5DD),
+                     (0xBE31D497, 0xBE32B9C3), (0x3EFA4B7A, 0x3F023125), (0xBFC42E8C, 0xC00D4424),
+                     (0x406009E7, 0x41846BD2), (0x410127FA, 0x44C8455B), (0xC1A58080, 0xCDE61923),
+                     (0xC24668D3, 0xE2BCD959), (0xB02F2103, 0xB02F2103), (0x19F93EA8, 0x19F93EA8),
+                     (0x8019549E, 0x8019549E)],
+            "rsqrt": [(0x3F95ED1A, 0x3F6C8A78), (0x404D2052, 0x3F0EFE98), (0x3F885E40, 0x3F780561),
+                      (0x402A94E5, 0x3F1CCE72), (0x4064472D, 0x3F078CAC), (0x404FBEC2, 0x3F0E171F),
+                      (0x3F8A160F, 0x3F767929), (0x3F9818D0, 0x3F6AD8CA), (0x3FD50B29, 0x3F466E79),
+                      (0x3FEEE168, 0x3F3B64BE), (0x3FADEFD3, 0x3F5B9BC8), (0x3FBC9F9D, 0x3F52E2BB)],
+        }
+
+        @wp.func_native("return wp_cuda_rsqrt(x);")
+        def cuda_rsqrt(x: float) -> float: ...
+
+        def run(enabled):
+            @wp.kernel(module="unique", enable_backward=False)
+            def libm(x: wp.array2d[float], y: wp.array2d[float]):
+                i = wp.tid()
+                y[0, i] = wp.log(x[0, i])
+                y[1, i] = wp.exp(x[1, i])
+                y[2, i] = wp.sinh(x[2, i])
+                y[3, i] = cuda_rsqrt(x[3, i])
+
+            n = max(len(v) for v in vectors.values())
+            x = np.ones((4, n), dtype=np.uint32) * np.uint32(0x3F800000)
+            for row, v in enumerate(vectors.values()):
+                x[row, : len(v)] = [a for a, _ in v]
+            saved = wp.config.metal_cuda_libm
+            try:
+                wp.config.metal_cuda_libm = enabled
+                libm.module.mark_modified()  # read when the module is hashed and built
+                xs = wp.array(x.view(np.float32), dtype=float, device=self.device)
+                ys = wp.zeros_like(xs)
+                wp.launch(libm, dim=n, inputs=[xs, ys], device=self.device)
+                return ys.numpy().view(np.uint32)
+            finally:
+                wp.config.metal_cuda_libm = saved
+
+        y = run(True)
+        for row, (name, v) in enumerate(vectors.items()):
+            np.testing.assert_array_equal(y[row, : len(v)], np.array([b for _, b in v], dtype=np.uint32), err_msg=name)
+        # the Metal library's log / exp / sinh round differently on these inputs
+        y = run(False)
+        for row, (name, v) in enumerate(list(vectors.items())[:3]):
+            self.assertGreater(int((y[row, : len(v)] != np.array([b for _, b in v], dtype=np.uint32)).sum()), 5, name)
+
     def test_64bit_bitwise_atomics_are_exact(self):
         """64-bit atomic and / or / xor update each 32-bit half atomically: the final value is exact under contention."""
         n = 1 << 16

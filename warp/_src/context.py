@@ -3122,6 +3122,10 @@ class ModuleHasher:
             ch.update(b"metal_device_args:1")
         elif warp.config.metal_device_args == "auto":
             ch.update(bytes(f"metal_device_args:auto-small:{int(warp.config.metal_device_args_max_cost)}", "utf-8"))
+        # on by default: salts every hash once, so Metal binaries built with the Metal library's log / exp / sinh
+        # and rsqrt are not reused (with it off, hashes and binaries are those of before)
+        if warp.config.metal_cuda_libm:
+            ch.update(b"metal_cuda_libm:1")
 
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output
@@ -3844,6 +3848,9 @@ class ModuleBuilder:
             # entry points; forward entry points name their address space, see metal_kernel_device_args)
             if warp.config.metal_device_args is True:
                 source = "#define WP_METAL_DEVICE_ARGS 1\n" + source
+            # CUDA's logf / expf / sinhf and rsqrt (metal_crt.h, metal_cuda_libm.h, svd.h)
+            if warp.config.metal_cuda_libm:
+                source = "#define WP_METAL_CUDA_LIBM 1\n" + source
             # Metal compiles from an in-memory string without include paths
             source = warp._src.build.expand_includes(source)
             source = warp._src.build.metal_rewrite_printf(source)  # shader logging has no %s
