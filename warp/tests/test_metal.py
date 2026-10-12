@@ -4,6 +4,7 @@
 """Behavior specific to the Metal backend, exercised through the public API."""
 
 import gc
+import os
 import unittest
 
 import numpy as np
@@ -1110,8 +1111,8 @@ class TestMetal(unittest.TestCase):
         """The fast_math module option makes float32 division and sqrt approximate, as --use_fast_math does on CUDA.
 
         CUDA's --use_fast_math makes x / y div.approx.ftz.f32 (MUFU.RCP + FMUL.FTZ) and sqrt sqrt.approx.ftz.f32
-        (MUFU.SQRT), without reassociation. warp.config.metal_fast_math selects CUDA's results bit for bit ("cuda",
-        the default), Metal's fast forms ("relaxed") or correctly rounded ones ("off"); without the option both are
+        (MUFU.SQRT), without reassociation. warp.config.metal_fast_math selects CUDA's results bit for bit ("cuda"),
+        Metal's fast forms ("relaxed") or correctly rounded ones ("off", the default); without the option both are
         correctly rounded. No mode may reassociate (x + 2^24) - 2^24 into x.
         """
         rng = np.random.default_rng(0)
@@ -1191,6 +1192,17 @@ class TestMetal(unittest.TestCase):
         np.testing.assert_array_equal(q, expected)
         finite = ~np.isnan(expected)
         np.testing.assert_array_equal(np.signbit(q[finite]), np.signbit(expected[finite]))
+
+    def test_fast_math_default_is_off(self):
+        """By default (metal_fast_math "off") a fast_math module computes bitwise what the same module without it does."""
+        self.assertEqual(wp.config.metal_fast_math, os.environ.get("WP_METAL_FAST_MATH", "off"))
+        if wp.config.metal_fast_math != "off":
+            self.skipTest("WP_METAL_FAST_MATH overrides the default")
+        rng = np.random.default_rng(1)
+        a = rng.uniform(-2.0, 2.0, 1 << 12).astype(np.float32)
+        x = rng.uniform(1.0e-3, 10.0, 1 << 12).astype(np.float32)
+        for fast_out, ref_out in zip(self._fast_math_ops(True, a, x), self._fast_math_ops(False, a, x)):
+            np.testing.assert_array_equal(fast_out.view(np.uint32), ref_out.view(np.uint32))
 
     def test_64bit_bitwise_atomics_are_exact(self):
         """64-bit atomic and / or / xor update each 32-bit half atomically: the final value is exact under contention."""

@@ -384,7 +384,7 @@ on Metal devices (the key-based builder of ``volume_builder.cpp``; the grid buff
 builder's). Rebuilds then need no host synchronization. False drains the GPU and runs the host builder on unified
 memory, as before. Rebuildable allocation always uses the host builder. Read at each call."""
 
-metal_fast_math: str = _os.environ.get("WP_METAL_FAST_MATH", "cuda")
+metal_fast_math: str = _os.environ.get("WP_METAL_FAST_MATH", "off")
 """How modules with the ``fast_math`` option compile on Metal. NVRTC's ``--use_fast_math`` makes every float32
 division of such a module ``div.approx.ftz.f32`` (SASS ``MUFU.RCP`` + ``FMUL.FTZ``) and ``sqrtf``
 ``sqrt.approx.ftz.f32`` (``MUFU.SQRT``). ``"cuda"``: the same results bit for bit, from an exact integer emulation of
@@ -392,7 +392,13 @@ the two ``MUFU`` instructions (``warp/native/metal_cuda_fast_math.h``). ``"relax
 (reassociation kept off): ``metal::fast::divide`` / ``metal::fast::sqrt``, Apple's approximations, faster, not CUDA's
 bits, and the sign of zero is not honoured. ``"off"``: ``fast_math`` is ignored (correctly rounded division and
 sqrt). Read when a ``fast_math`` module is hashed (in practice when its kernels are defined or first loaded) and
-part of its hash: set it before defining such kernels; ``WP_METAL_FAST_MATH`` sets it."""
+part of its hash: set it before defining such kernels; ``WP_METAL_FAST_MATH`` sets it.
+
+The default is ``"off"``, the precise lowering every Metal module had before ``fast_math`` was honoured on Metal:
+the ``"cuda"`` emulation costs about 3x a correctly rounded division or square root, and either approximate form
+would change the results of every ``fast_math`` kernel a program already runs (MuJoCo Warp's ray casts, Newton's
+ray and collision helpers). Code that wants CUDA's fast_math semantics opts in (MetalSim's MPM:
+``newton_compat.install(metal_fast_math=...)``)."""
 
 metal_device_args: bool | str = {"1": True, "0": False}.get(_os.environ.get("WP_METAL_DEVICE_ARGS", "auto"), "auto")
 """Address space Metal kernels read their argument structs and launch bounds from: ``"auto"`` (default) decides per

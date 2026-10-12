@@ -32,7 +32,7 @@
 //   "relaxed" (WP_FAST_MATH): Metal's relaxed math mode with reassociation switched back off: every division lowered
 //       as metal::fast::divide (a * fast rcp(b)), metal::fast::sqrt; Apple's approximations, not NVIDIA's, and the
 //       sign of zero is not honoured. Contraction is set by fuse_fp below in both cases.
-//   "off": fast_math is ignored (correctly rounded division and sqrt).
+//   "off" (the default): fast_math is ignored (correctly rounded division and sqrt).
 // Apple GPUs flush float32 denormals in every math mode.
 #if defined(WP_FAST_MATH) && WP_FAST_MATH
 #pragma METAL fp math_mode(relaxed)

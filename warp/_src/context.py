@@ -3835,7 +3835,7 @@ class ModuleBuilder:
             # fast_math selects approximate float32 division and square root in builtin.h / metal_crt.h, as NVRTC's
             # --use_fast_math does on CUDA: CUDA's own results ("cuda"), Metal's fast forms ("relaxed") or none ("off")
             if self.options.get("fast_math"):
-                mode = self.options.get("metal_fast_math", "cuda")  # resolve_options
+                mode = self.options.get("metal_fast_math", "off")  # resolve_options
                 if mode == "cuda":
                     source = "#define WP_METAL_CUDA_FAST_MATH 1\n" + source
                 elif mode == "relaxed":
