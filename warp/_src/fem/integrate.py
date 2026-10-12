@@ -1307,10 +1307,14 @@ def _generate_auxiliary_kernels(
     # heuristic to use tiles for "long" quadratures
     dispatch_tile_size = 32
     qp_eval_count = quadrature.evaluation_point_count()
+    # Metal takes CUDA's choice: the tiled kernels sum each node's contributions in another order (32 strided lane
+    # sums, then the warp shuffle tree, which Metal's SIMD-group reduction reproduces), so the same choice gives the
+    # same rounding on both GPUs
+    tiles_ok = device.is_cuda or device.is_metal
 
     if trial is None:
         if (
-            not device.is_cuda
+            not tiles_ok
             or qp_eval_count * test.space_restriction.total_node_element_count()
             < 3 * dispatch_tile_size * test.space_restriction.node_count() * test.domain.element_count()
         ):
@@ -1319,7 +1323,7 @@ def _generate_auxiliary_kernels(
             test, quadrature, accumulate_dtype, dispatch_tile_size, kernel_options
         )
     else:
-        if not device.is_cuda or qp_eval_count < 3 * dispatch_tile_size * test.domain.element_count():
+        if not tiles_ok or qp_eval_count < 3 * dispatch_tile_size * test.domain.element_count():
             dispatch_tile_size = 1
         dispatch_kernel = make_bilinear_dispatch_kernel(
             test, trial, quadrature, accumulate_dtype, dispatch_tile_size, kernel_options
