@@ -151,6 +151,7 @@ class SpaceRestriction:
             return_unique_nodes=True,
             temporary_store=temporary_store,
             index_count_limit=slot_bound,
+            keep_ignored_array_indices=False,  # _split_vertex_element_index reads only the kept ones
         )
 
         # Extract element index and index in element

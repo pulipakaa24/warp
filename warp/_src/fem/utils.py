@@ -73,6 +73,7 @@ def compress_node_indices(
     unique_node_indices: wp.array(dtype=int) = None,
     temporary_store: cache.TemporaryStore = None,
     index_count_limit: wp.array | None = None,
+    keep_ignored_array_indices: bool = True,
 ) -> (
     tuple[cache.Temporary, cache.Temporary] | tuple[cache.Temporary, cache.Temporary, cache.Temporary, cache.Temporary]
 ):
@@ -93,7 +94,9 @@ def compress_node_indices(
     later are ignored, as if they were ``NULL_NODE_INDEX`` (for instance the unused part of a fixed-capacity buffer;
     their ``sorted_array_indices`` entries stay in place, at the end). On Metal the sort and the run-length encoding
     then process only the first ``n`` indices, with dispatches sized on the GPU; elsewhere they process all of them.
-    The results are the same on every device.
+    The results are the same on every device. With ``keep_ignored_array_indices=False`` the caller does not read the
+    ``sorted_array_indices`` entries of the ignored positions (past ``node_offsets[node_count]``), and on Metal they
+    are left unwritten.
     """
 
     index_count = node_indices.size
@@ -105,6 +108,13 @@ def compress_node_indices(
         if sorted_array_indices is None or sorted_array_indices.shape != sorted_node_indices.shape:
             sorted_array_indices = cache.borrow_temporary_like(sorted_node_indices, temporary_store)
 
+        # Ignored indices sort last (NULL_NODE_INDEX is the largest key) and keep their order, so with a bound the
+        # sort and the run-length encoding may stop at the last index that can be valid
+        bounded = index_count_limit is not None and _metal_gpu_utilities(device)
+
+        # With the bound, the sort and the run-length encoding never read the keys past it (the sort leaves those
+        # pairs in place), so their keys are not written; their array indices only if the caller reads them.
+        tail_mode = 0 if not bounded else (1 if keep_ignored_array_indices else 2)
         indices_per_element = 1 if node_indices.ndim == 1 else node_indices.shape[-1]
         wp.launch(
             kernel=_prepare_node_sort_kernel,
@@ -116,12 +126,10 @@ def compress_node_indices(
                 sorted_array_indices,
                 indices_per_element,
                 index_count_limit,
+                tail_mode,
             ],
+            **({"dim_limit": index_count_limit} if tail_mode == 2 else {}),
         )
-
-        # Ignored indices sort last (NULL_NODE_INDEX is the largest key) and keep their order, so with a bound the
-        # sort and the run-length encoding may stop at the last index that can be valid
-        bounded = index_count_limit is not None and _metal_gpu_utilities(device)
 
         # Sort indices
         if bounded:
@@ -324,12 +332,18 @@ def _prepare_node_sort_kernel(
     sort_values: wp.array(dtype=int),
     divisor: int,
     index_count_limit: wp.array(dtype=int),
+    tail_mode: int,
 ):
     i = wp.tid()
-    node = node_indices[i]
     if index_count_limit:
         if i >= index_count_limit[0]:
-            node = NULL_NODE_INDEX
+            # 0: ignored (NULL key, array index kept); 1: array index only; 2: nothing (see compress_node_indices)
+            if tail_mode == 0:
+                sort_keys[i] = NULL_NODE_INDEX
+            if tail_mode <= 1:
+                sort_values[i] = i // divisor
+            return
+    node = node_indices[i]
     sort_keys[i] = wp.where(node >= 0 and node < node_count, node, NULL_NODE_INDEX)
     sort_values[i] = i // divisor
 
