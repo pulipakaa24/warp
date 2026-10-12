@@ -16,12 +16,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -91,6 +93,18 @@ int idle_flush_dispatches()
     return value;
 }
 
+// Memory freed during a graph capture is reused by later allocations of the same capture (WP_METAL_CAPTURE_REUSE=0
+// keeps every capture-time allocation separate, as before). Graph replays are serial, so an allocation recorded after
+// a free can occupy the freed memory, as in a CUDA graph's memory pool; see Graph::free_pool.
+bool capture_reuse_enabled()
+{
+    static const bool value = [] {
+        const char* env = std::getenv("WP_METAL_CAPTURE_REUSE");
+        return !env || atoi(env) != 0;
+    }();
+    return value;
+}
+
 // WP_METAL_INFLIGHT bounds the committed-but-unfinished command buffers (see flush()).
 int max_command_buffers_in_flight()
 {
@@ -137,6 +151,13 @@ struct Graph {
     std::vector<std::pair<size_t, size_t>> fixups;  // (field offset, data offset): field = data GPU address
     id<MTLBuffer> buffer;  // bytes uploaded at capture end
     std::vector<id<MTLBuffer>> retained;  // freed during capture but referenced by the recording
+    // Buffers allocated during this capture and freed during it, keyed by length: later allocations of the same
+    // capture take them instead of new memory (wp_alloc_metal), since replays run the recorded work in order (the
+    // dispatches that used a buffer before its free have completed when the ones recorded after its reuse run).
+    // Without reuse a capture holds every temporary of every step it records at once: Isaac Lab's Franka-Pour policy
+    // step (4 simulation steps) at 2,048 worlds allocated 70.7 GB against the device's 55.7 GB working set and
+    // replayed NaN, since memory past the working set is not resident. Moved to `retained` at capture end.
+    std::multimap<size_t, id<MTLBuffer>> free_pool;
     // Replay: the dispatches encoded once into an indirect command buffer (with a barrier between
     // consecutive commands), executed with one call per launch instead of re-encoding every dispatch.
     // Built lazily on the first launch; graphs with host ops keep the per-dispatch path.
@@ -208,6 +229,10 @@ struct Device {
     // Buffers allocated while a capture was open: the recording bakes their GPU addresses into its argument
     // blocks, so the graph keeps them alive when the array is freed later (like a CUDA graph's memory pool).
     std::map<uintptr_t, Graph*> capture_owned;
+    // Capture-owned allocations whose contents the host wrote while recording (host-to-device copies are not
+    // recorded: they happen at capture time). Their memory holds data the replays read, so it is never reused.
+    std::set<uintptr_t> capture_host_written;
+    bool warned_working_set = false;
     // A GPU failure observed where it cannot be returned (freeing memory); raised by the next synchronize.
     std::string deferred_error;
 
@@ -991,6 +1016,24 @@ void* wp_alloc_metal(int ordinal, size_t size)
         Device* dev = get_device(ordinal);
         if (!dev)
             return nullptr;
+        Graph* recording = dev->capture ? (dev->capture_stack.empty() ? dev->capture : dev->capture_stack.front())
+                                        : nullptr;
+        if (recording && !recording->free_pool.empty()) {
+            // smallest pooled buffer that holds the request, if it is at most twice as large
+            const size_t want = std::max(size, size_t(1));
+            auto fit = recording->free_pool.lower_bound(want);
+            if (fit != recording->free_pool.end() && fit->first <= std::max(2 * want, want + 4096)) {
+                id<MTLBuffer> buffer = fit->second;
+                recording->free_pool.erase(fit);
+                void* ptr = buffer.contents;
+                dev->allocations[uintptr_t(ptr)] = buffer;  // never left the residency set
+                dev->capture_owned[uintptr_t(ptr)] = recording;
+                dev->table_dirty = true;
+                if (g_alloc_tracker.enabled)
+                    g_alloc_tracker.record_alloc(ptr, size, ALLOC_KIND_DEVICE, ordinal);
+                return ptr;
+            }
+        }
         // Buffers are never bound to encoders (kernels use raw GPU addresses), so hazard tracking is pointless.
         MTLResourceOptions options = MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
         id<MTLBuffer> buffer = [dev->device newBufferWithLength:std::max(size, size_t(1)) options:options];
@@ -1002,11 +1045,22 @@ void* wp_alloc_metal(int ordinal, size_t size)
         }
         void* ptr = buffer.contents;
         dev->allocations[uintptr_t(ptr)] = buffer;
-        if (dev->capture)
-            dev->capture_owned[uintptr_t(ptr)] = dev->capture_stack.empty() ? dev->capture : dev->capture_stack.front();
+        if (recording)
+            dev->capture_owned[uintptr_t(ptr)] = recording;
         [dev->residency_set addAllocation:buffer];
         dev->residency_dirty = true;
         dev->table_dirty = true;
+        if (!dev->warned_working_set && dev->device.currentAllocatedSize > dev->device.recommendedMaxWorkingSetSize) {
+            // past the working set not every buffer is resident: kernels then read wrong data without any error
+            dev->warned_working_set = true;
+            fprintf(
+                stderr,
+                "Warp Metal warning: %.1f GB allocated on device \"%s\", more than its working set of %.1f GB; "
+                "kernels may read non-resident memory and produce wrong results\n",
+                dev->device.currentAllocatedSize / 1e9, dev->name.c_str(),
+                dev->device.recommendedMaxWorkingSetSize / 1e9
+            );
+        }
         if (g_alloc_tracker.enabled)
             g_alloc_tracker.record_alloc(ptr, size, ALLOC_KIND_DEVICE, ordinal);
         return ptr;
@@ -1033,6 +1087,17 @@ void wp_free_metal(int ordinal, void* ptr)
             // a recording references this memory (freed during capture, or allocated during one and freed
             // later): the graph keeps it alive, like CUDA graph allocations
             Graph* owner = owned != dev->capture_owned.end() ? owned->second : dev->capture;
+            Graph* recording = dev->capture
+                ? (dev->capture_stack.empty() ? dev->capture : dev->capture_stack.front())
+                : nullptr;
+            if (owned != dev->capture_owned.end() && owner == recording && capture_reuse_enabled()
+                && !dev->capture_host_written.count(uintptr_t(ptr))) {
+                // allocated and freed during this capture: later allocations of the capture may reuse it
+                owner->free_pool.emplace(size_t(it->second.length), it->second);
+                dev->capture_owned.erase(owned);
+                dev->allocations.erase(it);
+                return;
+            }
             owner->retained.push_back(it->second);
             if (dev->capture && dev->capture != owner)
                 dev->capture->retained.push_back(it->second);  // the open recording may reference it as well
@@ -1527,6 +1592,16 @@ int wp_metal_capture_begin(int ordinal)
 
 static void graph_destroy(int ordinal, Device* dev, Graph* graph);
 
+// Records that the host wrote the allocation holding ptr while a capture is open (see Device::capture_host_written).
+static void mark_host_written(Device& dev, const void* ptr)
+{
+    if (!dev.capture)
+        return;
+    uintptr_t base = 0;
+    if (buffer_containing(dev.allocations, uint64_t(uintptr_t(ptr)), false, base, [](id<MTLBuffer> x) { return x; }))
+        dev.capture_host_written.insert(base);
+}
+
 // Stops tracking allocations for a graph that is going away.
 static void forget_capture_owned(Device& dev, Graph* graph)
 {
@@ -1538,6 +1613,9 @@ static void forget_capture_owned(Device& dev, Graph* graph)
 static void discard_recording(Device& dev, Graph* graph)
 {
     forget_capture_owned(dev, graph);
+    for (const auto& kv : graph->free_pool)
+        dev.deferred_frees.push_back(kv.second);
+    graph->free_pool.clear();
     for (id<MTLBuffer> buffer : graph->retained)
         dev.deferred_frees.push_back(buffer);
     for (const auto& child : graph->children)
@@ -1549,6 +1627,10 @@ static void discard_recording(Device& dev, Graph* graph)
 // Uploads a recorded graph's argument blocks; the graph is ready to launch afterwards.
 static Graph* finalize_capture(Device& dev, Graph* graph)
 {
+    // memory freed during the capture and not reused stays with the graph (its recording may reference it)
+    for (const auto& kv : graph->free_pool)
+        graph->retained.push_back(kv.second);
+    graph->free_pool.clear();
     graph->buffer =
         [dev.device newBufferWithLength:std::max(graph->bytes.size(), size_t(1))
                                 options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
@@ -1578,6 +1660,7 @@ void* wp_metal_capture_end(int ordinal)
             wp::set_error_string("No graph capture in progress");
             return nullptr;
         }
+        dev->capture_host_written.clear();
         if (!dev->capture_stack.empty()) {
             // a branch body raised: drop every open recording so the device leaves capture mode
             discard_recording(*dev, dev->capture);
@@ -1990,6 +2073,7 @@ int wp_metal_capture_range_end(int ordinal)
         return 0;
     }
     // unified memory: the recorded range is written in place; a kernel of the replay may zero the length
+    mark_host_written(*dev, seg.range_host);
     uint32_t* range = static_cast<uint32_t*>(seg.range_host);
     range[0] = uint32_t(seg.start);
     range[1] = uint32_t(seg.count);
@@ -2188,6 +2272,7 @@ int wp_metal_memcpy(int ordinal, void* dst, const void* src, size_t n)
             if (!synchronize(*dev))
                 return -1;
             memcpy(dst, src, n);
+            mark_host_written(*dev, dst);
             return 0;
         }
         struct {

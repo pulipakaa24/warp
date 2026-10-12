@@ -652,6 +652,59 @@ class TestMetal(unittest.TestCase):
         np.testing.assert_array_equal(out.numpy(), 2.0 * np.arange(n, dtype=np.float32) + 1.0)
         del junk
 
+    def test_capture_reuses_memory_freed_during_capture(self):
+        """A capture of many steps that each allocate and free a temporary holds one temporary, not one per step,
+        and replays the same values as eager execution."""
+        n, steps = 1 << 16, 24
+        x = wp.array(np.arange(n, dtype=np.float32), device=self.device)
+        out = wp.zeros(n, dtype=float, device=self.device)
+        ptrs = []
+
+        def step(k):
+            tmp = wp.empty(n, dtype=float, device=self.device)  # scratch of this step only
+            wp.launch(saxpy_kernel, dim=n, inputs=[x, out, tmp], device=self.device)
+            wp.copy(out, tmp)
+            wp.launch(add_value, dim=n, inputs=[out, float(k)], device=self.device)
+            ptrs.append(tmp.ptr)
+
+        with wp.ScopedCapture(device=self.device, force_module_load=True) as capture:
+            for k in range(steps):
+                step(k)
+        # every step after the first reused the first step's memory (Isaac Lab's Franka-Pour policy step at 2,048
+        # worlds held 47 GB of per-step temporaries without reuse, past the working set, and replayed NaN)
+        self.assertEqual(len(set(ptrs)), 1)
+        expected = np.zeros(n, dtype=np.float32)
+        xs = np.arange(n, dtype=np.float32)
+        for k in range(steps):
+            expected = 2.0 * xs + expected + np.float32(k)
+        for _ in range(2):
+            out.zero_()
+            wp.capture_launch(capture.graph)
+            np.testing.assert_array_equal(out.numpy(), expected)
+
+    def test_capture_never_reuses_host_written_memory(self):
+        """Memory the host writes while recording (an indirect execution range is filled in at its end, on the
+        host) keeps its contents for the replays even when the array is freed during the capture."""
+        from warp._src import context as ctx  # noqa: PLC0415
+
+        device = wp.get_device(self.device)
+        out = wp.zeros(64, dtype=float, device=self.device)
+        with wp.ScopedCapture(device=self.device, force_module_load=True) as capture:
+            ranges = wp.empty(4, dtype=wp.uint32, device=self.device)
+            self.assertTrue(ctx.metal_capture_range_begin(ranges, 0, device=device))
+            wp.launch(add_value, dim=64, inputs=[out, 1.0], device=self.device)
+            ctx.metal_capture_range_end(device=device)
+            ranges_ptr = ranges.ptr
+            del ranges
+            other = wp.zeros(4, dtype=wp.uint32, device=self.device)  # same size, filled by a recorded memset
+            self.assertNotEqual(other.ptr, ranges_ptr)
+            wp.launch(add_value, dim=64, inputs=[out, 2.0], device=self.device)
+            del other
+        for _ in range(2):
+            out.zero_()
+            wp.capture_launch(capture.graph)
+            np.testing.assert_array_equal(out.numpy(), np.full(64, 3.0, dtype=np.float32))
+
     def test_capture_survives_failing_branch(self):
         """A branch body that raises leaves the device usable for normal launches and new captures."""
         cond = wp.ones(1, dtype=int, device=self.device)
