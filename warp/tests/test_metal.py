@@ -726,6 +726,53 @@ class TestMetal(unittest.TestCase):
         # one eager launch plus one replay: launches inside a capture are recorded, not executed
         np.testing.assert_array_equal(a.numpy(), np.full(4, 2.0, dtype=np.float32))
 
+    def test_replay_translates_nested_arrays_freed_during_capture(self):
+        """Array descriptors stored in device memory (here an array of structs written from the host before the
+        capture) still resolve at replay when the arrays they point to were freed during the capture."""
+        n = 4
+        out = wp.zeros(n, dtype=float, device=self.device)
+        values = [wp.array([1.0 + i, 10.0 * (i + 1)], dtype=float, device=self.device) for i in range(n)]
+        items = []
+        for i, v in enumerate(values):
+            h = ArrayHolder()
+            h.values = v
+            h.offset = float(i)
+            items.append(h)
+        holders = wp.array(items, dtype=ArrayHolder, device=self.device)
+        del items, h, v
+        with wp.ScopedCapture(device=self.device, force_module_load=True) as capture:
+            wp.launch(holder_sum_kernel, dim=n, inputs=[holders, out], device=self.device)
+            del values  # the pointees are freed while recording; the graph keeps their memory
+            scratch = wp.full(2, -1.0e6, dtype=float, device=self.device)
+            wp.launch(add_value, dim=2, inputs=[scratch, 1.0], device=self.device)
+            del scratch
+        extra = [wp.zeros(4096, dtype=float, device=self.device) for _ in range(4)]  # changes the address table
+        expected = np.array([1.0 + i + 10.0 * (i + 1) + i for i in range(n)], dtype=np.float32)
+        for _ in range(2):
+            out.zero_()
+            wp.capture_launch(capture.graph)
+            np.testing.assert_array_equal(out.numpy(), expected)
+        del extra
+
+    def test_capture_survives_failing_branch(self):
+        """A branch body that raises leaves the device usable for normal launches and new captures."""
+        cond = wp.ones(1, dtype=int, device=self.device)
+        a = wp.zeros(4, dtype=float, device=self.device)
+
+        def failing_body():
+            raise ValueError("branch body failed")
+
+        with self.assertRaises(ValueError):
+            with wp.ScopedCapture(device=self.device):
+                wp.capture_if(cond, on_true=failing_body)
+        self.assertFalse(wp.get_device(self.device).is_capturing)
+        wp.launch(increment_kernel, dim=4, inputs=[a], device=self.device)
+        with wp.ScopedCapture(device=self.device) as capture:
+            wp.launch(increment_kernel, dim=4, inputs=[a], device=self.device)
+        wp.capture_launch(capture.graph)
+        # one eager launch plus one replay: launches inside a capture are recorded, not executed
+        np.testing.assert_array_equal(a.numpy(), np.full(4, 2.0, dtype=np.float32))
+
     def test_replay_translates_nested_arrays_after_new_allocations(self):
         """Graph replays resolve array descriptors stored in device memory after the allocation set changed."""
         values = [wp.array([1.0 + i, 10.0 * (i + 1)], dtype=float, device=self.device) for i in range(4)]

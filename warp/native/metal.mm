@@ -231,6 +231,10 @@ struct Device {
     // Buffers allocated while a capture was open: the recording bakes their GPU addresses into its argument
     // blocks, so the graph keeps them alive when the array is freed later (like a CUDA graph's memory pool).
     std::map<uintptr_t, Graph*> capture_owned;
+    // Buffers kept alive only by graphs (freed by their arrays during or after a capture), with the number of graphs
+    // holding each. They stay in the translation table: a recorded kernel may reach them through an array descriptor
+    // stored in device memory (an array of structs written before the capture), which is translated at replay.
+    std::map<uintptr_t, std::pair<id<MTLBuffer>, int>> graph_memory;
     // Capture-owned allocations whose contents the host wrote while recording (host-to-device copies are not
     // recorded: they happen at capture time). Their memory holds data the replays read, so it is never reused.
     std::set<uintptr_t> capture_host_written;
@@ -442,6 +446,29 @@ bool has_pending_work(const Device& dev) { return dev.command_buffer != nil || !
 
 // Drops command buffers that have finished executing. Returns false if any of them failed.
 void release_buffers(Device& dev, std::vector<id<MTLBuffer>>& buffers);
+
+// Makes graph hold buffer (see Device::graph_memory).
+void graph_retain(Device& dev, std::vector<id<MTLBuffer>>& retained, id<MTLBuffer> buffer)
+{
+    retained.push_back(buffer);
+    auto& entry = dev.graph_memory[uintptr_t(buffer.contents)];
+    entry.first = buffer;
+    ++entry.second;
+    dev.table_dirty = true;
+}
+
+// Releases the buffers a graph holds once no submitted work can use them.
+void graph_release(Device& dev, std::vector<id<MTLBuffer>>& retained)
+{
+    for (id<MTLBuffer> buffer : retained) {
+        auto it = dev.graph_memory.find(uintptr_t(buffer.contents));
+        if (it != dev.graph_memory.end() && --it->second.second <= 0)
+            dev.graph_memory.erase(it);
+        dev.deferred_frees.push_back(buffer);
+    }
+    retained.clear();
+    dev.table_dirty = true;
+}
 
 bool retire_completed(Device& dev)
 {
@@ -665,6 +692,9 @@ void refresh_table(Device& dev)
     ranges.reserve(dev.allocations.size() + dev.imports.size());
     for (const auto& kv : dev.allocations)
         ranges.push_back({ uint64_t(kv.first), uint64_t(kv.second.length), kv.second.gpuAddress });
+    for (const auto& kv : dev.graph_memory)
+        if (!dev.allocations.count(kv.first))  // not reused by a live allocation
+            ranges.push_back({ uint64_t(kv.first), uint64_t(kv.second.first.length), kv.second.first.gpuAddress });
     for (const auto& kv : dev.imports)
         ranges.push_back({ uint64_t(kv.first), uint64_t(kv.second.buffer.length), kv.second.buffer.gpuAddress });
     std::sort(ranges.begin(), ranges.end(), [](const Range& a, const Range& b) { return a.host < b.host; });
@@ -1100,9 +1130,9 @@ void wp_free_metal(int ordinal, void* ptr)
                 dev->allocations.erase(it);
                 return;
             }
-            owner->retained.push_back(it->second);
+            graph_retain(*dev, owner->retained, it->second);
             if (dev->capture && dev->capture != owner)
-                dev->capture->retained.push_back(it->second);  // the open recording may reference it as well
+                graph_retain(*dev, dev->capture->retained, it->second);  // the open recording may reference it too
             if (owned != dev->capture_owned.end())
                 dev->capture_owned.erase(owned);
             dev->allocations.erase(it);
@@ -1618,8 +1648,7 @@ static void discard_recording(Device& dev, Graph* graph)
     for (const auto& kv : graph->free_pool)
         dev.deferred_frees.push_back(kv.second);
     graph->free_pool.clear();
-    for (id<MTLBuffer> buffer : graph->retained)
-        dev.deferred_frees.push_back(buffer);
+    graph_release(dev, graph->retained);
     for (const auto& child : graph->children)
         if (child.second)
             graph_destroy(0, &dev, child.first);
@@ -1631,7 +1660,7 @@ static Graph* finalize_capture(Device& dev, Graph* graph)
 {
     // memory freed during the capture and not reused stays with the graph (its recording may reference it)
     for (const auto& kv : graph->free_pool)
-        graph->retained.push_back(kv.second);
+        graph_retain(dev, graph->retained, kv.second);
     graph->free_pool.clear();
     graph->buffer =
         [dev.device newBufferWithLength:std::max(graph->bytes.size(), size_t(1))
@@ -2178,8 +2207,7 @@ static void graph_destroy(int ordinal, Device* dev, Graph* graph)
     forget_capture_owned(*dev, graph);
     if (graph->buffer)
         dev->deferred_frees.push_back(graph->buffer);  // released once no GPU work can use it
-    for (id<MTLBuffer> buffer : graph->retained)
-        dev->deferred_frees.push_back(buffer);
+    graph_release(*dev, graph->retained);
     for (const auto& child : graph->children)
         if (child.second)
             graph_destroy(ordinal, dev, child.first);
