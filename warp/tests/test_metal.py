@@ -654,7 +654,9 @@ class TestMetal(unittest.TestCase):
 
     def test_capture_reuses_memory_freed_during_capture(self):
         """A capture of many steps that each allocate and free a temporary holds one temporary, not one per step,
-        and replays the same values as eager execution."""
+        and replays the same values as eager execution (with WP_METAL_CAPTURE_REUSE=1; reuse is off by default)."""
+        if os.environ.get("WP_METAL_CAPTURE_REUSE", "0") in ("", "0"):
+            self.skipTest("capture memory reuse is off (WP_METAL_CAPTURE_REUSE=1 enables it)")
         n, steps = 1 << 16, 24
         x = wp.array(np.arange(n, dtype=np.float32), device=self.device)
         out = wp.zeros(n, dtype=float, device=self.device)

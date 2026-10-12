@@ -93,14 +93,16 @@ int idle_flush_dispatches()
     return value;
 }
 
-// Memory freed during a graph capture is reused by later allocations of the same capture (WP_METAL_CAPTURE_REUSE=0
-// keeps every capture-time allocation separate, as before). Graph replays are serial, so an allocation recorded after
-// a free can occupy the freed memory, as in a CUDA graph's memory pool; see Graph::free_pool.
+// WP_METAL_CAPTURE_REUSE=1: memory freed during a graph capture is reused by later allocations of the same capture.
+// Graph replays are serial, so an allocation recorded after a free can occupy the freed memory, as in a CUDA graph's
+// memory pool; see Graph::free_pool. Off by default (every capture-time allocation keeps its own buffer): with reuse,
+// Isaac Lab's Franka-Pour MPM step captured at one world faults on the GPU (kIOGPUCommandBufferCallbackErrorPageFault),
+// cause under investigation.
 bool capture_reuse_enabled()
 {
     static const bool value = [] {
         const char* env = std::getenv("WP_METAL_CAPTURE_REUSE");
-        return !env || atoi(env) != 0;
+        return env && atoi(env) != 0;
     }();
     return value;
 }
