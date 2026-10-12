@@ -275,7 +275,7 @@ template <typename Type> inline CUDA_CALLABLE quat_t<Type> normalize(const quat_
 {
     Type l = length(q);
     if (l > Type(kEps)) {
-        Type inv_l = Type(1) / l;
+        Type inv_l = WP_FDIV(Type(1), l);
 
         return quat_t<Type>(q.x * inv_l, q.y * inv_l, q.z * inv_l, q.w * inv_l);
     } else {
@@ -332,12 +332,12 @@ template <typename Type> inline CUDA_CALLABLE quat_t<Type> mul(Type s, const qua
 
 template <typename Type> inline CUDA_CALLABLE quat_t<Type> div(quat_t<Type> q, Type s)
 {
-    return quat_t<Type>(q.x / s, q.y / s, q.z / s, q.w / s);
+    return quat_t<Type>(WP_FDIV(q.x, s), WP_FDIV(q.y, s), WP_FDIV(q.z, s), WP_FDIV(q.w, s));
 }
 
 template <typename Type> inline CUDA_CALLABLE quat_t<Type> div(Type s, quat_t<Type> q)
 {
-    return quat_t<Type>(s / q.x, s / q.y, s / q.z, s / q.w);
+    return quat_t<Type>(WP_FDIV(s, q.x), WP_FDIV(s, q.y), WP_FDIV(s, q.z), WP_FDIV(s, q.w));
 }
 
 // approximate division
@@ -418,7 +418,7 @@ inline CUDA_CALLABLE quat_t<Type> quat_from_matrix(const mat_t<Rows, Cols, Type>
     if (tr >= Type(0)) {
         h = sqrt(tr + Type(1));
         w = Type(0.5) * h;
-        h = Type(0.5) / h;
+        h = WP_FDIV(Type(0.5), h);
 
         x = (m.data[2][1] - m.data[1][2]) * h;
         y = (m.data[0][2] - m.data[2][0]) * h;
@@ -435,7 +435,7 @@ inline CUDA_CALLABLE quat_t<Type> quat_from_matrix(const mat_t<Rows, Cols, Type>
         if (max_diag == 0) {
             h = sqrt((m.data[0][0] - (m.data[1][1] + m.data[2][2])) + Type(1));
             x = Type(0.5) * h;
-            h = Type(0.5) / h;
+            h = WP_FDIV(Type(0.5), h);
 
             y = (m.data[0][1] + m.data[1][0]) * h;
             z = (m.data[2][0] + m.data[0][2]) * h;
@@ -443,7 +443,7 @@ inline CUDA_CALLABLE quat_t<Type> quat_from_matrix(const mat_t<Rows, Cols, Type>
         } else if (max_diag == 1) {
             h = sqrt((m.data[1][1] - (m.data[2][2] + m.data[0][0])) + Type(1));
             y = Type(0.5) * h;
-            h = Type(0.5) / h;
+            h = WP_FDIV(Type(0.5), h);
 
             z = (m.data[1][2] + m.data[2][1]) * h;
             x = (m.data[0][1] + m.data[1][0]) * h;
@@ -452,7 +452,7 @@ inline CUDA_CALLABLE quat_t<Type> quat_from_matrix(const mat_t<Rows, Cols, Type>
         if (max_diag == 2) {
             h = sqrt((m.data[2][2] - (m.data[0][0] + m.data[1][1])) + Type(1));
             z = Type(0.5) * h;
-            h = Type(0.5) / h;
+            h = WP_FDIV(Type(0.5), h);
 
             x = (m.data[2][0] + m.data[0][2]) * h;
             y = (m.data[1][2] + m.data[2][1]) * h;

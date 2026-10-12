@@ -1090,12 +1090,29 @@ class TestMetal(unittest.TestCase):
             np.testing.assert_array_equal(out.numpy(), np.full(8, expected, dtype=np.float32), err_msg=f"{value}")
             self.assertEqual(waits, 0)
 
+    def _fast_math_ops(self, fast, a, x):
+        @wp.kernel(module="unique", module_options={"fast_math": fast})
+        def ops(a: wp.array[float], x: wp.array[float], q: wp.array[float], s: wp.array[float],
+                r: wp.array[float], n: wp.array[float]):
+            i = wp.tid()
+            q[i] = a[i] / x[i]
+            s[i] = wp.sqrt(x[i])
+            r[i] = (x[i] + 16777216.0) - 16777216.0
+            n[i] = wp.normalize(wp.vec3(a[i], x[i], 1.0))[0]
+
+        ops.module.mark_modified()  # metal_fast_math is read when the module is hashed and built
+        arrays = [wp.zeros(len(a), dtype=float, device=self.device) for _ in range(4)]
+        wp.launch(ops, len(a), inputs=[wp.array(a, device=self.device), wp.array(x, device=self.device), *arrays],
+                  device=self.device)
+        return [arr.numpy() for arr in arrays]
+
     def test_fast_math_approximates_division_and_sqrt_only(self):
         """The fast_math module option makes float32 division and sqrt approximate, as --use_fast_math does on CUDA.
 
-        CUDA's --use_fast_math is --prec-div=false --prec-sqrt=false --ftz=true --fmad=true: division becomes
-        x * rcp(y) (__fdividef, within 2 ulp) and sqrt is approximate, without reassociation. Without the option both
-        are correctly rounded. Neither mode may reassociate (x + 2^24) - 2^24 into x.
+        CUDA's --use_fast_math makes x / y div.approx.ftz.f32 (MUFU.RCP + FMUL.FTZ) and sqrt sqrt.approx.ftz.f32
+        (MUFU.SQRT), without reassociation. warp.config.metal_fast_math selects CUDA's results bit for bit ("cuda",
+        the default), Metal's fast forms ("relaxed") or correctly rounded ones ("off"); without the option both are
+        correctly rounded. No mode may reassociate (x + 2^24) - 2^24 into x.
         """
         rng = np.random.default_rng(0)
         n = 1 << 14
@@ -1108,31 +1125,72 @@ class TestMetal(unittest.TestCase):
             rr = ref.astype(np.float32)
             return np.abs(r.astype(np.float64) - ref) / (np.spacing(np.abs(rr)).astype(np.float64))
 
-        for fast in (False, True):
+        saved = wp.config.metal_fast_math
+        try:
+            for fast, mode in ((False, "cuda"), (True, "off"), (True, "relaxed"), (True, "cuda")):
+                wp.config.metal_fast_math = mode
+                q, s, r, _ = self._fast_math_ops(fast, a, x)
+                reassociated = (x + np.float32(16777216.0)) - np.float32(16777216.0)
+                np.testing.assert_array_equal(r, reassociated, err_msg=f"fast_math={fast} {mode} reassociated")
+                if not fast or mode == "off":
+                    np.testing.assert_array_equal(q, div_ref.astype(np.float32))
+                    np.testing.assert_array_equal(s, sqrt_ref.astype(np.float32))
+                else:
+                    self.assertLess(np.mean(q == div_ref.astype(np.float32)), 0.95)
+                    self.assertLess(np.mean(s == sqrt_ref.astype(np.float32)), 0.95)
+                    self.assertLessEqual(ulp_error(q, div_ref).max(), 2.5)
+                    self.assertLessEqual(ulp_error(s, sqrt_ref).max(), 2.5)
+        finally:
+            wp.config.metal_fast_math = saved
 
-            @wp.kernel(module="unique", module_options={"fast_math": fast})
-            def ops(a: wp.array[float], x: wp.array[float], q: wp.array[float], s: wp.array[float],
-                    r: wp.array[float]):
-                i = wp.tid()
-                q[i] = a[i] / x[i]
-                s[i] = wp.sqrt(x[i])
-                r[i] = (x[i] + 16777216.0) - 16777216.0
+    def test_fast_math_cuda_mode_matches_l4(self):
+        """metal_fast_math="cuda": MUFU.RCP / MUFU.SQRT results measured on an L4 (sm_89, Warp 1.16, fast_math kernel).
 
-            arrays = [wp.zeros(n, dtype=float, device=self.device) for _ in range(3)]
-            wp.launch(ops, n, inputs=[wp.array(a, device=self.device), wp.array(x, device=self.device), *arrays],
-                      device=self.device)
-            q, s, r = (arr.numpy() for arr in arrays)
-            reassociated = (x + np.float32(16777216.0)) - np.float32(16777216.0)
-            np.testing.assert_array_equal(r, reassociated, err_msg=f"fast_math={fast} reassociated")
-            if not fast:
-                np.testing.assert_array_equal(q, div_ref.astype(np.float32))
-                np.testing.assert_array_equal(s, sqrt_ref.astype(np.float32))
-            else:
-                self.assertLess(np.mean(q == div_ref.astype(np.float32)), 0.95)
-                self.assertLess(np.mean(s == sqrt_ref.astype(np.float32)), 0.95)
-                self.assertLessEqual(ulp_error(q, div_ref).max(), 2.5)
-                self.assertLessEqual(ulp_error(s, sqrt_ref).max(), 2.5)
+        Inputs where the L4 result is one ulp above, one ulp below and equal to the correctly rounded one, scaled over
+        exponents (both instructions are exponent-invariant on the L4), plus division special cases.
+        """
+        rcp_x = [0x3FD6216A, 0x3FE4F257, 0x3F8276EF, 0x3FE59612, 0x3FA297D9, 0x3FA8856B, 0x3FB75B14, 0x3F930DBC,
+                 0x3FFD4625, 0x3F875CEE]
+        rcp_l4 = [0x3F190736, 0x3F0F2004, 0x3F7B29F9, 0x3F0EB9F2, 0x3F4988A0, 0x3F4271C5, 0x3F32B671, 0x3F5ED48A,
+                  0x3F0160AF, 0x3F721333]
+        sqrt_x = [0x3FDBB398, 0x4003EC07, 0x4013F3DA, 0x40075AFA, 0x3FA09B79, 0x3F8A4B86, 0x3F803130, 0x3F8AFAEF,
+                  0x3FA61343, 0x407FCDB3]
+        sqrt_l4 = [0x3FA7B210, 0x3FB7C58D, 0x3FC29E01, 0x3FBA25D2, 0x3F8F6133, 0x3F850C47, 0x3F801895, 0x3F85608D,
+                   0x3F91CCCB, 0x3FFFE6D8]
+        u32 = np.uint32
+        # rcp(m 2^e) = rcp(m) 2^-e: divide 1 by x scaled by 2^e; sqrt(m 4^e) = sqrt(m) 2^e
+        xs, q_ref, ss, s_ref = [], [], [], []
+        for e in (-100, -7, 0, 9, 100):
+            xs += [u32(v + (e << 23)) for v in rcp_x]
+            q_ref += [u32(v - (e << 23)) for v in rcp_l4]
+        for e in (-50, -3, 0, 5, 50):
+            ss += [u32(v + (2 * e << 23)) for v in sqrt_x]
+            s_ref += [u32(v + (e << 23)) for v in sqrt_l4]
+        x = np.array(xs + ss, dtype=np.uint32).view(np.float32)
+        a = np.ones_like(x)
+        saved = wp.config.metal_fast_math
+        try:
+            wp.config.metal_fast_math = "cuda"
+            q, s, _, _ = self._fast_math_ops(True, a, x)
+        finally:
+            wp.config.metal_fast_math = saved
+        k = len(xs)
+        np.testing.assert_array_equal(q[:k].view(np.uint32), np.array(q_ref, dtype=np.uint32))
+        np.testing.assert_array_equal(s[k:].view(np.uint32), np.array(s_ref, dtype=np.uint32))
 
+        # special cases of div.approx.ftz.f32 (L4): x / 0 = inf, x / inf = 0, |y| > 2^126 gives a signed zero, denormal
+        # divisors are flushed (x / denormal = inf), 0 / 0 = NaN
+        a = np.array([1.0, -1.0, 3.0, -1.0, 2.0, 0.0, 1.0], dtype=np.float32)
+        y = np.array([0.0, np.inf, 1.5 * 2.0**126, 2.0**127, 1e-40, 0.0, -0.0], dtype=np.float32)
+        wp.config.metal_fast_math = "cuda"
+        try:
+            q, _, _, _ = self._fast_math_ops(True, a, y)
+        finally:
+            wp.config.metal_fast_math = saved
+        expected = np.array([np.inf, -0.0, 0.0, -0.0, np.inf, np.nan, -np.inf], dtype=np.float32)
+        np.testing.assert_array_equal(q, expected)
+        finite = ~np.isnan(expected)
+        np.testing.assert_array_equal(np.signbit(q[finite]), np.signbit(expected[finite]))
 
     def test_64bit_bitwise_atomics_are_exact(self):
         """64-bit atomic and / or / xor update each 32-bit half atomically: the final value is exact under contention."""

@@ -24,13 +24,17 @@
 #define CUDA_CALLABLE_DEVICE
 // The fuse_fp module option (default on): CUDA compiles with --fmad=true, contracting a * b + c into FMAs across
 // expressions and inlined calls; ask the Metal compiler for the same contraction so kernels round as on CUDA.
+// The fast_math module option: NVRTC's --use_fast_math makes every float32 division of the module
+// div.approx.ftz.f32 (SASS: MUFU.RCP + FMUL.FTZ) and sqrtf sqrt.approx.ftz.f32 (MUFU.SQRT), flushes denormals and
+// does not reassociate. warp.config.metal_fast_math picks the Metal form:
+//   "cuda" (WP_METAL_CUDA_FAST_MATH): CUDA's results bit for bit: WP_FDIV below and sqrtf (metal_crt.h) emulate
+//       MUFU.RCP / MUFU.SQRT exactly (metal_cuda_fast_math.h); safe math mode otherwise, as for any module.
+//   "relaxed" (WP_FAST_MATH): Metal's relaxed math mode with reassociation switched back off: every division lowered
+//       as metal::fast::divide (a * fast rcp(b)), metal::fast::sqrt; Apple's approximations, not NVIDIA's, and the
+//       sign of zero is not honoured. Contraction is set by fuse_fp below in both cases.
+//   "off": fast_math is ignored (correctly rounded division and sqrt).
+// Apple GPUs flush float32 denormals in every math mode.
 #if defined(WP_FAST_MATH) && WP_FAST_MATH
-// The fast_math module option: NVRTC's --use_fast_math is --prec-div=false --prec-sqrt=false --ftz=true --fmad=true,
-// i.e. every float32 division (and reciprocal) of the module becomes the approximate x * rcp(y) form (__fdividef,
-// 2 ulp), square roots are approximate, denormals are flushed; it does not reassociate. Metal's relaxed math mode
-// allows reciprocals (division lowered exactly as metal::fast::divide, bit for bit), and reassociation is switched
-// back off here; contraction is then set by fuse_fp below. Relaxed mode also ignores the sign of zero (the one
-// license beyond CUDA's). Apple GPUs flush float32 denormals in every math mode. sqrt: metal_crt.h.
 #pragma METAL fp math_mode(relaxed)
 #pragma clang fp reassociate(off)
 #endif
@@ -77,6 +81,16 @@
 #define WP_CONSTANT
 #define WP_TILE_SHARED
 #define WP_ARGS
+#endif
+
+// Float division in library code (vectors, matrices, quaternions, normalize): `a / b`, except in fast_math modules
+// on Metal with metal_fast_math == "cuda", where float32 division is CUDA's div.approx.ftz.f32 (see above).
+#if defined(__METAL_VERSION__) && defined(WP_METAL_CUDA_FAST_MATH) && WP_METAL_CUDA_FAST_MATH
+template <typename T> inline T wp_fdiv(T a, T b) { return a / b; }
+inline float wp_fdiv(float a, float b) { return wp_cuda_div(a, b); }
+#define WP_FDIV(a, b) wp_fdiv(a, b)
+#else
+#define WP_FDIV(a, b) ((a) / (b))
 #endif
 
 // Cross-compiler inline control for generated functions and native helpers.
@@ -1106,7 +1120,7 @@ inline CUDA_CALLABLE T div(T a, T b)\
         printf("%s:%d div(%f, %f)\n", __FILE__, __LINE__, float(a), float(b));\
         assert(0);\
     })\
-    return a/b;\
+    return WP_FDIV(a, b);\
 }\
 inline CUDA_CALLABLE void adj_div(T a, T b, T ret, T WP_THREAD& adj_a, T WP_THREAD& adj_b, T adj_ret)\
 {\

@@ -3297,7 +3297,7 @@ inline CUDA_CALLABLE mat_t<Rows, Cols, Type> div(const mat_t<Rows, Cols, Type> W
     mat_t<Rows, Cols, Type> t;
     for (unsigned i = 0; i < Rows; ++i) {
         for (unsigned j = 0; j < Cols; ++j) {
-            t.data[i][j] = a.data[i][j] / b;
+            t.data[i][j] = WP_FDIV(a.data[i][j], b);
         }
     }
 
@@ -3310,7 +3310,7 @@ inline CUDA_CALLABLE mat_t<Rows, Cols, Type> div(Type b, const mat_t<Rows, Cols,
     mat_t<Rows, Cols, Type> t;
     for (unsigned i = 0; i < Rows; ++i) {
         for (unsigned j = 0; j < Cols; ++j) {
-            t.data[i][j] = b / a.data[i][j];
+            t.data[i][j] = WP_FDIV(b, a.data[i][j]);
         }
     }
 
@@ -3800,7 +3800,7 @@ inline CUDA_CALLABLE mat_t<2, 2, Type> inverse_impl(const mat_t<2, 2, Type> WP_T
 {
     Type det = determinant(m);
     if (det > Type(kEps) || det < -Type(kEps)) {
-        Type rcp_det = Approx ? approx_rcp(det) : (Type(1.0f) / det);
+        Type rcp_det = Approx ? approx_rcp(det) : (WP_FDIV(Type(1.0f), det));
         return mat_t<2, 2, Type>(m.data[1][1], -m.data[0][1], -m.data[1][0], m.data[0][0]) * rcp_det;
     } else {
         return mat_t<2, 2, Type>();
@@ -3832,7 +3832,7 @@ inline CUDA_CALLABLE mat_t<3, 3, Type> inverse_impl(const mat_t<3, 3, Type> WP_T
         b.data[1][2] = m.data[0][2] * m.data[1][0] - m.data[0][0] * m.data[1][2];
         b.data[2][2] = m.data[0][0] * m.data[1][1] - m.data[0][1] * m.data[1][0];
 
-        Type rcp_det = Approx ? approx_rcp(det) : (Type(1.0f) / det);
+        Type rcp_det = Approx ? approx_rcp(det) : (WP_FDIV(Type(1.0f), det));
         return b * rcp_det;
     } else {
         return mat_t<3, 3, Type>();
@@ -3920,7 +3920,7 @@ inline CUDA_CALLABLE mat_t<4, 4, Type> inverse_impl(const mat_t<4, 4, Type> WP_T
     if (fabs(det) > kEps) {
         mat_t<4, 4, Type> invm;
 
-        wide_float rcp = Approx ? approx_rcp(det) : wide_float(1.0) / det;
+        wide_float rcp = Approx ? approx_rcp(det) : WP_FDIV(wide_float(1.0), det);
 
         // Multiply all 3x3 cofactors by reciprocal & transpose
         invm.data[0][0] = Type(z00 * rcp);
@@ -4034,7 +4034,7 @@ cw_div(const mat_t<Rows, Cols, Type> WP_THREAD& a, const mat_t<Rows, Cols, Type>
     mat_t<Rows, Cols, Type> t;
     for (unsigned i = 0; i < Rows; ++i) {
         for (unsigned j = 0; j < Cols; ++j) {
-            t.data[i][j] = a.data[i][j] / b.data[i][j];
+            t.data[i][j] = WP_FDIV(a.data[i][j], b.data[i][j]);
         }
     }
 

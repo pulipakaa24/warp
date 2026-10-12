@@ -14,6 +14,8 @@
 #include <metal_logging>
 #include <metal_stdlib>
 
+#include "metal_cuda_fast_math.h"
+
 #define WP_NO_FLOAT64
 
 // `half` is a builtin Metal type; Warp's software half lives under another name here.
@@ -162,9 +164,12 @@ inline float log10f(float x) { return metal::log10(x); }
 inline float expf(float x) { return metal::exp(x); }
 inline float exp2f(float x) { return metal::exp2(x); }
 inline float ldexpf(float x, int e) { return metal::ldexp(x, e); }
-// fast_math (WP_FAST_MATH, builtin.h): approximate square root, as NVRTC's --prec-sqrt=false; other functions keep
-// their precise forms (Metal's fast sin / cos / log are less accurate than CUDA's __sinf / __cosf / __logf)
-#if defined(WP_FAST_MATH) && WP_FAST_MATH
+// fast_math (builtin.h): approximate square root, as NVRTC's --prec-sqrt=false: CUDA's MUFU.SQRT bit for bit
+// (WP_METAL_CUDA_FAST_MATH) or Metal's fast sqrt (WP_FAST_MATH). Other functions keep their precise forms (CUDA's
+// fast-math __sinf / __expf / __logf etc. are not emulated; Newton's fast_math kernels use none of them).
+#if defined(WP_METAL_CUDA_FAST_MATH) && WP_METAL_CUDA_FAST_MATH
+#define WP_METAL_SQRTF wp_cuda_sqrt
+#elif defined(WP_FAST_MATH) && WP_FAST_MATH
 #define WP_METAL_SQRTF metal::fast::sqrt
 #else
 #define WP_METAL_SQRTF metal::sqrt

@@ -3833,9 +3833,13 @@ class ModuleBuilder:
             # fuse_fp selects FMA contraction in builtin.h, as --fmad does for NVRTC
             source = f"#define WP_FUSE_FP {int(bool(self.options.get('fuse_fp', True)))}\n" + source
             # fast_math selects approximate float32 division and square root in builtin.h / metal_crt.h, as NVRTC's
-            # --use_fast_math (--prec-div=false --prec-sqrt=false) does on CUDA
+            # --use_fast_math does on CUDA: CUDA's own results ("cuda"), Metal's fast forms ("relaxed") or none ("off")
             if self.options.get("fast_math"):
-                source = "#define WP_FAST_MATH 1\n" + source
+                mode = self.options.get("metal_fast_math", "cuda")  # resolve_options
+                if mode == "cuda":
+                    source = "#define WP_METAL_CUDA_FAST_MATH 1\n" + source
+                elif mode == "relaxed":
+                    source = "#define WP_FAST_MATH 1\n" + source
             # every kernel's arguments from device instead of constant memory (builtin.h, WP_ARGS: the backward
             # entry points; forward entry points name their address space, see metal_kernel_device_args)
             if warp.config.metal_device_args is True:
@@ -4288,6 +4292,15 @@ class Module:
         options = dict(self.options)
         if block_dim is not None:
             options["block_dim"] = block_dim
+
+        # The Metal form of fast_math (warp.config.metal_fast_math), fixed when the module is hashed so that the hash
+        # and the built source agree; only fast_math modules carry it (other hashes are unchanged)
+        if options.get("fast_math"):
+            if config.metal_fast_math not in ("cuda", "relaxed", "off"):
+                raise ValueError(
+                    f"warp.config.metal_fast_math must be 'cuda', 'relaxed' or 'off', got {config.metal_fast_math!r}"
+                )
+            options["metal_fast_math"] = config.metal_fast_math
 
         # Resolve None-means-inherit options
         if options["mode"] is None:

@@ -269,38 +269,38 @@ template <unsigned Length, typename Type> inline CUDA_CALLABLE vec_t<Length, Typ
 {
     vec_t<Length, Type> ret;
     for (unsigned i = 0; i < Length; ++i) {
-        ret[i] = a[i] / s;
+        ret[i] = WP_FDIV(a[i], s);
     }
     return ret;
 }
 
 template <typename Type> inline CUDA_CALLABLE vec_t<3, Type> div(vec_t<3, Type> a, Type s)
 {
-    return vec_t<3, Type>(a.c[0] / s, a.c[1] / s, a.c[2] / s);
+    return vec_t<3, Type>(WP_FDIV(a.c[0], s), WP_FDIV(a.c[1], s), WP_FDIV(a.c[2], s));
 }
 
 template <typename Type> inline CUDA_CALLABLE vec_t<2, Type> div(vec_t<2, Type> a, Type s)
 {
-    return vec_t<2, Type>(a.c[0] / s, a.c[1] / s);
+    return vec_t<2, Type>(WP_FDIV(a.c[0], s), WP_FDIV(a.c[1], s));
 }
 
 template <unsigned Length, typename Type> inline CUDA_CALLABLE vec_t<Length, Type> div(Type s, vec_t<Length, Type> a)
 {
     vec_t<Length, Type> ret;
     for (unsigned i = 0; i < Length; ++i) {
-        ret[i] = s / a[i];
+        ret[i] = WP_FDIV(s, a[i]);
     }
     return ret;
 }
 
 template <typename Type> inline CUDA_CALLABLE vec_t<3, Type> div(Type s, vec_t<3, Type> a)
 {
-    return vec_t<3, Type>(s / a.c[0], s / a.c[1], s / a.c[2]);
+    return vec_t<3, Type>(WP_FDIV(s, a.c[0]), WP_FDIV(s, a.c[1]), WP_FDIV(s, a.c[2]));
 }
 
 template <typename Type> inline CUDA_CALLABLE vec_t<2, Type> div(Type s, vec_t<2, Type> a)
 {
-    return vec_t<2, Type>(s / a.c[0], s / a.c[1]);
+    return vec_t<2, Type>(WP_FDIV(s, a.c[0]), WP_FDIV(s, a.c[1]));
 }
 
 // approximate division
@@ -342,7 +342,7 @@ inline CUDA_CALLABLE vec_t<Length, Type> cw_div(vec_t<Length, Type> a, vec_t<Len
 {
     vec_t<Length, Type> ret;
     for (unsigned i = 0; i < Length; ++i) {
-        ret[i] = a[i] / b[i];
+        ret[i] = WP_FDIV(a[i], b[i]);
     }
     return ret;
 }
@@ -1201,7 +1201,7 @@ template <typename Type> inline CUDA_CALLABLE vec_t<2, Type> normalize(vec_t<2, 
 {
     Type l = sqrt(a.c[0] * a.c[0] + a.c[1] * a.c[1]);
     if (l > Type(kEps))
-        return vec_t<2, Type>(a.c[0] / l, a.c[1] / l);
+        return vec_t<2, Type>(WP_FDIV(a.c[0], l), WP_FDIV(a.c[1], l));
     else
         return vec_t<2, Type>();
 }
@@ -1210,7 +1210,7 @@ template <typename Type> inline CUDA_CALLABLE vec_t<3, Type> normalize(vec_t<3, 
 {
     Type l = sqrt(a.c[0] * a.c[0] + a.c[1] * a.c[1] + a.c[2] * a.c[2]);
     if (l > Type(kEps))
-        return vec_t<3, Type>(a.c[0] / l, a.c[1] / l, a.c[2] / l);
+        return vec_t<3, Type>(WP_FDIV(a.c[0], l), WP_FDIV(a.c[1], l), WP_FDIV(a.c[2], l));
     else
         return vec_t<3, Type>();
 }
