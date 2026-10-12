@@ -7107,6 +7107,8 @@ class Runtime:
             self.core.wp_metal_release_host_memory.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
             self.core.wp_metal_release_host_memory.restype = None
             self.core.wp_metal_capture_begin.argtypes = [ctypes.c_int]
+            self.core.wp_metal_set_capture_reuse.argtypes = [ctypes.c_int]
+            self.core.wp_metal_set_capture_reuse.restype = None
             self.core.wp_metal_capture_begin.restype = ctypes.c_int
             self.core.wp_metal_capture_end.argtypes = [ctypes.c_int]
             self.core.wp_metal_capture_end.restype = ctypes.c_void_p
@@ -14032,6 +14034,7 @@ def capture_begin(
     if device.is_metal:
         if force_module_load:
             force_load(device)
+        runtime.core.wp_metal_set_capture_reuse(int(bool(warp.config.metal_capture_reuse)))
         if runtime.core.wp_metal_capture_begin(device.metal_ordinal) != 0:
             raise RuntimeError(runtime.get_error_string())
         if apic:

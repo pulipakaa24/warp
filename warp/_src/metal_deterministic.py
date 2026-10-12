@@ -754,14 +754,21 @@ class _Pool:
     def get(self, nbytes: int):
         if not self.buffers or self.buffers[-1].size < nbytes:
             size = max(nbytes, 2 * self.buffers[-1].size if self.buffers else 0, 1 << 16)
-            self.buffers.append(_host_zeroed(size, wp.uint8, self.device))
+            self.buffers.append(_host_zeroed(size, wp.uint8, self.device, record=True))
         return self.buffers[-1]
 
 
-def _host_zeroed(n, dtype, device):
-    """A new device array zeroed from the host (Metal memory is shared), so this works during graph capture."""
+def _host_zeroed(n, dtype, device, record=False):
+    """A new device array zeroed from the host (Metal memory is shared), so this works during graph capture.
+
+    ``record``: during a capture, also record the zeroing. With ``warp.config.metal_capture_reuse`` an array of 64 KiB
+    or more may occupy memory that dispatches recorded earlier in the capture write at every replay; the deterministic
+    passes need their scratch zero from here on. (Smaller arrays never take reused memory, and the plan buffer, filled
+    from the host after this, must not be cleared at replay.)"""
     arr = wp.empty(n, dtype=dtype, device=device)
     ctypes.memset(arr.ptr, 0, n * type_size_in_bytes(dtype))
+    if record and device.is_capturing:
+        arr.zero_()
     return arr
 
 

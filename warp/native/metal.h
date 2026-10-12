@@ -172,4 +172,6 @@ WP_API int wp_metal_wait_event(int ordinal, void* event, uint64_t value);
 // Diagnostics: out[0..3] = host waits for the GPU, command buffers committed, host ops run during
 // graph replay, kernel dispatches encoded (cumulative). Lets callers assert a loop never blocks.
 WP_API int wp_metal_counters(int ordinal, uint64_t* out, int n);
+// Graph captures begun from now on reuse memory freed during the capture (1) or keep every allocation (0).
+WP_API void wp_metal_set_capture_reuse(int enabled);
 }

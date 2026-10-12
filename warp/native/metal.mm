@@ -93,19 +93,14 @@ int idle_flush_dispatches()
     return value;
 }
 
-// WP_METAL_CAPTURE_REUSE=1: memory freed during a graph capture is reused by later allocations of the same capture.
-// Graph replays are serial, so an allocation recorded after a free can occupy the freed memory, as in a CUDA graph's
-// memory pool; see Graph::free_pool. Off by default (every capture-time allocation keeps its own buffer): with reuse,
-// Isaac Lab's Franka-Pour MPM step captured at one world faults on the GPU (kIOGPUCommandBufferCallbackErrorPageFault),
-// cause under investigation.
-bool capture_reuse_enabled()
-{
-    static const bool value = [] {
-        const char* env = std::getenv("WP_METAL_CAPTURE_REUSE");
-        return env && atoi(env) != 0;
-    }();
-    return value;
-}
+// Memory freed during a graph capture is reused by later allocations of the same capture when the capture began with
+// reuse on (wp_metal_set_capture_reuse; Python: warp.config.metal_capture_reuse, WP_METAL_CAPTURE_REUSE). Graph
+// replays are serial, so an allocation recorded after a free can occupy the freed memory, as in a CUDA graph's memory
+// pool; see Graph::free_pool. Only buffers of at least kCaptureReuseMinBytes take part: small ones save nothing worth
+// having, and the arrays whose contents the host writes while recording (indirect execution ranges, 16 bytes each)
+// are small, so they never land in memory an earlier allocation of the capture still writes at replay.
+bool g_capture_reuse = true;
+constexpr size_t kCaptureReuseMinBytes = 64 << 10;
 
 // WP_METAL_INFLIGHT bounds the committed-but-unfinished command buffers (see flush()).
 int max_command_buffers_in_flight()
@@ -160,6 +155,7 @@ struct Graph {
     // step (4 simulation steps) at 2,048 worlds allocated 70.7 GB against the device's 55.7 GB working set and
     // replayed NaN, since memory past the working set is not resident. Moved to `retained` at capture end.
     std::multimap<size_t, id<MTLBuffer>> free_pool;
+    bool reuse = false;  // reuse was on when the capture began
     // Replay: the dispatches encoded once into an indirect command buffer (with a barrier between
     // consecutive commands), executed with one call per launch instead of re-encoding every dispatch.
     // Built lazily on the first launch; graphs with host ops keep the per-dispatch path.
@@ -238,6 +234,9 @@ struct Device {
     // Capture-owned allocations whose contents the host wrote while recording (host-to-device copies are not
     // recorded: they happen at capture time). Their memory holds data the replays read, so it is never reused.
     std::set<uintptr_t> capture_host_written;
+    // Capture-owned allocations served from Graph::free_pool: memory that dispatches recorded earlier in the capture
+    // write at replay, so the host must not write contents into it at capture time (see wp_metal_capture_range_begin).
+    std::set<uintptr_t> capture_reused;
     bool warned_working_set = false;
     // A GPU failure observed where it cannot be returned (freeing memory); raised by the next synchronize.
     std::string deferred_error;
@@ -1050,7 +1049,7 @@ void* wp_alloc_metal(int ordinal, size_t size)
             return nullptr;
         Graph* recording = dev->capture ? (dev->capture_stack.empty() ? dev->capture : dev->capture_stack.front())
                                         : nullptr;
-        if (recording && !recording->free_pool.empty()) {
+        if (recording && recording->reuse && size >= kCaptureReuseMinBytes && !recording->free_pool.empty()) {
             // smallest pooled buffer that holds the request, if it is at most twice as large
             const size_t want = std::max(size, size_t(1));
             auto fit = recording->free_pool.lower_bound(want);
@@ -1060,6 +1059,7 @@ void* wp_alloc_metal(int ordinal, size_t size)
                 void* ptr = buffer.contents;
                 dev->allocations[uintptr_t(ptr)] = buffer;  // never left the residency set
                 dev->capture_owned[uintptr_t(ptr)] = recording;
+                dev->capture_reused.insert(uintptr_t(ptr));
                 dev->table_dirty = true;
                 if (g_alloc_tracker.enabled)
                     g_alloc_tracker.record_alloc(ptr, size, ALLOC_KIND_DEVICE, ordinal);
@@ -1122,8 +1122,8 @@ void wp_free_metal(int ordinal, void* ptr)
             Graph* recording = dev->capture
                 ? (dev->capture_stack.empty() ? dev->capture : dev->capture_stack.front())
                 : nullptr;
-            if (owned != dev->capture_owned.end() && owner == recording && capture_reuse_enabled()
-                && !dev->capture_host_written.count(uintptr_t(ptr))) {
+            if (owned != dev->capture_owned.end() && owner == recording && recording->reuse
+                && it->second.length >= kCaptureReuseMinBytes && !dev->capture_host_written.count(uintptr_t(ptr))) {
                 // allocated and freed during this capture: later allocations of the capture may reuse it
                 owner->free_pool.emplace(size_t(it->second.length), it->second);
                 dev->capture_owned.erase(owned);
@@ -1619,7 +1619,14 @@ int wp_metal_capture_begin(int ordinal)
         return -1;
     }
     dev->capture = new Graph();
+    dev->capture->reuse = g_capture_reuse;
     return 0;
+}
+
+void wp_metal_set_capture_reuse(int enabled)
+{
+    WP_METAL_LOCK();
+    g_capture_reuse = enabled != 0;
 }
 
 static void graph_destroy(int ordinal, Device* dev, Graph* graph);
@@ -1692,6 +1699,7 @@ void* wp_metal_capture_end(int ordinal)
             return nullptr;
         }
         dev->capture_host_written.clear();
+        dev->capture_reused.clear();
         if (!dev->capture_stack.empty()) {
             // a branch body raised: drop every open recording so the device leaves capture mode
             discard_recording(*dev, dev->capture);
@@ -2080,6 +2088,16 @@ int wp_metal_capture_range_begin(int ordinal, void* range_host)
         : nil;
     if (!buffer || (uintptr_t(range_host) - base) + 16 > buffer.length) {
         wp::set_error_string("The indirect execution range must be a 16-byte-aligned Metal allocation of 16 bytes");
+        return -1;
+    }
+    if (dev->capture_reused.count(base)) {
+        // the range is written by the host at the range's end; dispatches recorded earlier in this capture that used
+        // the same memory would overwrite it at every replay
+        wp::set_error_string(
+            "The indirect execution range lies in memory this capture reuses (an array of %zu bytes allocated during "
+            "the capture); allocate the ranges before the capture, or with warp.config.metal_capture_reuse = False",
+            size_t(buffer.length)
+        );
         return -1;
     }
     graph->segments.push_back({ graph->dispatches.size(), 0, range_host, buffer, size_t(uintptr_t(range_host) - base) });

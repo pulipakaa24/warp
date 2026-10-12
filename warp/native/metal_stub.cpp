@@ -42,6 +42,8 @@ const char* wp_metal_profile_report() { return ""; }
 
 int wp_metal_capture_begin(int) { return unavailable(); }
 
+void wp_metal_set_capture_reuse(int) { }
+
 void* wp_metal_capture_end(int) { return unavailable(), nullptr; }
 
 int wp_metal_capture_push(int) { return unavailable(); }

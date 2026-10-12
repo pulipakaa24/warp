@@ -448,6 +448,12 @@ example_mpm_anymal: host waits per frame 17 -> 10, frame 41.3 -> 40.7 ms). Read 
 
 metal_gpu_utilities: bool = _os.environ.get("WP_METAL_GPU_UTILITIES", "1") != "0"
 
+metal_capture_reuse: bool = _os.environ.get("WP_METAL_CAPTURE_REUSE", "1") != "0"
+"""Metal graph capture: buffers of 64 KiB or more freed during a capture are reused by later allocations of the same
+capture, as in a CUDA graph's memory pool (replays are serial). Without it a capture of several simulation steps holds
+every step's temporaries at once. Read when a capture begins. Environment: ``WP_METAL_CAPTURE_REUSE``.
+"""
+
 metal_bounded_launch: bool = _os.environ.get("WP_METAL_BOUNDED_LAUNCH", "1") != "0"
 """Honor device-side launch bounds on Metal (``wp.launch(..., dim_limit=...)``, also used by ``warp.fem`` and the GPU
 utilities for fixed-capacity buffers): only the threadgroups below the bound are dispatched, sized on the GPU.

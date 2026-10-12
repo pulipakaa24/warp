@@ -104,6 +104,18 @@ def add_value(a: wp.array[float], v: float):
     a[wp.tid()] += v
 
 
+@wp.kernel
+def fill_uint32_zero(a: wp.array[wp.uint32]):
+    a[wp.tid()] = wp.uint32(0)
+
+
+@wp.kernel
+def reset_range_lengths(n: int, ranges: wp.array[wp.uint32]):
+    # as MetalSim's captured MPM solves do at their start: every range back to its full length
+    for j in range(n):
+        ranges[4 * j + 1] = ranges[4 * j + 2]
+
+
 def _countdown_body(counter, trace):
     wp.launch(countdown_step, dim=trace.shape[0], inputs=[counter, trace], device=trace.device)
 
@@ -654,10 +666,16 @@ class TestMetal(unittest.TestCase):
 
     def test_capture_reuses_memory_freed_during_capture(self):
         """A capture of many steps that each allocate and free a temporary holds one temporary, not one per step,
-        and replays the same values as eager execution (with WP_METAL_CAPTURE_REUSE=1; reuse is off by default)."""
-        if os.environ.get("WP_METAL_CAPTURE_REUSE", "0") in ("", "0"):
-            self.skipTest("capture memory reuse is off (WP_METAL_CAPTURE_REUSE=1 enables it)")
-        n, steps = 1 << 16, 24
+        and replays the same values as eager execution."""
+        saved = wp.config.metal_capture_reuse
+        wp.config.metal_capture_reuse = True
+        try:
+            self._capture_reuse_steps()
+        finally:
+            wp.config.metal_capture_reuse = saved
+
+    def _capture_reuse_steps(self):
+        n, steps = 1 << 16, 24  # 256 KiB temporaries: past the 64 KiB reuse threshold
         x = wp.array(np.arange(n, dtype=np.float32), device=self.device)
         out = wp.zeros(n, dtype=float, device=self.device)
         ptrs = []
@@ -683,6 +701,57 @@ class TestMetal(unittest.TestCase):
             out.zero_()
             wp.capture_launch(capture.graph)
             np.testing.assert_array_equal(out.numpy(), expected)
+
+    def test_capture_range_after_small_freed_temporary(self):
+        """An indirect execution range allocated during a capture right after a small temporary was freed keeps the
+        fields the host writes at the range's end: replaying the earlier dispatches must not overwrite them. Isaac Lab's
+        Franka-Pour MPM step at one world reused a 2,940-byte temporary for the 80-byte ranges of a solve, and the
+        replay ran garbage execution ranges (kIOGPUCommandBufferCallbackErrorPageFault)."""
+        from warp._src import context as ctx  # noqa: PLC0415
+
+        device = wp.get_device(self.device)
+        saved = wp.config.metal_capture_reuse
+        wp.config.metal_capture_reuse = True
+        try:
+            out = wp.zeros(64, dtype=float, device=self.device)
+            with wp.ScopedCapture(device=self.device, force_module_load=True) as capture:
+                scratch = wp.empty(735, dtype=wp.uint32, device=self.device)  # 2,940 bytes, as in the scene
+                wp.launch(fill_uint32_zero, dim=735, inputs=[scratch], device=self.device)
+                del scratch
+                ranges = wp.empty(20, dtype=wp.uint32, device=self.device)  # 80 bytes, 5 ranges
+                wp.launch(reset_range_lengths, dim=1, inputs=[5, ranges], device=self.device)
+                for j in range(5):
+                    self.assertTrue(ctx.metal_capture_range_begin(ranges, j, device=device))
+                    wp.launch(add_value, dim=64, inputs=[out, 1.0], device=self.device)
+                    ctx.metal_capture_range_end(device=device)
+            for r in range(2):
+                out.zero_()
+                wp.capture_launch(capture.graph)
+                np.testing.assert_array_equal(out.numpy(), np.full(64, 5.0, dtype=np.float32))
+        finally:
+            wp.config.metal_capture_reuse = saved
+
+    def test_capture_range_in_reused_memory_raises(self):
+        """A range array that lands in memory the capture reuses is refused with an error instead of replaying ranges
+        that earlier dispatches overwrite."""
+        from warp._src import context as ctx  # noqa: PLC0415
+
+        device = wp.get_device(self.device)
+        saved = wp.config.metal_capture_reuse
+        wp.config.metal_capture_reuse = True
+        try:
+            out = wp.zeros(64, dtype=float, device=self.device)
+            with self.assertRaises(RuntimeError):
+                with wp.ScopedCapture(device=self.device, force_module_load=True):
+                    scratch = wp.empty(1 << 16, dtype=wp.uint32, device=self.device)
+                    wp.launch(fill_uint32_zero, dim=1 << 16, inputs=[scratch], device=self.device)
+                    del scratch
+                    ranges = wp.empty(1 << 16, dtype=wp.uint32, device=self.device)  # takes the freed buffer
+                    ctx.metal_capture_range_begin(ranges, 0, device=device)
+            wp.launch(add_value, dim=64, inputs=[out, 1.0], device=self.device)  # the device is usable afterwards
+            np.testing.assert_array_equal(out.numpy(), np.full(64, 1.0, dtype=np.float32))
+        finally:
+            wp.config.metal_capture_reuse = saved
 
     def test_capture_never_reuses_host_written_memory(self):
         """Memory the host writes while recording (an indirect execution range is filled in at its end, on the
