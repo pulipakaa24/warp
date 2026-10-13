@@ -429,6 +429,20 @@ are added at borrow time.
 """
 
 
+_TIGHT_POOL_MIN_BYTES = 1 << 20
+_TIGHT_POOL_MAX_RATIO = 1.25
+
+
+def _tight_pool(device) -> bool:
+    """Metal: temporary pools allocate the requested size and do not hand an array of at least 1 MiB more than 1.25x
+    the requested size (``WP_METAL_FEM_TIGHT_POOL=0`` restores growth by 1.5x and any larger array). A captured graph
+    keeps every array of the pool alive, so the pool's high-water mark is device memory for the graph's lifetime.
+    Which buffer a temporary gets has no effect on results: temporaries are uninitialized either way."""
+    import os  # noqa: PLC0415
+
+    return getattr(device, "is_metal", False) and os.environ.get("WP_METAL_FEM_TIGHT_POOL", "1") != "0"
+
+
 class TemporaryStore:
     """
     Shared pool of temporary arrays that will be persisted and reused across invocations of ``warp.fem`` functions.
@@ -493,13 +507,21 @@ class TemporaryStore:
                     a=self._pool_capacities,
                     x=capacity,
                 )
+                tight = _tight_pool(self.device)
+                if (
+                    tight
+                    and index < len(self._pool)
+                    and capacity >= _TIGHT_POOL_MIN_BYTES
+                    and self._pool_capacities[index] > _TIGHT_POOL_MAX_RATIO * capacity
+                ):
+                    index = len(self._pool)  # only much larger arrays are free: allocate one of the requested size
                 if index < len(self._pool):
                     # Big enough array found, remove from pool
                     ptr = self._pool.pop(index)
                     capacity = self._pool_capacities.pop(index)
                 else:
                     # No big enough array found, allocate new one
-                    if len(self._pool) > 0:
+                    if len(self._pool) > 0 and not tight:
                         grow_factor = 1.5
                         capacity = max(int(self._pool_capacities[-1] * grow_factor), capacity)
 
