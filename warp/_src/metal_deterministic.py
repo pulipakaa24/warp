@@ -212,6 +212,7 @@ struct det_counter_args_t {
     uint num_tiles;
     uint num_cursors;
     uint pad;
+    device atomic_int* flag;   // the sticky overflow / phase-mismatch flag (det_ctx.overflow)
 };
 
 inline int target_of_record(constant det_counter_args_t& a, uint r)
@@ -559,6 +560,10 @@ kernel void det_counter_writeback(
             while (t + 1 < a.num_targets && int(k) >= a.t[t + 1].cursor_base)
                 ++t;
             const int j = int(k) - a.t[t].cursor_base;
+            // tripwire: a thread made fewer counter calls in phase 1 than phase 0 recorded (more, or different
+            // ones, are flagged by counter_add); see flag_phase_mismatch in metal_deterministic.h
+            if (a.t[t].cursors[j] != a.t[t].cursors[a.t[t].dim + j] && a.flag)
+                atomic_fetch_or_explicit(a.flag, 2, memory_order_relaxed);
             a.t[t].cursors[j] = 0;
             a.t[t].cursors[a.t[t].dim + j] = 0;
         }
@@ -671,6 +676,7 @@ class _CounterArgs(ctypes.Structure):
         ("num_tiles", ctypes.c_uint32),
         ("num_cursors", ctypes.c_uint32),
         ("pad", ctypes.c_uint32),
+        ("flag", ctypes.c_uint64),
     ]
 
 
@@ -698,7 +704,7 @@ class _AllPointers:
 _ALL_POINTERS = _AllPointers()
 for _t in (_FinalizeArgs, _CounterTarget, _RecordsArgs):
     _t._wp_pointer_fields = tuple(name for name, ftype in _t._fields_ if ftype is ctypes.c_uint64)
-_CounterArgs._wp_pointer_fields = ("keys", "payload", "carry_k", "carry_s", "carry_u", "totals", "touched")
+_CounterArgs._wp_pointer_fields = ("keys", "payload", "carry_k", "carry_s", "carry_u", "totals", "touched", "flag")
 
 
 def _offsets_array(struct_type):
@@ -1100,6 +1106,7 @@ class _Plan:
             args.carry_u = sb + scan_regions["carry_u"]
             args.totals = sb + scan_regions["totals"]
             args.touched = zb + scan_regions["touched"]
+            args.flag = state.overflow.ptr
             self.counter_sort.bind(state, sb)
             self.sorts.append(self.counter_sort)
             self.build_args = _CounterArgs.from_buffer_copy(args)
@@ -1328,6 +1335,16 @@ def _check_overflow(state, kernel):
     if state.overflow_reported:
         return
     value = ctypes.c_int32.from_address(state.overflow.ptr).value
+    if value & 2:
+        state.overflow_reported = True
+        raise RuntimeError(
+            "Deterministic counter phase mismatch on Metal: a thread's consumed-return atomic_add calls in the "
+            "execution pass differ from those its counting pass recorded (detected at kernel "
+            f"'{kernel.key}'; possibly a later launch than the one that mismatched), so slots were handed to the wrong "
+            "calls. The kernel decides its counter calls from data it writes earlier in the same launch, which the "
+            "counting pass cannot see (its stores are suppressed): see 'Side effects in the counting pass' in the "
+            "deterministic execution guide."
+        )
     if value:
         state.overflow_reported = True
         raise RuntimeError(
