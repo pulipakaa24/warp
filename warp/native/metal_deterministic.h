@@ -93,10 +93,24 @@ inline float to_float(half x) { return half_to_float(x); }
 inline float to_float(wp_bfloat16 x) { return bfloat16_to_float(x); }
 #endif
 
+// Bits of the sticky flag (det_ctx.overflow): records beyond records_per_thread, and a phase mismatch.
+#define WP_DET_FLAG_OVERFLOW 1
+#define WP_DET_FLAG_PHASE_MISMATCH 2
+
 inline void flag_overflow(thread det_ctx& ctx)
 {
     if (ctx.overflow)
-        metal::atomic_store_explicit(ctx.overflow, 1, metal::memory_order_relaxed);
+        metal::atomic_fetch_or_explicit(ctx.overflow, WP_DET_FLAG_OVERFLOW, metal::memory_order_relaxed);
+}
+
+// Phase 1 made a counter call that phase 0 did not record (or recorded with another destination or count): the
+// kernel's calls depend on data that phase 0 could not see (its stores are suppressed), so the slots handed out no
+// longer match the calls and writes can land in slots reserved by other threads. Fewer calls in phase 1 are caught
+// after the launch (det_counter_writeback compares each thread's call counts).
+inline void flag_phase_mismatch(thread det_ctx& ctx)
+{
+    if (ctx.overflow)
+        metal::atomic_fetch_or_explicit(ctx.overflow, WP_DET_FLAG_PHASE_MISMATCH, metal::memory_order_relaxed);
 }
 
 // Adds a signed 64-bit value to the bin at b (two 32-bit words, low first): exact modulo 2^64 in any order.
@@ -188,6 +202,13 @@ inline int counter_add(thread det_ctx& ctx, thread const det_counter_buf_t& buf,
         buf.dest_of[record] = dest;
         buf.values[record] = value;
         return 0;
+    }
+    // tripwire: phase 0 must have recorded this call (same call number, destination and count); the phase-0 call
+    // count of this thread is still in the first half of the cursors until the writeback clears it
+    if (call >= buf.cursors[ctx.idx] || buf.dest_of[record] != dest || buf.values[record] != value) {
+        flag_phase_mismatch(ctx);
+        if (call >= buf.cursors[ctx.idx])
+            return 0;  // no slot was reserved for this call (as for an overflowing call)
     }
     // the base slot of this reservation; values greater than one reserve [slot, slot + value)
     return buf.prefixes[record];

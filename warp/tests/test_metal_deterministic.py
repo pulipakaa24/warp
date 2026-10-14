@@ -8,6 +8,7 @@ consumed-return counters run in two phases and hand out slots in thread order pe
 module option ``metal_ordered_atomics`` keeps the earlier ordered launches (one SIMD-group in task order).
 """
 
+import ctypes
 import math
 import unittest
 
@@ -83,6 +84,19 @@ def det_append_fixed_scratch(x: wp.array[float], counter: wp.array[int], out: wp
     if local[0] + local[1] > 0.0:
         slot = wp.atomic_add(counter, 0, 1)
         out[slot] = local[0] + local[1]
+
+
+@wp.kernel(module="unique", module_options=RUN_TO_RUN)
+def det_append_after_scratch(
+    x: wp.array[float], scratch: wp.array[float], counter: wp.array[int], out: wp.array[float]
+):
+    # unsupported: the counter call depends on a global store made earlier in the launch, which the counting pass
+    # does not perform ("Side effects in the counting pass" in the deterministic execution guide)
+    tid = wp.tid()
+    scratch[tid] = x[tid]
+    if scratch[tid] > 0.0:
+        slot = wp.atomic_add(counter, 0, 1)
+        out[slot] = scratch[tid]
 
 
 @wp.kernel(module="unique", module_options=ORDERED)
@@ -259,6 +273,38 @@ class TestMetalDeterministic(unittest.TestCase):
         expected = values[values > 0]
         self.assertEqual(int(counter.numpy()[0]), expected.size)
         np.testing.assert_array_equal(out.numpy()[: expected.size], expected)
+
+    def _phase_mismatch_raised(self, x_np, scratch_init):
+        from warp._src import metal_deterministic as md  # noqa: PLC0415
+
+        state = md._state(wp.get_device(self.device))
+        n = x_np.size
+        x = wp.array(x_np, device=self.device)
+        scratch = wp.full(n, scratch_init, dtype=float, device=self.device)
+        counter = wp.zeros(1, dtype=int, device=self.device)
+        out = wp.zeros(n, dtype=float, device=self.device)
+        try:
+            # the launch only peeks at the flag without waiting for the GPU; check it again after a sync
+            wp.launch(det_append_after_scratch, dim=n, inputs=[x, scratch, counter, out], device=self.device)
+            wp.synchronize_device(self.device)
+            md._check_overflow(state, det_append_after_scratch)
+        except RuntimeError as e:
+            return "phase mismatch" in str(e)
+        finally:
+            ctypes.memset(state.overflow.ptr, 0, 4)
+            state.overflow_reported = False
+        return False
+
+    def test_phase_mismatch_tripwire(self):
+        """Flag a kernel whose execution pass makes counter calls its counting pass did not record (more calls:
+        the counting pass reads the scratch as 0), or records calls the execution pass does not make (fewer)."""
+        self.assertTrue(self._phase_mismatch_raised(np.ones(3000, dtype=np.float32), 0.0))
+        self.assertTrue(self._phase_mismatch_raised(-np.ones(3000, dtype=np.float32), 1.0))
+
+    def test_no_tripwire_when_phases_agree(self):
+        """Supported counter kernels leave the flag clear (scratch already equal to the input in both passes)."""
+        x_np = np.ones(3000, dtype=np.float32)
+        self.assertFalse(self._phase_mismatch_raised(x_np, 1.0))
 
     def test_graph_capture(self):
         """Replay deterministic accumulation and counter launches from a captured graph."""
