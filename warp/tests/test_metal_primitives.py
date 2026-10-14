@@ -125,6 +125,40 @@ class TestMetalPrimitives(unittest.TestCase):
                         keys_np, values_np, wp_type, wp.int32, n, msg=f"{wp_type.__name__} n={n} {pattern}"
                     )
 
+    def test_scratch_pool_over_2gib(self):
+        """The scratch pool hands out buffers above 2**31 bytes (int32 array-shape limit) without overshooting."""
+        if not metal_available():
+            self.skipTest("Metal not available")
+        state = metal_primitives._DeviceState(wp.get_device("metal:0"))
+        request = 2**31 + 4096
+        ptr = state.scratch_ptr(request)
+        self.assertNotEqual(ptr, 0)
+        nbytes = 8 * state.scratch[-1].size
+        self.assertGreaterEqual(nbytes, request)
+        self.assertLessEqual(nbytes, request + request // 4 + 8)
+        state.scratch.clear()
+
+    def test_radix_sort_pairs_scratch_over_2gib(self):
+        """A sort whose scratch exceeds 2**31 bytes completes and matches the host order (opt-in: ~7 GB)."""
+        import os  # noqa: PLC0415
+
+        if not metal_available():
+            self.skipTest("Metal not available")
+        if os.environ.get("WARP_METAL_LARGE_TESTS") != "1":
+            self.skipTest("set WARP_METAL_LARGE_TESTS=1 (needs ~7 GB of device memory)")
+        n = 280_000_000                     # uint32 keys + int32 values: 8 B per pair -> 2.24 GB of scratch
+        rng = np.random.default_rng(11)
+        keys_np = rng.integers(0, 2**32, size=2 * n, dtype=np.uint32)
+        with wp.ScopedDevice("metal:0"), gpu_utilities(True):
+            keys = wp.array(keys_np, dtype=wp.uint32)
+            values = wp.array(np.arange(2 * n, dtype=np.int32), dtype=wp.int32)
+            wp.utils.radix_sort_pairs(keys, values, n)
+            k = keys.numpy()[:n]
+            v = values.numpy()[:n]
+        self.assertTrue(np.all(k[1:] >= k[:-1]))
+        np.testing.assert_array_equal(keys_np[v], k)
+        self.assertEqual(np.unique(v).size, n)
+
     def test_radix_sort_pairs_empty_and_partial_buffers(self):
         rng = np.random.default_rng(3)
         keys_np = rng.integers(-100, 100, size=500).astype(np.int32)

@@ -865,10 +865,15 @@ class _DeviceState:
         return handle
 
     def scratch_ptr(self, nbytes):
-        """Address of a device scratch buffer of at least ``nbytes`` (contents undefined)."""
-        if not self.scratch or self.scratch[-1].size < nbytes:
-            size = max(nbytes, 2 * self.scratch[-1].size if self.scratch else 0, 1 << 16)
-            self.scratch.append(wp.empty(size, dtype=wp.uint8, device=self.device))
+        """Address of a device scratch buffer of at least ``nbytes`` (contents undefined).
+
+        Allocated in 8-byte elements: Warp array shapes are int32, so a byte-element buffer could not exceed 2 GiB
+        (an S2 collider rasterisation at 1.57M particles needed more). Grown to at most 1.25x the request beyond the
+        current capacity, not doubled past it (doubling turned a 1.6 GiB request into a 3 GiB allocation)."""
+        capacity = 8 * self.scratch[-1].size if self.scratch else 0
+        if capacity < nbytes:
+            size = max(nbytes, min(2 * capacity, nbytes + nbytes // 4), 1 << 16)
+            self.scratch.append(wp.empty((size + 7) // 8, dtype=wp.uint64, device=self.device))
         return self.scratch[-1].ptr
 
     def launch_bounded(self, name, limit, args, pointer_offsets, count, divisor, per_thread=False):
