@@ -437,6 +437,14 @@ interpolators of Benjamin Carleton's sass-math model), equal to an NVIDIA L4's r
 the Metal library's functions. Read when a module is built and part of the module hash when ``True``;
 ``WP_METAL_CUDA_LIBM=0`` turns it off."""
 
+metal_bsr_mv_tiles: bool = _os.environ.get("WP_METAL_BSR_MV_TILES", "1") != "0"
+"""Whether :func:`warp.sparse.bsr_mv` on Metal makes CUDA's choice between its two product kernels: rows holding many
+blocks (``nnz * block_size > 2 * tile_size * rows``, the CUDA heuristic) are summed by the tiled kernel (64 strided
+lane sums, then the warp shuffle tree, which Metal's SIMD-group reduction reproduces), the others one thread per
+row. The same choice gives the same summation order, and so the same rounding, on both GPUs; one thread per long
+row is also latency-bound (e.g. the body rows of Newton's MPM rigidity operator, thousands of blocks each).
+``False`` (``WP_METAL_BSR_MV_TILES=0``) keeps one thread per row on Metal, as before. Read at each call."""
+
 metal_eager_conditionals: bool = _os.environ.get("WP_METAL_EAGER_CONDITIONALS", "0") == "1"
 """Whether :func:`warp.capture_while` and :func:`warp.capture_if` outside a graph capture on Metal record their
 bodies once as a graph gated on the device (indirect execution ranges a kernel closes once the condition is 0), so

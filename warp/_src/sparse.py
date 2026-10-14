@@ -4952,7 +4952,9 @@ def bsr_mv(
         use_tiles = False
     else:
         tile_size = 64
-        use_tiles = device.is_cuda and A.nnz * A.block_size > 2 * tile_size * A.shape[0]
+        # Metal takes CUDA's choice (warp.config.metal_bsr_mv_tiles): same kernel, same summation order
+        tiles_ok = device.is_cuda or (getattr(device, "is_metal", False) and wp.config.metal_bsr_mv_tiles)
+        use_tiles = tiles_ok and A.nnz * A.block_size > 2 * tile_size * A.shape[0]
 
     if transpose:
         if beta.value == 0.0:
