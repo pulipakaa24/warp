@@ -868,11 +868,12 @@ class _DeviceState:
         """Address of a device scratch buffer of at least ``nbytes`` (contents undefined).
 
         Allocated in 8-byte elements: Warp array shapes are int32, so a byte-element buffer could not exceed 2 GiB
-        (an S2 collider rasterisation at 1.57M particles needed more). Grown to at most 1.25x the request beyond the
-        current capacity, not doubled past it (doubling turned a 1.6 GiB request into a 3 GiB allocation)."""
+        (an S2 collider rasterisation at 1.57M particles needed more). Grown by doubling: outgrown buffers stay alive
+        (captured graphs may reference them), so the retained chain is ~2x the largest buffer; a smaller growth step
+        retains more (1.25x steps: ~5x)."""
         capacity = 8 * self.scratch[-1].size if self.scratch else 0
         if capacity < nbytes:
-            size = max(nbytes, min(2 * capacity, nbytes + nbytes // 4), 1 << 16)
+            size = max(nbytes, 2 * capacity, 1 << 16)
             self.scratch.append(wp.empty((size + 7) // 8, dtype=wp.uint64, device=self.device))
         return self.scratch[-1].ptr
 

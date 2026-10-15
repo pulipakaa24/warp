@@ -135,7 +135,7 @@ class TestMetalPrimitives(unittest.TestCase):
         self.assertNotEqual(ptr, 0)
         nbytes = 8 * state.scratch[-1].size
         self.assertGreaterEqual(nbytes, request)
-        self.assertLessEqual(nbytes, request + request // 4 + 8)
+        self.assertLessEqual(nbytes, request + 8)          # a fresh pool allocates the request (rounded to 8 B)
         state.scratch.clear()
 
     def test_radix_sort_pairs_scratch_over_2gib(self):
