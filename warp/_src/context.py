@@ -7164,6 +7164,9 @@ class Runtime:
             self.core.wp_texture_destroy_metal.argtypes = [ctypes.c_uint64]
             self.core.wp_texture_destroy_metal.restype = None
             self.core.wp_metal_get_kernel.restype = ctypes.c_void_p
+            if hasattr(self.core, "wp_metal_set_maximize_concurrent_compilation"):  # a library built before it
+                self.core.wp_metal_set_maximize_concurrent_compilation.argtypes = [ctypes.c_int, ctypes.c_int]
+                self.core.wp_metal_set_maximize_concurrent_compilation.restype = ctypes.c_int
             self.core.wp_metal_launch_kernel.argtypes = [
                 ctypes.c_int,  # device ordinal
                 ctypes.c_void_p,  # kernel (pipeline state)
@@ -12495,6 +12498,12 @@ def launch(
             fwd_types = kernel.infer_argument_types(fwd_args)
             kernel = kernel.add_overload(fwd_types)
 
+        # inside ``wp.preload_launches()``: record the kernel for a parallel load instead of launching it
+        preload = getattr(_launch_preload_state, "active", None)
+        if preload is not None and not record_cmd and preload._accepts(device):
+            preload._add(kernel, device, block_dim)
+            return None
+
         # delay load modules, including new overload if needed
         module_exec = kernel.module.load(device, block_dim)
 
@@ -13550,6 +13559,213 @@ def load_module(
         )
 
     force_load(device=device, modules=modules, block_dim=block_dim, max_workers=max_workers)
+
+
+_launch_preload_state = threading.local()
+"""Per-thread active :class:`LaunchPreload` (``.active``); only the thread that entered it is intercepted."""
+
+
+class LaunchPreload:
+    """Context manager returned by :func:`preload_launches`. Its attributes report what was loaded.
+
+    Attributes:
+        modules: Number of distinct (module, device, block_dim) variants recorded.
+        kernels: Number of distinct kernels recorded.
+        workers: Number of worker threads used to load them.
+        discover_seconds: Time spent inside the ``with`` block (recording launches).
+        load_seconds: Time spent compiling and loading after the block.
+        errors: ``(description, exception)`` pairs for loads that failed; the same failures surface again,
+            from the module's recorded build error, when those kernels are launched.
+        metal_compile_tasks: ``MTLDevice.maximumConcurrentCompilationTaskCount`` after the
+            :attr:`warp.config.metal_maximize_concurrent_compilation` setting was applied, or ``None``.
+    """
+
+    def __init__(self, device: DeviceLike | None, max_workers: int | None, kernel_hooks: bool):
+        self._device_arg = device
+        self._max_workers = max_workers
+        self._kernel_hooks = kernel_hooks
+        self._device = None
+        # (id(module), device alias, block_dim) -> ((module, device, block_dim), {id(kernel): kernel}),
+        # in first-launch order (Device is not hashable)
+        self._variants: dict[tuple, tuple[tuple, dict[int, Kernel]]] = {}
+        self._t_enter = 0.0
+        self.modules = 0
+        self.kernels = 0
+        self.workers = 0
+        self.discover_seconds = 0.0
+        self.load_seconds = 0.0
+        self.errors: list[tuple[str, BaseException]] = []
+        self.metal_compile_tasks: int | None = None
+
+    def _accepts(self, device: Device) -> bool:
+        return self._device is None or device == self._device
+
+    def _add(self, kernel: Kernel, device: Device, block_dim: int) -> None:
+        variant = self._variants.get((id(kernel.module), device.alias, block_dim))
+        if variant is None:
+            variant = ((kernel.module, device, block_dim), {})
+            self._variants[(id(kernel.module), device.alias, block_dim)] = variant
+        variant[1].setdefault(id(kernel), kernel)
+
+    def add(self, kernel: Kernel, device: DeviceLike | None = None, block_dim: int | None = None) -> None:
+        """Record ``kernel`` for loading as if it were launched, e.g. from a list of kernels an earlier run used.
+
+        Args:
+            kernel: A concrete (non-generic) kernel or kernel overload.
+            device: The launch device. ``None`` uses the preload's device, or the current device if it has none.
+            block_dim: The launch ``block_dim``, resolved as :func:`warp.launch` resolves it.
+        """
+        if kernel.is_generic:
+            raise RuntimeError(f"Kernel '{kernel.key}' is generic: record one of its overloads")
+        if device is None:
+            device = self._device if self._device is not None else runtime.get_device(self._device_arg)
+        else:
+            device = runtime.get_device(device)
+        self._add(kernel, device, _resolve_launch_block_dim(device, block_dim))
+
+    def __enter__(self) -> LaunchPreload:
+        import time  # noqa: PLC0415
+
+        init()
+        if getattr(_launch_preload_state, "active", None) is not None:
+            raise RuntimeError("wp.preload_launches() cannot be nested")
+        self._device = None if self._device_arg is None else runtime.get_device(self._device_arg)
+        _launch_preload_state.active = self
+        self._t_enter = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        import time  # noqa: PLC0415
+
+        _launch_preload_state.active = None
+        t = time.perf_counter()
+        self.discover_seconds = t - self._t_enter
+        # A failing block (e.g. code that is not capture-safe) still had its earlier launches recorded; loading
+        # them has no effect on results, so do it and let the exception propagate. Not on KeyboardInterrupt.
+        if exc_type is None or issubclass(exc_type, Exception):
+            self._load()
+        self.load_seconds = time.perf_counter() - t
+        return False
+
+    def _load(self) -> None:
+        variants = list(self._variants.values())
+        self.modules = len(variants)
+        self.kernels = sum(len(kernels) for _, kernels in variants)
+        if not variants:
+            return
+
+        max_workers = self._max_workers
+        if max_workers is None:
+            max_workers = warp.config.load_module_max_workers
+            if max_workers is None:
+                max_workers = min(os.cpu_count() or 1, 4)
+        self.workers = max(1, int(max_workers))
+
+        if (
+            self.workers > 1
+            and warp.config.metal_maximize_concurrent_compilation
+            and hasattr(runtime.core, "wp_metal_set_maximize_concurrent_compilation")
+        ):
+            metal_devices = {key[1].metal_ordinal: key[1] for key, _ in variants if key[1].is_metal}
+            for metal_device in metal_devices.values():
+                tasks = runtime.core.wp_metal_set_maximize_concurrent_compilation(metal_device.metal_ordinal, 1)
+                self.metal_compile_tasks = tasks if tasks >= 0 else None
+
+        def load(key):
+            module, device, block_dim = key
+            return module.load(device, block_dim)
+
+        def describe(key, kernel=None):
+            module, device, block_dim = key
+            what = f"module '{module.name}'" if kernel is None else f"kernel '{kernel.key}'"
+            return f"{what} on '{device}' (block_dim={block_dim})"
+
+        context_saved = is_cuda_driver_initialized()
+        if context_saved:
+            saved_context = runtime.core.wp_cuda_context_get_current()
+        try:
+            if self.workers == 1:
+                for key, kernels in variants:
+                    try:
+                        module_exec = load(key)
+                    except Exception as e:
+                        self.errors.append((describe(key), e))
+                        continue
+                    if module_exec is not None and self._kernel_hooks:
+                        for kernel in kernels.values():
+                            try:
+                                module_exec.get_kernel_hooks(kernel)
+                            except Exception as e:
+                                self.errors.append((describe(key, kernel), e))
+            else:
+                with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                    loads = [(key, kernels, executor.submit(load, key)) for key, kernels in variants]
+                    hooks = []
+                    # Kernel pipelines (Metal) / function lookups are queued as each module finishes loading.
+                    for key, kernels, future in loads:
+                        try:
+                            module_exec = future.result()
+                        except Exception as e:
+                            self.errors.append((describe(key), e))
+                            continue
+                        if module_exec is not None and self._kernel_hooks:
+                            for kernel in kernels.values():
+                                hooks.append((key, kernel, executor.submit(module_exec.get_kernel_hooks, kernel)))
+                    for key, kernel, future in hooks:
+                        try:
+                            future.result()
+                        except Exception as e:
+                            self.errors.append((describe(key, kernel), e))
+        finally:
+            if context_saved:
+                runtime.core.wp_cuda_context_set_current(saved_context)
+
+        for what, e in self.errors:
+            log_debug(f"wp.preload_launches: loading {what} failed; its launch will report it: {e}")
+
+
+def preload_launches(
+    device: DeviceLike | None = None, max_workers: int | None = None, kernel_hooks: bool = True
+) -> LaunchPreload:
+    """Record the kernels a block of code launches, then compile and load them in parallel.
+
+    Inside the ``with`` block, :func:`warp.launch` (and everything built on it) records the kernel, its overload
+    and its ``block_dim`` instead of launching it, on the calling thread only and on ``device`` only (all devices
+    if ``None``). Launches with ``record_cmd=True`` and zero-size launches behave as usual. When the block exits,
+    the distinct (module, device, block_dim) variants are loaded by :meth:`Module.load` on ``max_workers``
+    threads, and with ``kernel_hooks`` each recorded kernel's entry points are looked up as its module finishes
+    (on Metal this creates the compute pipelines, which is compiler work too). Later launches of those kernels
+    find everything loaded.
+
+    This is how to warm up code that creates kernels while it runs (kernel factories, specialized kernels such
+    as MuJoCo Warp's ``__locals__`` modules), whose modules :func:`force_load` cannot name in advance: run one
+    step under ``preload_launches``. Kernels are not executed, so host code in the block must not depend on
+    results of launches inside it; memory operations and other non-kernel work in the block still run. Code
+    that is capture-safe can be run inside a :class:`warp.ScopedCapture` whose graph is discarded, so that
+    nothing in it executes. A graph captured inside the block holds no kernel launches: code that captures a
+    graph on its first call and keeps it must not run its first call here. :meth:`LaunchPreload.add` records
+    kernels known from elsewhere (for example the kernels an earlier run launched).
+
+    Compiled output is the same as from lazy loading: the same :meth:`Module.load` runs with the same options;
+    only the thread and the order differ (Python code generation remains serialized under Warp's codegen
+    lock). Loading failures are not raised here (see :attr:`LaunchPreload.errors`); the launch raises them.
+
+    Args:
+        device: The device whose launches are recorded. ``None`` records launches on every device.
+        max_workers: Worker threads for loading. ``0`` or ``1`` loads serially. If ``None``,
+            :attr:`warp.config.load_module_max_workers` determines the default.
+        kernel_hooks: Whether to also look up each recorded kernel's entry points (Metal: create its pipelines).
+
+    Returns:
+        A context manager. Its attributes (see :class:`LaunchPreload`) report what was loaded.
+
+    Example:
+        >>> with wp.preload_launches("metal:0", max_workers=8) as preload:  # doctest: +SKIP
+        ...     with wp.ScopedCapture("metal:0"):
+        ...         step(model, data)  # capture-safe code; the throwaway graph is never launched
+        >>> graph = capture(step)  # compiles nothing now  # doctest: +SKIP
+    """
+    return LaunchPreload(device, max_workers, kernel_hooks)
 
 
 def _resolve_module(module: Module | types.ModuleType | str) -> Module:

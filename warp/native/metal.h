@@ -46,6 +46,8 @@ WP_API void wp_metal_unload_library(void* library);
 // Returns a compute pipeline state for the named kernel function, or null with an error string.
 // The handle stays valid until the owning library is unloaded.
 WP_API void* wp_metal_get_kernel(void* library, const char* name);
+// Sets MTLDevice.shouldMaximizeConcurrentCompilation; returns maximumConcurrentCompilationTaskCount (-1: bad ordinal).
+WP_API int wp_metal_set_maximize_concurrent_compilation(int ordinal, int enable);
 WP_API int wp_metal_get_kernel_thread_execution_width(void* kernel);
 WP_API int wp_metal_get_kernel_max_threads_per_threadgroup(void* kernel);
 

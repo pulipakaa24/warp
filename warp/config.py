@@ -532,7 +532,16 @@ load_module_max_workers: int | None = 0
 For ``wp.load_module()`` and ``wp.force_load()``, if the ``max_workers`` parameter is not specified,
 the default number of worker threads is determined by this setting. ``0`` means serial loading.
 If ``None``, Warp determines the behavior (currently equal to ``min(os.cpu_count(), 4)``).
+:func:`warp.preload_launches` uses the same default.
 """
+
+metal_maximize_concurrent_compilation: bool = _os.environ.get("WP_METAL_MAXIMIZE_CONCURRENT_COMPILATION", "0") == "1"
+"""Whether a parallel :func:`warp.preload_launches` on a Metal device first sets the device's
+``MTLDevice.shouldMaximizeConcurrentCompilation`` (macOS 13.3+), which lets the Metal compiler use more CPU threads
+for concurrent library and pipeline compiles. It changes the number of compiler threads only, not what is compiled,
+and stays on for the process once set. Off by default (``WP_METAL_MAXIMIZE_CONCURRENT_COMPILATION=1`` turns it on):
+on an M4 Max under macOS 26 ``maximumConcurrentCompilationTaskCount`` is 16 with and without it, so it changes
+nothing there; it is kept for devices whose default task count is lower."""
 
 deterministic: DeterministicMode = DeterministicMode.NOT_GUARANTEED
 """Determinism guarantee for supported atomic operations.

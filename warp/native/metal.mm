@@ -1252,11 +1252,15 @@ uint64_t wp_metal_gpu_address(int ordinal, const void* ptr)
 
 void* wp_metal_load_library(int ordinal, const char* source)
 {
-    WP_METAL_LOCK();
-    @autoreleasepool {
+    id<MTLDevice> device = nil;
+    {
+        WP_METAL_LOCK();
         Device* dev = get_device(ordinal);
         if (!dev || !source)
             return nullptr;
+        device = dev->device;
+    }
+    @autoreleasepool {
         MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
         options.enableLogging = printf_mode() >= 1;  // wp.printf / assertions in kernels
         options.languageVersion = MTLLanguageVersion3_2;  // 64-bit atomics, os_log
@@ -1265,9 +1269,14 @@ void* wp_metal_load_library(int ordinal, const char* source)
         options.mathMode = MTLMathModeSafe;
         options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
         NSError* error = nil;
-        id<MTLLibrary> library = [dev->device newLibraryWithSource:@(source) options:options error:&error];
+        // The compile runs outside the runtime lock: it touches no Warp device state, MTLDevice is
+        // thread-safe (Sendable), and it is the dominant cost of a module load, so holding the lock
+        // here serialized parallel module loads (wp.force_load, wp.preload_launches) across threads.
+        id<MTLLibrary> library = [device newLibraryWithSource:@(source) options:options error:&error];
         if (!library) {
-            wp::set_error_string("Metal library compilation failed:\n%s", compile_errors(error).c_str());
+            std::string message = compile_errors(error);
+            WP_METAL_LOCK();
+            wp::set_error_string("Metal library compilation failed:\n%s", message.c_str());
             return nullptr;
         }
         return new Library { library, {}, ordinal };
@@ -1284,23 +1293,30 @@ void wp_metal_unload_library(void* library)
 
 void* wp_metal_get_kernel(void* library, const char* name)
 {
-    WP_METAL_LOCK();
-    @autoreleasepool {
-        Library* lib = static_cast<Library*>(library);
+    Library* lib = static_cast<Library*>(library);
+    id<MTLLibrary> mtl_library = nil;
+    uint64_t slot_address = 0;
+    {
+        WP_METAL_LOCK();
         if (!lib || !name) {
             wp::set_error_string("Invalid Metal library or kernel name");
             return nullptr;
         }
-        NSError* error = nil;
         Device* dev = get_device(lib->ordinal);
+        slot_address = dev ? dev->table_slot.gpuAddress : 0;
+        mtl_library = lib->library;
+    }
+    @autoreleasepool {
+        // Function specialization and pipeline compilation run outside the runtime lock (see
+        // wp_metal_load_library); only the error string and the library's pipeline list are shared.
+        NSError* error = nil;
         MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
-        uint64_t slot_address = dev ? dev->table_slot.gpuAddress : 0;
         [constants setConstantValue:&slot_address type:MTLDataTypeULong atIndex:0];
-        id<MTLFunction> function = [lib->library newFunctionWithName:@(name) constantValues:constants error:&error];
+        id<MTLFunction> function = [mtl_library newFunctionWithName:@(name) constantValues:constants error:&error];
         if (!function) {
-            wp::set_error_string(
-                "Kernel \"%s\" was not found in the Metal library: %s", name, error_description(error)
-            );
+            std::string message = error_description(error);
+            WP_METAL_LOCK();
+            wp::set_error_string("Kernel \"%s\" was not found in the Metal library: %s", name, message.c_str());
             return nullptr;
         }
         MTLComputePipelineDescriptor* descriptor = [MTLComputePipelineDescriptor new];
@@ -1308,19 +1324,36 @@ void* wp_metal_get_kernel(void* library, const char* name)
         descriptor.label = @(name);
         descriptor.supportIndirectCommandBuffers = YES;  // graphs replay through indirect command buffers
         id<MTLComputePipelineState> pipeline =
-            [lib->library.device newComputePipelineStateWithDescriptor:descriptor
-                                                               options:MTLPipelineOptionNone
-                                                            reflection:nil
-                                                                 error:&error];
+            [mtl_library.device newComputePipelineStateWithDescriptor:descriptor
+                                                              options:MTLPipelineOptionNone
+                                                           reflection:nil
+                                                                error:&error];
         if (!pipeline) {
-            wp::set_error_string(
-                "Failed to create Metal pipeline for kernel \"%s\": %s", name, error_description(error)
-            );
+            std::string message = error_description(error);
+            WP_METAL_LOCK();
+            wp::set_error_string("Failed to create Metal pipeline for kernel \"%s\": %s", name, message.c_str());
             return nullptr;
         }
+        WP_METAL_LOCK();
         lib->kernels.push_back(pipeline);
         return (__bridge void*)pipeline;
     }
+}
+
+int wp_metal_set_maximize_concurrent_compilation(int ordinal, int enable)
+{
+    id<MTLDevice> device = nil;
+    {
+        WP_METAL_LOCK();
+        Device* dev = get_device(ordinal);
+        if (!dev)
+            return -1;
+        device = dev->device;
+    }
+    // Lets the Metal compiler use more CPU threads (macOS 13.3+; WWDC23 "Optimize GPU renderers with
+    // Metal"). Only the number of compiler threads changes, not what is compiled.
+    device.shouldMaximizeConcurrentCompilation = enable ? YES : NO;
+    return int(device.maximumConcurrentCompilationTaskCount);
 }
 
 int wp_metal_get_kernel_thread_execution_width(void* kernel)
