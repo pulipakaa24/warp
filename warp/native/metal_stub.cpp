@@ -77,6 +77,7 @@ void* wp_metal_load_library(int, const char*) { return unavailable(), nullptr; }
 void wp_metal_unload_library(void*) { }
 
 void* wp_metal_get_kernel(void*, const char*) { return unavailable(), nullptr; }
+int wp_metal_set_maximize_concurrent_compilation(int, int) { return unavailable(), -1; }
 
 int wp_metal_get_kernel_thread_execution_width(void*) { return unavailable(), 0; }
 

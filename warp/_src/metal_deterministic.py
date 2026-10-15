@@ -750,7 +750,10 @@ def metal_struct_source(name: str, det_meta, counter_ctype, scatter_ctype) -> st
 
 
 class _Pool:
-    """Grow-only device buffer; outgrown buffers stay alive (plans and captured graphs may reference them)."""
+    """Grow-only device buffer; outgrown buffers stay alive (plans and captured graphs may reference them).
+
+    Buffers are ``uint32`` arrays: a Warp array dimension is limited to 2^31 - 1 elements, and the G1 velocity task at
+    4,096 worlds needs a 2.65 GB scratch region for its deterministic CCD launch (more than 2^31 bytes)."""
 
     def __init__(self, device, zeroed: bool):
         self.device = device
@@ -758,10 +761,22 @@ class _Pool:
         self.buffers = []
 
     def get(self, nbytes: int):
-        if not self.buffers or self.buffers[-1].size < nbytes:
-            size = max(nbytes, 2 * self.buffers[-1].size if self.buffers else 0, 1 << 16)
-            self.buffers.append(_host_zeroed(size, wp.uint8, self.device, record=True))
+        if not self.buffers or _nbytes(self.buffers[-1]) < nbytes:
+            size = max(nbytes, 2 * _nbytes(self.buffers[-1]) if self.buffers else 0, 1 << 16)
+            self.buffers.append(_host_zeroed(_pool_words(size), wp.uint32, self.device, record=True))
         return self.buffers[-1]
+
+
+def _pool_words(nbytes: int) -> int:
+    """Number of ``uint32`` words that hold ``nbytes`` bytes."""
+    words = (int(nbytes) + 3) // 4
+    if words >= 2**31:
+        raise RuntimeError(f"Deterministic mode on Metal: a {nbytes / 2**30:.1f} GiB scratch region is over the 8 GiB limit")
+    return words
+
+
+def _nbytes(arr) -> int:
+    return arr.size * type_size_in_bytes(arr.dtype)
 
 
 def _host_zeroed(n, dtype, device, record=False):

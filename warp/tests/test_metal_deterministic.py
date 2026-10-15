@@ -329,6 +329,23 @@ class TestMetalDeterministic(unittest.TestCase):
             np.testing.assert_array_equal(acc.numpy(), expected)
             np.testing.assert_array_equal(out.numpy(), np.arange(3000))
 
+    def test_scratch_pool_past_2gib(self):
+        """Pool sizes are bytes held in uint32 words, so a region over 2^31 bytes (the G1 task's deterministic CCD
+        launch at 4,096 worlds needs 2.65 GB) fits in one Warp array; growth doubles the byte size."""
+        from warp._src import metal_deterministic as md  # noqa: PLC0415
+
+        self.assertEqual(md._pool_words(2650920960), 662730240)
+        self.assertEqual(md._pool_words(5), 2)
+        with self.assertRaises(RuntimeError):
+            md._pool_words(2**33)
+        pool = md._Pool(wp.get_device(self.device), zeroed=False)
+        a = pool.get(100)
+        self.assertEqual(md._nbytes(a), 1 << 16)
+        self.assertIs(pool.get(1 << 16), a)
+        b = pool.get((1 << 16) + 1)
+        self.assertEqual(md._nbytes(b), 1 << 17)
+        self.assertTrue(not np.any(b.numpy()))
+
     def test_ordered_launches_opt_in(self):
         """Run atomics in task order on one SIMD-group with the metal_ordered_atomics module option."""
         x_np = (np.random.default_rng(5).standard_normal(5000) * 1.0e3).astype(np.float32)

@@ -144,6 +144,7 @@ from warp._src.context import set_module_options as set_module_options
 from warp._src.context import get_module_options as get_module_options
 from warp._src.context import get_module as get_module
 from warp._src.context import force_load as force_load
+from warp._src.context import preload_launches as preload_launches
 from warp._src.context import load_module as load_module
 from warp._src.context import compile_aot_module as compile_aot_module
 from warp._src.context import load_aot_module as load_aot_module

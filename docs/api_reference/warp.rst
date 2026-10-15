@@ -356,6 +356,7 @@ Module Management
    get_module_options
    load_aot_module
    load_module
+   preload_launches
    set_module_options
 
 CUDA Stream Management
